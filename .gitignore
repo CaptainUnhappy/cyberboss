@@ -7,3 +7,14 @@ node_modules/
 npm-debug.log*
 third_party/
 firmware/
+
+# Local runtimes and generated analysis artifacts
+.venv*/
+.codex-runtime/
+analysis/
+
+# Local user data and transient backups
+user/
+.env.codex-backup-*
+__pycache__/
+*.py[cod]

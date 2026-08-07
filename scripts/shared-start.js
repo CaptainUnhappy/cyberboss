@@ -36,6 +36,7 @@ async function main() {
     cwd: rootDir,
     env: childEnv,
     stdio: "inherit",
+    windowsHide: true,
   });
 
   writePidFile(bridgePidFile, child.pid);

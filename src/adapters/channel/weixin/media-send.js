@@ -93,28 +93,28 @@ function buildMediaRef(uploaded) {
 }
 
 async function sendMediaItem({ to, item, contextToken, baseUrl, token }) {
+  const msg = {
+    from_user_id: "",
+    to_user_id: to,
+    client_id: crypto.randomUUID(),
+    message_type: 2,
+    message_state: 2,
+    item_list: [item],
+  };
+  const normalizedContextToken = String(contextToken || "").trim();
+  if (normalizedContextToken) {
+    msg.context_token = normalizedContextToken;
+  }
   await sendMessage({
     baseUrl,
     token,
     body: {
-      msg: {
-        from_user_id: "",
-        to_user_id: to,
-        client_id: crypto.randomUUID(),
-        message_type: 2,
-        message_state: 2,
-        item_list: [item],
-        context_token: contextToken,
-      },
+      msg,
     },
   });
 }
 
 async function sendWeixinMediaFile({ filePath, to, contextToken, baseUrl, token, cdnBaseUrl }) {
-  if (!contextToken) {
-    throw new Error("sendWeixinMediaFile requires contextToken");
-  }
-
   const mime = getMimeFromFilename(filePath);
   const uploadOpts = { baseUrl, token };
 

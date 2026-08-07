@@ -148,6 +148,61 @@ test("dispatchSystemMessage yields when a local pending turn already owns the wo
   assert.equal(handled, false);
 });
 
+test("dispatchSystemMessage remaps a legacy alias to the only live ClawBot context target", async () => {
+  let preparedInput = null;
+  let dispatchedPrepared = null;
+  const appLike = {
+    systemMessageDispatcher: {
+      buildPreparedMessage(message, contextToken) {
+        preparedInput = { message, contextToken };
+        return {
+          workspaceId: "default",
+          accountId: "acc-1",
+          senderId: message.senderId,
+          contextToken,
+          workspaceRoot: "/workspace",
+        };
+      },
+    },
+    channelAdapter: {
+      getKnownContextTokens() {
+        return { "platform-user@im.wechat": "ctx-live" };
+      },
+    },
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          buildBindingKey({ senderId }) {
+            return `binding:${senderId}`;
+          },
+          getThreadIdForWorkspace() {
+            return "thread-1";
+          },
+        };
+      },
+    },
+    threadStateStore: { getThreadState() { return null; } },
+    turnGateStore: { isPending() { return false; } },
+    turnBoundaryScopeKeys: new Set(),
+    resolveWorkspaceRoot() { return "/workspace"; },
+    isTurnDispatchBlocked: CyberbossApp.prototype.isTurnDispatchBlocked,
+    async dispatchPreparedTurn(payload) {
+      dispatchedPrepared = payload.prepared;
+      return true;
+    },
+  };
+
+  const dispatched = await CyberbossApp.prototype.dispatchSystemMessage.call(appLike, {
+    senderId: "legacy-alias",
+    id: "system-remap",
+    text: "ping",
+  });
+  assert.equal(dispatched, true);
+  assert.equal(preparedInput.message.senderId, "platform-user@im.wechat");
+  assert.equal(preparedInput.contextToken, "ctx-live");
+  assert.equal(dispatchedPrepared.contextToken, "ctx-live");
+});
+
 test("handlePreparedMessage queues while the scope is in a turn-boundary handoff", async () => {
   const queued = [];
   let dispatched = false;

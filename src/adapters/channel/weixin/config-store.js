@@ -1,8 +1,10 @@
 const fs = require("fs");
 const path = require("path");
 
-const DEFAULT_MIN_WEIXIN_CHUNK = 20;
-const MAX_MIN_WEIXIN_CHUNK = 3800;
+// Keep ordinary replies in one WeChat bubble whenever practical. The value is
+// the preferred natural-boundary cut point; the hard channel limit is 4000.
+const DEFAULT_MIN_WEIXIN_CHUNK = 3600;
+const MAX_MIN_WEIXIN_CHUNK = 4000;
 
 function loadWeixinConfig(config) {
   const filePath = config?.weixinConfigFile;

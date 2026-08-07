@@ -81,6 +81,24 @@ test("system silent JSON is suppressed", async () => {
   assert.deepEqual(sent, []);
 });
 
+test("plain weixin turns may use the silent action for receipt-only material", async () => {
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-weixin-silent", {
+    userId: "user-weixin",
+    contextToken: "ctx-weixin",
+    provider: "weixin",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-weixin-silent",
+    turnId: "turn-weixin-silent",
+    itemId: "item-weixin-silent",
+    text: "{\"action\":\"silent\"}",
+  });
+
+  assert.deepEqual(sent, []);
+});
+
 test("system send_message JSON sends only the message text", async () => {
   const { sent, streamDelivery } = createHarness();
   streamDelivery.queueReplyTargetForThread("thread-2", {
@@ -465,10 +483,90 @@ test("system send_message retries with the latest context token on ret=-2", asyn
   }]);
 });
 
+test("WeFlow UIA reply target is forwarded as the exclusive outbound provider", async () => {
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-weflow-uia", {
+    userId: "user-weflow-uia",
+    contextToken: "ctx-weflow-uia",
+    provider: "weflow-uia",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-weflow-uia",
+    turnId: "turn-weflow-uia",
+    itemId: "item-weflow-uia",
+    text: "single route",
+  });
+
+  assert.deepEqual(sent, [{
+    userId: "user-weflow-uia",
+    text: "single route",
+    contextToken: "ctx-weflow-uia",
+    provider: "weflow-uia",
+  }]);
+});
+
+test("system send_message retries explicitly without context after a stale-token failure", async () => {
+  const attempts = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText(payload, successful) {
+      attempts.push(payload);
+      if (attempts.length === 1) {
+        throw new Error("sendMessage ret=-2 errcode= errmsg=");
+      }
+      successful.push(payload);
+    },
+    getKnownContextTokens() {
+      return { "user-contextless": "ctx-stale" };
+    },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-contextless", {
+    userId: "user-contextless",
+    contextToken: "ctx-stale",
+    provider: "system",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-contextless",
+    turnId: "turn-contextless",
+    itemId: "item-contextless",
+    text: "{\"action\":\"send_message\",\"message\":\"主动消息\"}",
+  });
+
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[1].contextToken, "");
+  assert.equal(attempts[1].omitContextToken, true);
+  assert.deepEqual(sent, [attempts[1]]);
+});
+
+test("system targets remain deliverable when no context token is cached", async () => {
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-no-context", {
+    userId: "user-no-context",
+    contextToken: "",
+    provider: "system",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-no-context",
+    turnId: "turn-no-context",
+    itemId: "item-no-context",
+    text: "{\"action\":\"send_message\",\"message\":\"按时提醒你\"}",
+  });
+
+  assert.deepEqual(sent, [{
+    userId: "user-no-context",
+    text: "按时提醒你",
+    contextToken: "",
+  }]);
+});
+
 test("system send_message is deferred after retry exhaustion", async () => {
   const deferred = [];
+  const attempts = [];
   const { sent, streamDelivery } = createHarness({
-    async sendText() {
+    async sendText(payload) {
+      attempts.push(payload);
       const error = new Error("sendMessage ret=-2 errcode= errmsg=");
       error.ret = -2;
       throw error;
@@ -494,6 +592,8 @@ test("system send_message is deferred after retry exhaustion", async () => {
   });
 
   assert.deepEqual(sent, []);
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[1].omitContextToken, true);
   assert.equal(deferred.length, 1);
   assert.equal(deferred[0].threadId, "thread-6");
   assert.equal(deferred[0].userId, "user-6");

@@ -24,12 +24,12 @@ class StreamDelivery {
   }
 
   setReplyTarget(bindingKey, target) {
-    if (!bindingKey || !target?.userId || !target?.contextToken) {
+    if (!bindingKey || !target?.userId) {
       return;
     }
     this.replyTargetByBindingKey.set(bindingKey, {
       userId: String(target.userId).trim(),
-      contextToken: String(target.contextToken).trim(),
+      contextToken: normalizeText(target.contextToken),
       provider: normalizeText(target.provider),
     });
   }
@@ -375,6 +375,9 @@ class StreamDelivery {
       text: prependDeferredPrefix ? buildEffectiveReplyText(state.deferredReplyPrefix, baseText) : baseText,
       contextToken: state.replyTarget.contextToken,
     };
+    if (state.replyTarget.provider === "weflow-uia") {
+      payload.provider = "weflow-uia";
+    }
     if (prependDeferredPrefix) {
       payload.preserveBlock = true;
     }
@@ -388,51 +391,82 @@ class StreamDelivery {
       text,
       contextToken: initialTarget.contextToken,
     };
+    if (initialTarget.provider === "weflow-uia") {
+      payload.provider = "weflow-uia";
+    }
     await this.sendTextWithRetry(state, payload, { kind: "system_reply" });
   }
 
   async sendTextWithRetry(state, payload, { kind }) {
     const initialTarget = state.replyTarget;
+    let latestError = null;
     try {
       await this.channelAdapter.sendText(payload);
       return;
     } catch (error) {
+      latestError = error;
       const retryTarget = this.resolveRetriableReplyTarget(initialTarget, error);
-      if (!retryTarget) {
-        const deferred = await this.deferSystemReply(state, payload.text, error, kind);
-        if (deferred) {
+      if (retryTarget) {
+        console.warn(
+          `[cyberboss] system reply retrying with refreshed context token thread=${state.threadId} user=${retryTarget.userId}`
+        );
+        try {
+          const retryPayload = this.buildRetryPayload(payload, retryTarget);
+          await this.channelAdapter.sendText(retryPayload);
+          this.rememberSuccessfulReplyTarget(state, retryTarget);
           return;
+        } catch (retryError) {
+          latestError = retryError;
         }
-        throw error;
       }
+    }
+
+    const contextlessTarget = this.resolveContextlessReplyTarget(initialTarget, latestError);
+    if (contextlessTarget) {
       console.warn(
-        `[cyberboss] system reply retrying with refreshed context token thread=${state.threadId} user=${retryTarget.userId}`
+        `[cyberboss] system reply retrying without context token thread=${state.threadId} user=${contextlessTarget.userId}`
       );
       try {
-        const retryPayload = {
-          userId: retryTarget.userId,
-          text: payload.text,
-          contextToken: retryTarget.contextToken,
-        };
-        if (payload.preserveBlock) {
-          retryPayload.preserveBlock = true;
-        }
+        const retryPayload = this.buildRetryPayload(payload, contextlessTarget);
+        retryPayload.omitContextToken = true;
         await this.channelAdapter.sendText(retryPayload);
-        state.replyTarget = retryTarget;
-        if (state.bindingKey) {
-          this.replyTargetByBindingKey.set(state.bindingKey, {
-            userId: retryTarget.userId,
-            contextToken: retryTarget.contextToken,
-            provider: retryTarget.provider,
-          });
-        }
+        this.rememberSuccessfulReplyTarget(state, contextlessTarget);
+        return;
       } catch (retryError) {
-        const deferred = await this.deferSystemReply(state, payload.text, retryError, kind);
-        if (deferred) {
-          return;
-        }
-        throw retryError;
+        latestError = retryError;
       }
+    }
+
+    const deferred = await this.deferSystemReply(state, payload.text, latestError, kind);
+    if (deferred) {
+      return;
+    }
+    throw latestError;
+  }
+
+  buildRetryPayload(payload, target) {
+    const retryPayload = {
+      userId: target.userId,
+      text: payload.text,
+      contextToken: target.contextToken,
+    };
+    if (payload.preserveBlock) {
+      retryPayload.preserveBlock = true;
+    }
+    if (payload.provider) {
+      retryPayload.provider = payload.provider;
+    }
+    return retryPayload;
+  }
+
+  rememberSuccessfulReplyTarget(state, target) {
+    state.replyTarget = target;
+    if (state.bindingKey) {
+      this.replyTargetByBindingKey.set(state.bindingKey, {
+        userId: target.userId,
+        contextToken: target.contextToken,
+        provider: target.provider,
+      });
     }
   }
 
@@ -483,6 +517,17 @@ class StreamDelivery {
     return {
       userId: currentTarget.userId,
       contextToken: refreshedContextToken,
+      provider: currentTarget.provider,
+    };
+  }
+
+  resolveContextlessReplyTarget(currentTarget, error) {
+    if (!isSystemReplyContextFailure(error) || !currentTarget?.userId) {
+      return null;
+    }
+    return {
+      userId: currentTarget.userId,
+      contextToken: "",
       provider: currentTarget.provider,
     };
   }
@@ -692,12 +737,12 @@ function normalizeText(value) {
 }
 
 function normalizeReplyTarget(target) {
-  if (!target?.userId || !target?.contextToken) {
+  if (!target?.userId) {
     return null;
   }
   return {
     userId: String(target.userId).trim(),
-    contextToken: String(target.contextToken).trim(),
+    contextToken: normalizeText(target.contextToken),
     provider: normalizeText(target.provider),
   };
 }

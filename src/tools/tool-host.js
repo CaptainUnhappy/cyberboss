@@ -93,6 +93,76 @@ const PROJECT_TOOLS = [
     },
   },
   {
+    name: "cyberboss_memory_remember",
+    description: "Create or update one durable Cyberboss memory. Use for stable user preferences, relationships, reply style, recurring constraints, and long-lived plans; do not store unrequested sensitive data or forwarded material as user facts.",
+    shortHint: "Remember or update one durable user fact or preference.",
+    topics: ["memory"],
+    inputSchema: {
+      type: "object",
+      required: ["content"],
+      properties: {
+        key: { type: "string", description: "Stable key used to update the same memory later." },
+        category: { type: "string", description: "Category such as profile, preference, style, relationship, plan, or constraint." },
+        content: { type: "string", description: "Concise self-contained memory content." },
+        tags: { type: "array", items: { type: "string" } },
+        source: { type: "string", description: "Short provenance note, never a raw protocol payload." },
+        pinned: { type: "boolean", description: "Always include this memory in automatic recall." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = services.memory.remember(args);
+      return {
+        text: `Memory ${result.created ? "created" : "updated"}: ${result.entry.key || result.entry.id}`,
+        data: result,
+      };
+    },
+  },
+  {
+    name: "cyberboss_memory_search",
+    description: "Search durable Cyberboss memory before answering questions that depend on user preferences, relationships, prior decisions, reply style, or recurring plans.",
+    shortHint: "Search durable memory by query, category, or tags.",
+    topics: ["memory"],
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        categories: { type: "array", items: { type: "string" } },
+        tags: { type: "array", items: { type: "string" } },
+        limit: { type: "integer" },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = services.memory.search(args);
+      return {
+        text: `Memory search returned ${result.entries.length} entries.`,
+        data: result,
+      };
+    },
+  },
+  {
+    name: "cyberboss_memory_forget",
+    description: "Delete durable Cyberboss memory by id or stable key when the user retracts it or asks for it to be forgotten.",
+    shortHint: "Forget one durable memory by id or key.",
+    topics: ["memory"],
+    inputSchema: {
+      type: "object",
+      required: ["identifier"],
+      properties: {
+        identifier: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = services.memory.forget(args);
+      return {
+        text: `Memory removed: ${result.removedCount}.`,
+        data: result,
+      };
+    },
+  },
+  {
     name: "cyberboss_reminder_create",
     description: "Create a reminder in Cyberboss.",
     shortHint: "Create a reminder with direct text plus delayMinutes or dueAt.",

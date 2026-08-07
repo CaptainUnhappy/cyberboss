@@ -228,9 +228,6 @@ class StickerService {
     }
     const contextTokens = loadPersistedContextTokens(this.config, account.accountId);
     const contextToken = normalizeText(contextTokens[targetUserId]);
-    if (!contextToken) {
-      return false;
-    }
     await this.channelAdapter.sendText({
       userId: targetUserId,
       text: normalizedText,

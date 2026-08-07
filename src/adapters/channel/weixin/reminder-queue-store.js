@@ -84,7 +84,7 @@ function normalizeReminder(reminder) {
   const text = typeof reminder.text === "string" ? reminder.text.trim() : "";
   const dueAtMs = Number(reminder.dueAtMs);
   const createdAt = typeof reminder.createdAt === "string" ? reminder.createdAt.trim() : "";
-  if (!id || !accountId || !senderId || !contextToken || !text || !Number.isFinite(dueAtMs) || dueAtMs <= 0) {
+  if (!id || !accountId || !senderId || !text || !Number.isFinite(dueAtMs) || dueAtMs <= 0) {
     return null;
   }
   return {

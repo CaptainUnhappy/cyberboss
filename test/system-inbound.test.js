@@ -5,6 +5,11 @@ const os = require("os");
 const path = require("path");
 
 const { CyberbossApp } = require("../src/core/app");
+const {
+  assembleRuntimeTurnText,
+  buildMergedInboundPrepared,
+  takeImageOnlyBatchMessages,
+} = require("../src/core/inbound-turn");
 
 test("system messages bypass normal inbound wrapping", async () => {
   const prepared = await CyberbossApp.prototype.prepareIncomingMessageForRuntime.call({}, {
@@ -93,6 +98,171 @@ test("image attachments stay as inbound drafts before runtime turn assembly", as
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test("system messages dispatch to a known platform user without a context token", async () => {
+  let captured = null;
+  const dispatched = await CyberbossApp.prototype.dispatchSystemMessage.call({
+    channelAdapter: {
+      getKnownContextTokens() {
+        return {};
+      },
+    },
+    systemMessageDispatcher: {
+      buildPreparedMessage(message, contextToken) {
+        return {
+          provider: "system",
+          workspaceId: "default",
+          accountId: "account-1",
+          senderId: message.senderId,
+          contextToken,
+          workspaceRoot: "/workspace",
+          text: message.text,
+        };
+      },
+    },
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          buildBindingKey() {
+            return "binding-1";
+          },
+        };
+      },
+    },
+    isTurnDispatchBlocked() {
+      return false;
+    },
+    async dispatchPreparedTurn(payload) {
+      captured = payload;
+      return true;
+    },
+  }, {
+    id: "system-1",
+    senderId: "platform-user@im.wechat",
+    text: "periodic check-in",
+  });
+
+  assert.equal(dispatched, true);
+  assert.equal(captured.prepared.senderId, "platform-user@im.wechat");
+  assert.equal(captured.prepared.contextToken, "");
+});
+
+test("quoted attachments retain their origin and reference through persistence", async () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-quoted-inbound-test-"));
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    headers: { get: () => "image/jpeg" },
+    async arrayBuffer() {
+      return Buffer.from([0xff, 0xd8, 0xff, 0x00]);
+    },
+  });
+
+  try {
+    const prepared = await CyberbossApp.prototype.prepareIncomingMessageForRuntime.call({
+      config: {
+        stateDir,
+        weixinCdnBaseUrl: "https://cdn.example.com",
+      },
+      channelAdapter: { async sendText() {} },
+    }, {
+      provider: "weixin",
+      text: "总结一下",
+      senderId: "user-1",
+      contextToken: "ctx-1",
+      quotedContexts: [{
+        kind: "image",
+        title: "引用图片",
+        text: "",
+        url: "",
+        attachmentRefs: ["quoted:message-1:0"],
+        rawSecret: "must-not-leak",
+      }],
+      attachments: [{
+        kind: "image",
+        origin: "quoted",
+        quoteIndex: 0,
+        attachmentRef: "quoted:message-1:0",
+        fileName: "quoted.jpg",
+        directUrls: ["https://cdn.example.com/quoted.jpg"],
+        mediaRef: { encryptType: 0 },
+      }],
+      receivedAt: "2026-08-06T05:20:00.000Z",
+    }, "/workspace");
+
+    assert.equal(prepared.attachments[0].origin, "quoted");
+    assert.equal(prepared.attachments[0].quoteIndex, 0);
+    assert.equal(prepared.attachments[0].attachmentRef, "quoted:message-1:0");
+    assert.deepEqual(prepared.quotedContexts, [{
+      kind: "image",
+      title: "引用图片",
+      text: "",
+      url: "",
+      attachmentRefs: ["quoted:message-1:0"],
+    }]);
+
+    const prompt = assembleRuntimeTurnText({ prepared });
+    assert.ok(prompt.startsWith("总结一下"));
+    assert.ok(prompt.indexOf("Quoted context:") < prompt.indexOf("Saved attachments:"));
+    assert.match(prompt, /\[quoted image\]/i);
+    assert.match(prompt, /quoted:message-1:0/);
+    assert.doesNotMatch(prompt, /must-not-leak|aes_key|encrypt_query_param/i);
+    assert.ok(prompt.endsWith("Message time: [2026-08-06 13:20]"));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("merged inbound messages preserve ordered quote contexts", () => {
+  const merged = buildMergedInboundPrepared({
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    messages: [{
+      originalText: "第一条",
+      quotedContexts: [{ kind: "text", title: "A", text: "甲", attachmentRefs: [] }],
+      attachments: [],
+      attachmentFailures: [],
+      receivedAt: "2026-08-06T05:20:00.000Z",
+    }],
+    trailingPrepared: {
+      originalText: "第二条",
+      quotedContexts: [{ kind: "link", title: "B", text: "乙", url: "https://example.com", attachmentRefs: [] }],
+      attachments: [],
+      attachmentFailures: [],
+      receivedAt: "2026-08-06T05:20:01.000Z",
+    },
+  });
+
+  assert.equal(merged.originalText, "第一条\n\n第二条");
+  assert.deepEqual(merged.quotedContexts.map((item) => item.title), ["A", "B"]);
+  assert.equal(merged.receivedAt, "2026-08-06T05:20:01.000Z");
+});
+
+test("quoted image contexts follow their attachment batch", () => {
+  const attachments = Array.from({ length: 12 }, (_, index) => ({
+    kind: "image",
+    isImage: true,
+    attachmentRef: `quoted:message-1:${index}`,
+  }));
+  const quotedContexts = attachments.map((item, index) => ({
+    kind: "image",
+    title: `image-${index}`,
+    attachmentRefs: [item.attachmentRef],
+  }));
+
+  const split = takeImageOnlyBatchMessages([{
+    originalText: "",
+    attachments,
+    quotedContexts,
+  }], 10);
+
+  assert.equal(split.batchMessages[0].quotedContexts.length, 10);
+  assert.equal(split.remainingMessages[0].quotedContexts.length, 2);
+  assert.deepEqual(
+    split.remainingMessages[0].quotedContexts.map((item) => item.title),
+    ["image-10", "image-11"]
+  );
 });
 
 test("image prompt assembly is runtime-neutral for claudecode drafts", async () => {

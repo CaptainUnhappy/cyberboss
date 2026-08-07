@@ -162,6 +162,7 @@ CYBERBOSS_VISION_MODEL=
 CYBERBOSS_VISION_TIMEOUT_MS=30000
 CYBERBOSS_ACCOUNT_ID=
 CYBERBOSS_WEIXIN_MIN_CHUNK_CHARS=20
+CYBERBOSS_SYSTEM_ACTION_INSTRUCTIONS_FILE=
 CYBERBOSS_WEIXIN_BASE_URL=https://ilinkai.weixin.qq.com
 CYBERBOSS_WEIXIN_CDN_BASE_URL=https://novac2c.cdn.weixin.qq.com/c2c
 CYBERBOSS_WEIXIN_QR_BOT_TYPE=3
@@ -212,6 +213,8 @@ CYBERBOSS_LOCATION_BATTERY_HISTORY_LIMIT=100
   单张图片 caption 请求超时时间。
 - `CYBERBOSS_WEIXIN_MIN_CHUNK_CHARS`
   设置微信短分片合并阈值默认值。
+- `CYBERBOSS_SYSTEM_ACTION_INSTRUCTIONS_FILE`
+  覆盖随机 check-in、提醒和位置事件使用的系统唤醒提示词文件。留空时使用 `templates/system-action-instructions.md`。
 - `CYBERBOSS_WEIXIN_BASE_URL`、`CYBERBOSS_WEIXIN_CDN_BASE_URL`、`CYBERBOSS_WEIXIN_QR_BOT_TYPE`
   在特殊部署环境下覆盖微信桥接接口地址和二维码 bot 类型。
 - `CYBERBOSS_ENABLE_LOCATION_SERVER`
@@ -233,6 +236,13 @@ CYBERBOSS_LOCATION_BATTERY_HISTORY_LIMIT=100
 
 
 `CYBERBOSS_ALLOWED_USER_IDS` 支持逗号分隔多个 user id。
+
+### 修改默认提示词
+
+- 微信线程的人格与长期行为默认模板位于 `templates/weixin-instructions.md`。首次运行后会生成 `${HOME}/.cyberboss/weixin-instructions.md`，日常应编辑生成后的文件，再在微信发送 `/reread` 让当前线程重新读取。
+- 随机 check-in、提醒和位置事件共用的系统唤醒提示词位于 `templates/system-action-instructions.md`。也可以通过 `CYBERBOSS_SYSTEM_ACTION_INSTRUCTIONS_FILE` 指向自己的文件；该文件按修改时间自动重载。
+- 系统唤醒提示词会先放稳定指令，再放 `Trigger`，最后放动态 `Event time`；普通微信消息同样把 `Message time` 放在末尾，以延长可复用提示词前缀、提高 provider 的提示词缓存命中机会。
+- 两种提示词文件都支持 `{{USER_NAME}}`；其中的女性人称会按 `CYBERBOSS_USER_GENDER` 自动替换。
 
 原因有两个：
 

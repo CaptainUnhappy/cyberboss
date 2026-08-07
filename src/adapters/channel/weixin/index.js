@@ -8,9 +8,10 @@ const { createInboundFilter } = require("./message-utils");
 const { sendWeixinMediaFile } = require("./media-send");
 const { loadSyncBuffer, saveSyncBuffer } = require("./sync-buffer-store");
 const { loadWeixinConfig, saveWeixinConfig, DEFAULT_MIN_WEIXIN_CHUNK } = require("./config-store");
+const { sendWeFlowUiaText } = require("../../../integrations/weflow-outbound");
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
-const MAX_WEIXIN_CHUNK = 3800;
+const MAX_WEIXIN_CHUNK = 4000;
 const SEND_MESSAGE_CHUNK_INTERVAL_MS = 350;
 const WEIXIN_MAX_DELIVERY_MESSAGES = 10;
 
@@ -59,12 +60,9 @@ function createWeixinChannelAdapter(config) {
     return ensureContextTokenCache()[normalizedUserId] || "";
   }
 
-  function sendTextChunks({ userId, text, contextToken = "", preserveBlock = false }) {
+  function sendTextChunks({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "" }) {
     const account = ensureAccount();
-    const resolvedToken = resolveContextToken(userId, contextToken);
-    if (!resolvedToken) {
-      throw new Error(`Missing context_token. Cannot reply to user ${userId}.`);
-    }
+    const resolvedToken = omitContextToken ? "" : resolveContextToken(userId, contextToken);
     const content = String(text || "");
     if (!content.trim()) {
       return Promise.resolve();
@@ -81,6 +79,9 @@ function createWeixinChannelAdapter(config) {
     return sendChunks.reduce((promise, chunk, index) => promise
       .then(() => {
         const deliveryChunk = finalizeWeixinDeliveryChunk(chunk) || "Completed.";
+        if (provider === "weflow-uia") {
+          return sendWeFlowUiaText(config, { text: deliveryChunk });
+        }
         return sendText({
           baseUrl: account.baseUrl,
           token: account.token,
@@ -167,8 +168,8 @@ function createWeixinChannelAdapter(config) {
       const account = ensureAccount();
       return inboundFilter.normalize(message, config, account.accountId);
     },
-    async sendText({ userId, text, contextToken = "", preserveBlock = false }) {
-      await sendTextChunks({ userId, text, contextToken, preserveBlock });
+    async sendText({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "" }) {
+      await sendTextChunks({ userId, text, contextToken, preserveBlock, omitContextToken, provider });
     },
     async sendTyping({ userId, status = 1, contextToken = "" }) {
       const account = ensureAccount();
@@ -201,9 +202,6 @@ function createWeixinChannelAdapter(config) {
     async sendFile({ userId, filePath, contextToken = "" }) {
       const account = ensureAccount();
       const resolvedToken = resolveContextToken(userId, contextToken);
-      if (!resolvedToken) {
-        throw new Error(`Missing context_token. Cannot send a file to user ${userId}.`);
-      }
       return sendWeixinMediaFile({
         filePath,
         to: userId,
@@ -291,15 +289,58 @@ function chunkReplyTextForWeixin(text, minChunk = DEFAULT_MIN_WEIXIN_CHUNK) {
     return chunkReplyText(normalized, MAX_WEIXIN_CHUNK);
   }
 
-  const chunks = [];
+  const unitsWithinLimit = [];
   for (const unit of units) {
     if (unit.length <= MAX_WEIXIN_CHUNK) {
-      chunks.push(unit);
+      unitsWithinLimit.push(unit);
       continue;
     }
-    chunks.push(...chunkReplyText(unit, MAX_WEIXIN_CHUNK));
+    unitsWithinLimit.push(...chunkReplyText(unit, MAX_WEIXIN_CHUNK));
   }
-  return mergeShortChunks(chunks.filter(Boolean), MAX_WEIXIN_CHUNK, minChunk);
+  return coalesceNaturalChunks(
+    unitsWithinLimit.filter(Boolean),
+    MAX_WEIXIN_CHUNK,
+    normalizeChunkTarget(minChunk, DEFAULT_MIN_WEIXIN_CHUNK),
+  );
+}
+
+function coalesceNaturalChunks(chunks, maxLength, targetLength) {
+  if (!chunks.length) {
+    return [];
+  }
+  const merged = [];
+  let buffer = "";
+  for (const sourceChunk of chunks) {
+    for (const chunk of splitUtf8(sourceChunk, maxLength)) {
+      const joined = buffer ? `${buffer}${chunk}` : chunk;
+      if (buffer && joined.length > maxLength) {
+        merged.push(buffer);
+        buffer = chunk;
+      } else {
+        buffer = joined;
+      }
+      if (buffer.length >= targetLength) {
+        merged.push(buffer);
+        buffer = "";
+      }
+    }
+  }
+  if (buffer) {
+    const previous = merged[merged.length - 1] || "";
+    if (previous && previous.length + buffer.length <= maxLength) {
+      merged[merged.length - 1] = `${previous}${buffer}`;
+    } else {
+      merged.push(buffer);
+    }
+  }
+  return merged;
+}
+
+function normalizeChunkTarget(value, fallback) {
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) && parsed >= 1 && parsed <= MAX_WEIXIN_CHUNK
+    ? parsed
+    : fallback;
 }
 
 function mergeShortChunks(chunks, maxLength, minLength) {
@@ -323,51 +364,36 @@ function mergeShortChunks(chunks, maxLength, minLength) {
   return merged;
 }
 
-function packChunksForWeixinDelivery(chunks, maxMessages = 10, maxChunkChars = 3800) {
+function packChunksForWeixinDelivery(chunks, maxMessages = 10, maxChunkChars = 4000) {
   const normalizedChunks = Array.isArray(chunks)
     ? chunks.map((chunk) => normalizeLineEndings(chunk)).filter((chunk) => chunk.trim())
     : [];
-  if (!normalizedChunks.length || normalizedChunks.length <= maxMessages) {
-    return normalizedChunks;
+  if (!normalizedChunks.length) {
+    return [];
   }
 
-  const packed = normalizedChunks.slice(0, Math.max(0, maxMessages - 1));
-  const tailChunks = normalizedChunks.slice(Math.max(0, maxMessages - 1));
-  if (!tailChunks.length) {
-    return packed;
-  }
-
-  const tailText = tailChunks.join("") || "Completed.";
-  if (tailText.length <= maxChunkChars) {
-    packed.push(tailText);
-    return packed;
-  }
-
-  const tailHardChunks = splitUtf8(tailText, maxChunkChars);
-  if (tailHardChunks.length === 1) {
-    packed.push(tailHardChunks[0]);
-    return packed;
-  }
-
-  const preserveCount = Math.max(0, maxMessages - tailHardChunks.length);
-  const preserved = normalizedChunks.slice(0, preserveCount);
-  const rebundledTail = normalizedChunks.slice(preserveCount);
-  const groupedTail = [];
+  // Greedily fill each bubble up to the documented channel limit while
+  // preserving the separators already attached to natural text units.
+  const grouped = [];
   let current = "";
-  for (const chunk of rebundledTail) {
-    const joined = current ? `${current}${chunk}` : chunk;
-    if (current && joined.length > maxChunkChars) {
-      groupedTail.push(current);
-      current = chunk;
-      continue;
+  for (const sourceChunk of normalizedChunks) {
+    for (const chunk of splitUtf8(sourceChunk, maxChunkChars)) {
+      const joined = current ? `${current}${chunk}` : chunk;
+      if (current && joined.length > maxChunkChars) {
+        grouped.push(current);
+        current = chunk;
+        continue;
+      }
+      current = joined;
     }
-    current = joined;
   }
   if (current) {
-    groupedTail.push(current);
+    grouped.push(current);
   }
-
-  return preserved.concat(groupedTail.map((item) => normalizeLineEndings(item) || "Completed.")).slice(0, maxMessages);
+  // maxMessages is a soft target. Content is never discarded when a very long
+  // reply inherently needs more bubbles than the target allows.
+  void maxMessages;
+  return grouped.map((item) => normalizeLineEndings(item) || "Completed.");
 }
 
 function splitTextAtBoundaries(text, boundaries) {
@@ -487,6 +513,7 @@ module.exports = {
   stripChunkTailChineseFullStops,
   chunkReplyText,
   chunkReplyTextForWeixin,
+  coalesceNaturalChunks,
   mergeShortChunks,
   packChunksForWeixinDelivery,
   splitTextAtBoundaries,

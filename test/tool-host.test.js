@@ -11,6 +11,17 @@ function createHost() {
           return { filePath: "/tmp/diary.md", ...args };
         },
       },
+      memory: {
+        remember(args) {
+          return { created: true, entry: { id: "mem-1", ...args } };
+        },
+        search(args) {
+          return { query: args.query || "", entries: [{ id: "mem-1", content: "short replies" }], total: 1 };
+        },
+        forget() {
+          return { removed: [{ id: "mem-1" }], removedCount: 1 };
+        },
+      },
       reminder: {
         async create(args) {
           return { id: "reminder-1", ...args };
@@ -230,6 +241,27 @@ test("tool host validates structured reminder input types", async () => {
       delayMinutes: "30",
     }, {});
   }, /input\.delayMinutes must be an integer/);
+});
+
+test("tool host exposes durable memory remember, search, and forget operations", async () => {
+  const host = createHost();
+  const remembered = await host.invokeTool("cyberboss_memory_remember", {
+    key: "reply_style",
+    category: "style",
+    content: "short replies",
+    tags: ["wechat"],
+    pinned: true,
+  }, {});
+  const searched = await host.invokeTool("cyberboss_memory_search", {
+    query: "reply",
+    limit: 3,
+  }, {});
+  const forgotten = await host.invokeTool("cyberboss_memory_forget", {
+    identifier: "reply_style",
+  }, {});
+  assert.match(remembered.text, /Memory created/);
+  assert.equal(searched.data.entries[0].content, "short replies");
+  assert.equal(forgotten.data.removedCount, 1);
 });
 
 test("tool host exposes sticker tools with compact structured outputs", async () => {

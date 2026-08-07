@@ -3,6 +3,7 @@ const { SessionStore } = require("../adapters/runtime/codex/session-store");
 const { createTimelineIntegration } = require("../integrations/timeline");
 const { ChannelFileService } = require("../services/channel-file-service");
 const { DiaryService } = require("../services/diary-service");
+const { MemoryService } = require("../services/memory-service");
 const { ReminderService } = require("../services/reminder-service");
 const { StickerService } = require("../services/sticker-service");
 const { SystemMessageService } = require("../services/system-message-service");
@@ -24,6 +25,7 @@ function createProjectTooling(config, options = {}) {
   const channelFile = new ChannelFileService({ config, channelAdapter, sessionStore });
   const services = {
     diary: new DiaryService({ config }),
+    memory: new MemoryService({ config }),
     reminder: new ReminderService({ config, sessionStore }),
     system: new SystemMessageService({ config, sessionStore }),
     channelFile,

@@ -10,6 +10,18 @@ const { createClaudeCodeRuntimeAdapter } = require("../adapters/runtime/claudeco
 const { findModelByQuery } = require("../adapters/runtime/codex/model-catalog");
 const { createTimelineIntegration } = require("../integrations/timeline");
 const {
+  WechatCliInboxSource,
+  persistLocalWechatAttachments,
+} = require("../integrations/wechat-cli-inbox");
+const { WeFlowInboxSource } = require("../integrations/weflow-inbox");
+const {
+  executeWeFlowControlCommand,
+  formatWeFlowControlConfirmation,
+  isWeFlowControlConfirmation,
+  isWeFlowControlCommand,
+  resolveWeFlowSendSource,
+} = require("../integrations/weflow-outbound");
+const {
   assembleRuntimeTurnText,
   buildInboundDraft,
   buildMergedInboundPrepared,
@@ -19,6 +31,10 @@ const {
   takeImageOnlyBatchMessages,
 } = require("./inbound-turn");
 const { resolveVisionContext } = require("../services/vision-context");
+const {
+  VoiceTranscriptionService,
+  enrichMessageWithVoiceTranscripts,
+} = require("../services/voice-transcription");
 const {
   buildWeixinHelpText,
 } = require("./command-registry");
@@ -82,6 +98,9 @@ class CyberbossApp {
     this.pendingImageInboundByScope = new Map();
     this.turnBoundaryScopeKeys = new Set();
     this.systemMessageDispatcher = null;
+    this.wechatCliInboxSource = null;
+    this.weflowInboxSource = null;
+    this.voiceTranscriptionService = new VoiceTranscriptionService({ config });
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
       sessionStore: this.runtimeAdapter.getSessionStore(),
@@ -154,9 +173,17 @@ class CyberbossApp {
         console.error(`[cyberboss] checkin poller stopped: ${error.message}`);
       });
     }
+    await this.ensureWechatCliInboxStarted();
+    void this.warmVoiceTranscription().catch((error) => {
+      console.warn(`[cyberboss] voice transcription warmup failed: ${formatErrorMessage(error)}`);
+    });
+    await this.ensureWeFlowInboxStarted();
 
     const shutdown = createShutdownController(async () => {
       this.clearPendingImageInboundTimers();
+      await this.closeWechatCliInbox();
+      await this.closeWeFlowInbox();
+      await this.closeVoiceTranscription();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
     });
@@ -207,6 +234,9 @@ class CyberbossApp {
     } finally {
       shutdown.dispose();
       this.clearPendingImageInboundTimers();
+      await this.closeWechatCliInbox();
+      await this.closeWeFlowInbox();
+      await this.closeVoiceTranscription();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
     }
@@ -230,6 +260,202 @@ class CyberbossApp {
       return;
     }
     await this.projectServices.whereabouts.closeServer();
+  }
+
+  async ensureWechatCliInboxStarted() {
+    if (!this.config.startWithWechatCliInbox || this.wechatCliInboxSource) {
+      return this.wechatCliInboxSource;
+    }
+    this.wechatCliInboxSource = new WechatCliInboxSource({
+      config: this.config,
+      isReady: () => Boolean(this.resolveWechatCliInboxReplyTarget()),
+      onMessage: (message, snapshot) => this.handleWechatCliInboxMessage(message, snapshot),
+    });
+    await this.wechatCliInboxSource.start();
+    console.log(
+      `[cyberboss] wechat-cli inbox enabled chat=${this.config.wechatCliInboxChat} intervalMs=${this.config.wechatCliInboxPollIntervalMs}`
+    );
+    return this.wechatCliInboxSource;
+  }
+
+  async closeWechatCliInbox() {
+    const source = this.wechatCliInboxSource;
+    this.wechatCliInboxSource = null;
+    if (source) {
+      await source.stop();
+    }
+  }
+
+  async ensureWeFlowInboxStarted() {
+    if (!this.config.startWithWeflowInbox || this.weflowInboxSource) {
+      return this.weflowInboxSource;
+    }
+    this.weflowInboxSource = new WeFlowInboxSource({
+      config: this.config,
+      isReady: () => Boolean(this.resolveWeFlowInboxReplyTarget()),
+      onMessage: (message, snapshot) => this.handleWeFlowInboxMessage(message, snapshot),
+    });
+    await this.weflowInboxSource.start();
+    console.log(
+      `[cyberboss] WeFlow inbox enabled chat=${this.config.weflowInboxChat} baseUrl=${this.config.weflowBaseUrl}`
+    );
+    return this.weflowInboxSource;
+  }
+
+  async closeWeFlowInbox() {
+    const source = this.weflowInboxSource;
+    this.weflowInboxSource = null;
+    if (source) {
+      await source.stop();
+    }
+  }
+
+  async warmVoiceTranscription() {
+    const service = this.voiceTranscriptionService;
+    if (!service) return;
+    const result = await service.warm();
+    const description = service.describe();
+    if (result.status === "ready") {
+      console.log(`[cyberboss] voice transcription ready model=${description.model} device=${description.device}/${description.computeType}`);
+    } else if (result.status === "model_missing") {
+      console.warn(`[cyberboss] voice transcription model missing: ${description.model}`);
+    }
+  }
+
+  async closeVoiceTranscription() {
+    await this.voiceTranscriptionService?.close?.();
+  }
+
+  resolveWechatCliInboxReplyTarget() {
+    return this.resolveLocalWechatReplyTarget(this.config.wechatCliInboxReplyUserId);
+  }
+
+  resolveWeFlowInboxReplyTarget() {
+    return this.resolveLocalWechatReplyTarget(this.config.weflowInboxReplyUserId);
+  }
+
+  async resolveWeFlowReplySource() {
+    return resolveWeFlowSendSource(this.config);
+  }
+
+  resolveLocalWechatReplyTarget(replyUserId = "") {
+    if (!this.activeAccountId) {
+      return null;
+    }
+    const knownTokens = this.channelAdapter.getKnownContextTokens();
+    const explicitUserId = normalizeCommandArgument(replyUserId);
+    if (explicitUserId) {
+      return {
+        userId: explicitUserId,
+        contextToken: knownTokens[explicitUserId] || "",
+        provider: "weixin",
+      };
+    }
+
+    const knownUserIds = Object.keys(knownTokens).filter((userId) => normalizeCommandArgument(userId));
+    if (knownUserIds.length === 1) {
+      return {
+        userId: knownUserIds[0],
+        contextToken: knownTokens[knownUserIds[0]],
+        provider: "weixin",
+      };
+    }
+
+    const userId = resolvePreferredSenderId({
+      config: this.config,
+      accountId: this.activeAccountId,
+      explicitUser: explicitUserId,
+      sessionStore: this.runtimeAdapter.getSessionStore(),
+    });
+    const contextToken = knownTokens[userId] || "";
+    return userId ? { userId, contextToken, provider: "weixin" } : null;
+  }
+
+  async handleWechatCliInboxMessage(message, snapshot = {}) {
+    const target = this.resolveWechatCliInboxReplyTarget();
+    if (!target) {
+      return false;
+    }
+    const persisted = await persistLocalWechatAttachments({
+      attachments: message.attachments,
+      stateDir: this.config.stateDir,
+      messageId: message.id,
+      receivedAt: message.receivedAt,
+      config: this.config,
+    });
+    const normalized = {
+      provider: "weixin",
+      accountId: this.activeAccountId,
+      workspaceId: this.config.workspaceId,
+      senderId: target.userId,
+      chatId: `wechat-cli:${normalizeCommandArgument(snapshot.chatUsername) || normalizeCommandArgument(this.config.wechatCliInboxChat)}`,
+      messageId: `wechat-cli:${message.id}`,
+      contextToken: target.contextToken,
+      text: buildWechatCliInboxTurnText(message, snapshot, this.config),
+      quotedContexts: Array.isArray(message.quotedContexts) ? message.quotedContexts : [],
+      attachments: [],
+      persistedAttachments: persisted.saved,
+      persistedAttachmentFailures: persisted.failed,
+      receivedAt: normalizeIsoTime(message.receivedAt)
+        || (message.timestamp ? new Date(message.timestamp * 1000).toISOString() : new Date().toISOString()),
+    };
+    await this.handlePreparedMessage(normalized, { allowCommands: false });
+    return true;
+  }
+
+  async handleWeFlowInboxMessage(message, snapshot = {}) {
+    const target = this.resolveWeFlowInboxReplyTarget();
+    if (!target) {
+      return false;
+    }
+    const persisted = await persistLocalWechatAttachments({
+      attachments: message.attachments,
+      stateDir: this.config.stateDir,
+      messageId: message.id,
+      receivedAt: message.receivedAt,
+      config: this.config,
+    });
+    const voice = await enrichMessageWithVoiceTranscripts({
+      message,
+      attachments: persisted.saved,
+      transcriptionService: this.voiceTranscriptionService,
+    });
+    const enrichedMessage = voice.message;
+    if (isWeFlowControlConfirmation(enrichedMessage.text)) {
+      console.log(`[cyberboss] WeFlow control confirmation consumed: ${enrichedMessage.text}`);
+      return true;
+    }
+    if (isWeFlowControlCommand(enrichedMessage.text)) {
+      console.log(`[cyberboss] WeFlow control command handled by bridge: ${enrichedMessage.text}`);
+      return true;
+    }
+    let sendSource;
+    try {
+      sendSource = await this.resolveWeFlowReplySource();
+    } catch (error) {
+      console.warn(`[cyberboss] WeFlow message waiting for a single reply route: ${formatErrorMessage(error)}`);
+      return false;
+    }
+    const chatUsername = normalizeCommandArgument(snapshot.chatUsername)
+      || normalizeCommandArgument(this.config.weflowInboxChat);
+    const normalized = {
+      provider: sendSource === "azzy" ? "weflow-uia" : "weixin",
+      accountId: this.activeAccountId,
+      workspaceId: this.config.workspaceId,
+      senderId: target.userId,
+      chatId: `weflow:${chatUsername}`,
+      messageId: `weflow:${enrichedMessage.id}`,
+      contextToken: target.contextToken,
+      text: buildWeFlowInboxTurnText(enrichedMessage, snapshot, this.config),
+      quotedContexts: Array.isArray(enrichedMessage.quotedContexts) ? enrichedMessage.quotedContexts : [],
+      attachments: [],
+      persistedAttachments: persisted.saved,
+      persistedAttachmentFailures: [...persisted.failed, ...voice.failures],
+      receivedAt: normalizeIsoTime(enrichedMessage.receivedAt)
+        || (enrichedMessage.timestamp ? new Date(enrichedMessage.timestamp * 1000).toISOString() : new Date().toISOString()),
+    };
+    await this.handlePreparedMessage(normalized, { allowCommands: false });
+    return true;
   }
 
   handleLocationAccepted(result) {
@@ -328,8 +554,44 @@ class CyberbossApp {
       return;
     }
 
+    if (isWeFlowControlConfirmation(normalized.text)) {
+      console.log(`[cyberboss] native control confirmation consumed: ${normalized.text}`);
+      return;
+    }
+    if (isWeFlowControlCommand(normalized.text)) {
+      await this.handleWeFlowControlCommand(normalized);
+      return;
+    }
+
     this.primeDeferredRepliesForSender(normalized);
     await this.handlePreparedMessage(normalized, { allowCommands: true });
+  }
+
+  async handleWeFlowControlCommand(normalized) {
+    try {
+      const result = await executeWeFlowControlCommand(this.config, {
+        command: normalized.text,
+        contact: "yourself",
+        notify: false,
+      });
+      const confirmation = formatWeFlowControlConfirmation(result);
+      await this.channelAdapter.sendText({
+        userId: normalized.senderId,
+        text: confirmation,
+        contextToken: normalized.contextToken,
+      });
+      console.log(
+        `[cyberboss] native control command ${normalized.text} -> ${result.send_source}`
+      );
+    } catch (error) {
+      const detail = formatErrorMessage(error);
+      console.warn(`[cyberboss] native control command failed: ${detail}`);
+      await this.channelAdapter.sendText({
+        userId: normalized.senderId,
+        text: `⚠️ 发信源切换失败：${detail}`,
+        contextToken: normalized.contextToken,
+      }).catch(() => {});
+    }
   }
 
   deferSystemReply({ threadId = "", userId = "", text = "", error = null, kind = "plain_reply" }) {
@@ -427,11 +689,13 @@ class CyberbossApp {
 
   async dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared }) {
     const pendingScopeKey = this.turnGateStore.begin(bindingKey, workspaceRoot);
-    await this.channelAdapter.sendTyping({
-      userId: prepared.senderId,
-      status: 1,
-      contextToken: prepared.contextToken,
-    }).catch(() => {});
+    if (prepared.provider !== "weflow-uia") {
+      await this.channelAdapter.sendTyping({
+        userId: prepared.senderId,
+        status: 1,
+        contextToken: prepared.contextToken,
+      }).catch(() => {});
+    }
 
     try {
       const model = this.runtimeAdapter.getSessionStore().getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
@@ -482,16 +746,21 @@ class CyberbossApp {
         userId: prepared.senderId,
         text: `❌ Request failed\n${messageText}`,
         contextToken: prepared.contextToken,
+        provider: prepared.provider,
       }).catch(() => {});
       return false;
     }
   }
 
   async buildRuntimeTurn({ prepared, model = "" }) {
+    const memoryContext = typeof this.resolveRelevantMemory === "function"
+      ? this.resolveRelevantMemory(prepared)
+      : { entries: [], items: [] };
     if (prepared?.provider === "system") {
       return {
-        text: String(prepared.text || "").trim(),
+        text: injectSystemMemoryContext(String(prepared.text || "").trim(), memoryContext.items),
         attachments: [],
+        memoryContext,
       };
     }
     const visionContext = await resolveVisionContext({
@@ -505,9 +774,33 @@ class CyberbossApp {
         prepared,
         config: this.config,
         visionContext,
+        memoryContext,
       }),
       attachments: Array.isArray(visionContext.runtimeAttachments) ? visionContext.runtimeAttachments : [],
       visionContext,
+      memoryContext,
+    };
+  }
+
+  resolveRelevantMemory(prepared) {
+    const service = this.projectServices?.memory;
+    if (!service || typeof service.search !== "function") {
+      return { entries: [], items: [] };
+    }
+    const quotedText = (Array.isArray(prepared?.quotedContexts) ? prepared.quotedContexts : [])
+      .flatMap((item) => [item?.title, item?.text])
+      .filter(Boolean)
+      .join("\n");
+    const query = prepared?.provider === "system"
+      ? `主动联系 定时唤醒 check-in 用户偏好 近期计划 ${String(prepared?.text || "")}`
+      : [prepared?.originalText, prepared?.text, quotedText].filter(Boolean).join("\n");
+    const result = service.search({
+      query,
+      limit: this.config.memoryRecallLimit,
+    });
+    return {
+      ...result,
+      items: Array.isArray(result?.entries) ? result.entries : [],
     };
   }
 
@@ -656,6 +949,7 @@ class CyberbossApp {
       provider: prepared.provider,
       originalText: prepared.originalText,
       text: prepared.text,
+      quotedContexts: Array.isArray(prepared.quotedContexts) ? prepared.quotedContexts : [],
       attachments: Array.isArray(prepared.attachments) ? prepared.attachments : [],
       attachmentFailures: Array.isArray(prepared.attachmentFailures) ? prepared.attachmentFailures : [],
       receivedAt: prepared.receivedAt,
@@ -703,6 +997,9 @@ class CyberbossApp {
           provider: pendingDispatch.prepared.provider,
           originalText: pendingDispatch.prepared.originalText,
           text: pendingDispatch.prepared.text,
+          quotedContexts: Array.isArray(pendingDispatch.prepared.quotedContexts)
+            ? pendingDispatch.prepared.quotedContexts
+            : [],
           attachments: pendingDispatch.prepared.attachments,
           attachmentFailures: pendingDispatch.prepared.attachmentFailures,
           receivedAt: pendingDispatch.prepared.receivedAt,
@@ -785,6 +1082,18 @@ class CyberbossApp {
         attachments: [],
         attachmentFailures: [],
       };
+    }
+
+    if (Array.isArray(normalized?.persistedAttachments)
+      || Array.isArray(normalized?.persistedAttachmentFailures)) {
+      return buildInboundDraft(normalized, {
+        attachments: Array.isArray(normalized.persistedAttachments)
+          ? normalized.persistedAttachments
+          : [],
+        attachmentFailures: Array.isArray(normalized.persistedAttachmentFailures)
+          ? normalized.persistedAttachmentFailures
+          : [],
+      });
     }
 
     const attachments = Array.isArray(normalized.attachments) ? normalized.attachments : [];
@@ -933,7 +1242,28 @@ class CyberbossApp {
   }
 
   async dispatchSystemMessage(message) {
-    const prepared = this.systemMessageDispatcher?.buildPreparedMessage(message, this.channelAdapter.getKnownContextTokens()[message.senderId] || "");
+    const knownContextTokens = this.channelAdapter.getKnownContextTokens();
+    const requestedSenderId = normalizeCommandArgument(message?.senderId);
+    let resolvedSenderId = requestedSenderId;
+    let contextToken = knownContextTokens[resolvedSenderId] || "";
+    const liveUserIds = Object.keys(knownContextTokens).filter((userId) => normalizeCommandArgument(userId));
+    if (!contextToken && liveUserIds.length === 1) {
+      resolvedSenderId = liveUserIds[0];
+      contextToken = knownContextTokens[resolvedSenderId];
+      console.warn(
+        `[cyberboss] system message target remapped from ${requestedSenderId || "(empty)"} to live ClawBot user ${resolvedSenderId}`
+      );
+    }
+    if (!resolvedSenderId) {
+      console.warn(
+        `[cyberboss] system message waiting id=${message?.id || ""} reason=no_target_user`
+      );
+      return false;
+    }
+    const prepared = this.systemMessageDispatcher?.buildPreparedMessage({
+      ...message,
+      senderId: resolvedSenderId,
+    }, contextToken);
     if (!prepared) {
       throw new Error("system message could not be prepared");
     }
@@ -1309,7 +1639,7 @@ class CyberbossApp {
       const current = this.channelAdapter.getMinChunkChars?.() ?? DEFAULT_MIN_WEIXIN_CHUNK;
       await this.channelAdapter.sendText({
         userId: normalized.senderId,
-        text: `💡 Current minimum merge chunk is ${current} characters. Usage: /chunk <number> (e.g. /chunk 50)`,
+        text: `💡 Current natural-boundary chunk target is ${current} characters. Usage: /chunk <number> (e.g. /chunk 3600)`,
         contextToken: normalized.contextToken,
       });
       return;
@@ -1326,7 +1656,7 @@ class CyberbossApp {
     const updated = this.channelAdapter.setMinChunkChars?.(parsed) ?? parsed;
     await this.channelAdapter.sendText({
       userId: normalized.senderId,
-      text: `✅ Minimum merge chunk set to ${updated} characters. Shorter fragments will be merged into one message up to this size.`,
+      text: `✅ Natural-boundary chunk target set to ${updated} characters. Adjacent fragments are coalesced up to WeChat's 4000-character limit.`,
       contextToken: normalized.contextToken,
     });
   }
@@ -1672,9 +2002,6 @@ class CyberbossApp {
       return null;
     }
     const contextToken = this.channelAdapter.getKnownContextTokens()[userId] || "";
-    if (!contextToken) {
-      return null;
-    }
     return {
       userId,
       contextToken,
@@ -1688,12 +2015,12 @@ function buildRunKey(threadId, turnId) {
 }
 
 function normalizeReplyTarget(target) {
-  if (!target?.userId || !target?.contextToken) {
+  if (!target?.userId) {
     return null;
   }
   return {
     userId: String(target.userId).trim(),
-    contextToken: String(target.contextToken).trim(),
+    contextToken: normalizeText(target.contextToken),
     provider: normalizeText(target.provider),
   };
 }
@@ -1857,6 +2184,91 @@ function formatErrorMessage(error) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function injectSystemMemoryContext(text, items) {
+  const source = String(text || "").trim();
+  const memories = (Array.isArray(items) ? items : [])
+    .map((item) => {
+      const content = normalizeText(item?.content).replace(/\s+/g, " ").slice(0, 2_000);
+      if (!content) {
+        return "";
+      }
+      const category = normalizeText(item?.category) || "memory";
+      const key = normalizeText(item?.key);
+      return `- [${key ? `${category}/${key}` : category}] ${content}`;
+    })
+    .filter(Boolean);
+  if (!source || !memories.length) {
+    return source;
+  }
+  const section = [
+    "Relevant durable memory:",
+    ...memories,
+    "Use this as background; do not mention memory mechanics in the outgoing message.",
+  ].join("\n");
+  const marker = "\n\nTrigger:\n";
+  const markerIndex = source.indexOf(marker);
+  if (markerIndex < 0) {
+    return `${source}\n\n${section}`;
+  }
+  return `${source.slice(0, markerIndex)}\n\n${section}${source.slice(markerIndex)}`;
+}
+
+function buildWechatCliInboxTurnText(message, snapshot = {}, config = {}) {
+  const chat = normalizeText(snapshot.chat) || normalizeText(config.wechatCliInboxChat) || "main account";
+  const header = `本地微信入站（来自大号会话 ${chat}）`;
+  const text = normalizeText(message?.text);
+  const title = normalizeText(message?.title);
+  const url = normalizeText(message?.url);
+  const body = [];
+  if (text) {
+    body.push(text);
+  } else if (title) {
+    body.push(`[${formatWechatCliKind(message?.kind)}] ${title}`);
+  }
+  if (url && !body.some((item) => item.includes(url))) {
+    body.push(url);
+  }
+  return [header, ...body].join("\n").trim();
+}
+
+function buildWeFlowInboxTurnText(message, snapshot = {}, config = {}) {
+  const chat = normalizeText(snapshot.chat)
+    || normalizeText(config.weflowInboxDisplayName)
+    || normalizeText(config.weflowInboxChat)
+    || "main account";
+  const header = `WeFlow 微信入站（来自大号会话 ${chat}）`;
+  const text = normalizeText(message?.text);
+  const title = normalizeText(message?.title);
+  const url = normalizeText(message?.url);
+  const body = [];
+  if (text) {
+    body.push(message?.voiceTranscript ? `[语音转写]\n${text}` : text);
+  } else if (title) {
+    body.push(`[${formatWechatCliKind(message?.kind)}] ${title}`);
+  }
+  if (url && !body.some((item) => item.includes(url))) {
+    body.push(url);
+  }
+  return [header, ...body].join("\n").trim();
+}
+
+function formatWechatCliKind(value) {
+  switch (normalizeText(value).toLowerCase()) {
+    case "image":
+      return "图片";
+    case "voice":
+      return "语音";
+    case "video":
+      return "视频";
+    case "file":
+      return "文件";
+    case "link":
+      return "链接";
+    default:
+      return "资料";
+  }
 }
 
 module.exports = { CyberbossApp };

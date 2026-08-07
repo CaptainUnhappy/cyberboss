@@ -40,9 +40,14 @@ function createInboundFilter() {
       }
 
       const itemList = Array.isArray(message.item_list) ? message.item_list : [];
-      const text = bodyFromItemList(itemList);
-      const attachments = extractAttachmentItems(itemList);
-      if (!text && !attachments.length) {
+      const messageId = normalizeMessageId(message);
+      const text = bodyFromItemList(itemList, { includeQuotedText: false });
+      const directAttachments = extractAttachmentItems(itemList, { origin: "direct" });
+      const quoted = extractQuotedItems(itemList, {
+        referenceScope: messageId || String(createdAtMs || "message"),
+      });
+      const attachments = [...directAttachments, ...quoted.attachments];
+      if (!text && !attachments.length && !quoted.contexts.length) {
         return null;
       }
 
@@ -52,10 +57,11 @@ function createInboundFilter() {
         workspaceId: config.workspaceId,
         senderId,
         chatId: senderId,
-        messageId: normalizeMessageId(message),
+        messageId,
         threadKey: normalizeText(message.session_id),
         text,
         attachments,
+        quotedContexts: quoted.contexts,
         contextToken: normalizeText(message.context_token),
         receivedAt: createdAtMs > 0 ? new Date(createdAtMs).toISOString() : new Date().toISOString(),
       };
@@ -63,7 +69,7 @@ function createInboundFilter() {
   };
 }
 
-function bodyFromItemList(items) {
+function bodyFromItemList(items, { includeQuotedText = true } = {}) {
   if (!Array.isArray(items) || !items.length) {
     return "";
   }
@@ -74,7 +80,7 @@ function bodyFromItemList(items) {
       if (!text) {
         continue;
       }
-      const ref = item?.ref_msg;
+      const ref = includeQuotedText ? item?.ref_msg : null;
       if (!ref || !ref.message_item || isMediaItemType(Number(ref.message_item.type))) {
         return text;
       }
@@ -102,18 +108,132 @@ function bodyFromItemList(items) {
   return "";
 }
 
+function extractQuotedItems(itemList, { referenceScope = "" } = {}) {
+  const contexts = [];
+  const attachments = [];
+  if (!Array.isArray(itemList) || !itemList.length) {
+    return { contexts, attachments };
+  }
+
+  for (const item of itemList) {
+    const ref = item?.ref_msg;
+    const messageItem = ref?.message_item;
+    if (!ref || !messageItem || typeof messageItem !== "object") {
+      continue;
+    }
+
+    const quoteIndex = contexts.length;
+    const normalizedScope = normalizeReferenceScope(referenceScope);
+    const attachmentRef = `quoted:${normalizedScope ? `${normalizedScope}:` : ""}${quoteIndex}`;
+    const attachment = normalizeAttachmentItem(messageItem, attachments.length, {
+      origin: "quoted",
+      quoteIndex,
+      attachmentRef,
+    });
+    if (attachment) {
+      attachments.push(attachment);
+    }
+
+    const link = extractKnownLink(messageItem);
+    const text = extractQuotedText(messageItem, link);
+    const title = normalizeText(ref.title) || link.title;
+    contexts.push({
+      kind: inferQuotedKind(messageItem, link),
+      title,
+      text,
+      url: link.url,
+      attachmentRefs: attachment ? [attachmentRef] : [],
+    });
+  }
+
+  return { contexts, attachments };
+}
+
+function inferQuotedKind(messageItem, link) {
+  if (link.url) {
+    return "link";
+  }
+  const itemType = Number(messageItem?.type);
+  if (itemType === MESSAGE_ITEM_TEXT) {
+    return "text";
+  }
+  if (itemType === MESSAGE_ITEM_IMAGE) {
+    return "image";
+  }
+  if (itemType === MESSAGE_ITEM_VOICE) {
+    return "voice";
+  }
+  if (itemType === MESSAGE_ITEM_FILE) {
+    return "file";
+  }
+  if (itemType === MESSAGE_ITEM_VIDEO) {
+    return "video";
+  }
+  return "unknown";
+}
+
+function extractQuotedText(messageItem, link) {
+  const itemType = Number(messageItem?.type);
+  if (itemType === MESSAGE_ITEM_TEXT || itemType === MESSAGE_ITEM_VOICE) {
+    return bodyFromItemList([messageItem], { includeQuotedText: false });
+  }
+  return normalizeText(
+    link.description
+    || messageItem?.file_item?.file_name
+    || messageItem?.file_item?.filename
+    || messageItem?.video_item?.file_name
+    || messageItem?.video_item?.filename
+  );
+}
+
+function extractKnownLink(messageItem) {
+  const candidates = [
+    messageItem?.link_item,
+    messageItem?.url_item,
+    messageItem?.app_item,
+    messageItem?.text_item?.link,
+  ].filter((value) => value && typeof value === "object");
+
+  let url = "";
+  let title = "";
+  let description = "";
+  for (const candidate of candidates) {
+    url ||= normalizeHttpUrl(candidate.url || candidate.link || candidate.href || candidate.web_url);
+    title ||= normalizeText(candidate.title || candidate.name);
+    description ||= normalizeText(candidate.description || candidate.desc || candidate.summary);
+  }
+
+  const text = normalizeText(messageItem?.text_item?.text);
+  url ||= extractHttpUrl(text);
+  return { url, title, description };
+}
+
+function extractHttpUrl(value) {
+  const match = normalizeText(value).match(/https?:\/\/[^\s<>"']+/iu);
+  return match ? normalizeHttpUrl(match[0]) : "";
+}
+
+function normalizeHttpUrl(value) {
+  const normalized = normalizeText(value);
+  return /^https?:\/\//iu.test(normalized) ? normalized : "";
+}
+
+function normalizeReferenceScope(value) {
+  return normalizeText(value).replace(/[^a-z0-9_.-]+/giu, "_").slice(0, 80);
+}
+
 function isMediaItemType(type) {
   return type === MESSAGE_ITEM_IMAGE || type === MESSAGE_ITEM_VOICE || type === MESSAGE_ITEM_FILE || type === MESSAGE_ITEM_VIDEO;
 }
 
-function extractAttachmentItems(itemList) {
+function extractAttachmentItems(itemList, metadata = {}) {
   if (!Array.isArray(itemList) || !itemList.length) {
     return [];
   }
 
   const attachments = [];
   for (let index = 0; index < itemList.length; index += 1) {
-    const normalized = normalizeAttachmentItem(itemList[index], index);
+    const normalized = normalizeAttachmentItem(itemList[index], index, metadata);
     if (normalized) {
       attachments.push(normalized);
     }
@@ -121,7 +241,11 @@ function extractAttachmentItems(itemList) {
   return attachments;
 }
 
-function normalizeAttachmentItem(item, index) {
+function normalizeAttachmentItem(item, index, {
+  origin = "direct",
+  quoteIndex = null,
+  attachmentRef = "",
+} = {}) {
   const itemType = Number(item?.type);
   const payload = resolveAttachmentPayload(itemType, item);
   if (!payload) {
@@ -134,6 +258,9 @@ function normalizeAttachmentItem(item, index) {
 
   return {
     kind: payload.kind,
+    origin: origin === "quoted" ? "quoted" : "direct",
+    quoteIndex: Number.isInteger(quoteIndex) && quoteIndex >= 0 ? quoteIndex : null,
+    attachmentRef: normalizeText(attachmentRef),
     itemType,
     index,
     fileName: normalizeText(
@@ -188,7 +315,6 @@ function normalizeAttachmentItem(item, index) {
         || item?.filekey
       ),
     },
-    rawItem: item,
   };
 }
 
@@ -279,4 +405,5 @@ function normalizeText(value) {
 module.exports = {
   createInboundFilter,
   bodyFromItemList,
+  extractQuotedItems,
 };

@@ -27,7 +27,8 @@ async function main() {
       ...process.argv.slice(2),
     ], {
       stdio: "inherit",
-      shell: process.platform === "win32",
+      shell: false,
+      windowsHide: true,
     });
 
     child.on("exit", (code, signal) => {

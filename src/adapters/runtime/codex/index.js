@@ -173,6 +173,7 @@ function createCodexRuntimeAdapter(config) {
         model: desiredModel,
         modelProvider: configuredModelProvider,
         workspaceRoot,
+        accessMode: config.codexAccessMode,
       });
       const result = await completion;
       return { threadId, ...result };
@@ -244,6 +245,7 @@ function createCodexRuntimeAdapter(config) {
         model: desiredModel,
         modelProvider: desiredModelProvider,
         workspaceRoot,
+        accessMode: config.codexAccessMode,
       });
       return {
         threadId,

@@ -11,23 +11,35 @@ function resolvePreferredSenderId({
     return normalizedExplicitUser;
   }
 
-  const configuredUsers = Array.isArray(config?.allowedUserIds)
-    ? config.allowedUserIds.map((value) => normalizeText(value)).filter(Boolean)
-    : [];
-  if (configuredUsers.length) {
-    return configuredUsers[0];
-  }
-
-  const bindingCandidates = collectBindingSenderIds({ config, accountId, sessionStore });
-  if (bindingCandidates.length === 1) {
-    return bindingCandidates[0];
-  }
-
+  // A recent context token improves reply continuity, so prefer the real
+  // platform user id associated with one. Outbound sends can still target a
+  // known platform id when no current token is available.
   const persistedUserIds = Object.keys(loadPersistedContextTokens(config, accountId) || {})
     .map((value) => normalizeText(value))
     .filter(Boolean);
+
+  const configuredUsers = Array.isArray(config?.allowedUserIds)
+    ? config.allowedUserIds.map((value) => normalizeText(value)).filter(Boolean)
+    : [];
+  const configuredWithToken = configuredUsers.find((userId) => persistedUserIds.includes(userId));
+  if (configuredWithToken) {
+    return configuredWithToken;
+  }
   if (persistedUserIds.length === 1) {
     return persistedUserIds[0];
+  }
+
+  const bindingCandidates = collectBindingSenderIds({ config, accountId, sessionStore });
+  const boundWithToken = bindingCandidates.filter((userId) => persistedUserIds.includes(userId));
+  if (boundWithToken.length === 1) {
+    return boundWithToken[0];
+  }
+
+  if (configuredUsers.length) {
+    return configuredUsers[0];
+  }
+  if (bindingCandidates.length === 1) {
+    return bindingCandidates[0];
   }
 
   return "";

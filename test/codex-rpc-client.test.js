@@ -48,7 +48,34 @@ test("codex rpc client sends image attachments as local images", async () => {
     { type: "text", text: "what is this image?" },
     {
       type: "localImage",
-      path: "/tmp/cyberboss image.jpg",
+      path: path.join("/tmp", "cyberboss image.jpg"),
     },
   ]);
+});
+
+test("codex trusted mode skips approvals while retaining workspace-write isolation", async () => {
+  const client = new CodexRpcClient({
+    endpoint: "ws://127.0.0.1:8765",
+    extraWritableRoots: [path.join("/tmp", "cyberboss-state")],
+  });
+  const calls = [];
+  client.sendRequest = async (method, params) => {
+    calls.push({ method, params });
+    return { result: { turn: { id: "turn-1" } } };
+  };
+
+  await client.sendUserMessage({
+    threadId: "thread-1",
+    text: "inspect the attachment",
+    accessMode: "trusted",
+    workspaceRoot: path.join("/tmp", "workspace"),
+  });
+
+  assert.equal(calls[0].params.accessMode, "current");
+  assert.equal(calls[0].params.approvalPolicy, "never");
+  assert.deepEqual(calls[0].params.sandboxPolicy, {
+    type: "workspaceWrite",
+    writableRoots: [path.join("/tmp", "workspace"), path.join("/tmp", "cyberboss-state")],
+    networkAccess: true,
+  });
 });

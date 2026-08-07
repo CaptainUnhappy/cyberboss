@@ -33,6 +33,43 @@ function readConfig() {
     projectToolContextFile: path.join(stateDir, "project-tool-runtime-context.json"),
     weixinInstructionsFile: path.join(stateDir, "weixin-instructions.md"),
     weixinOperationsFile: path.resolve(__dirname, "..", "..", "templates", "weixin-operations.md"),
+    wechatCliRoot: readTextEnv("CYBERBOSS_WECHAT_CLI_ROOT"),
+    wechatCliPythonCommand: readTextEnv("CYBERBOSS_WECHAT_CLI_PYTHON") || "python",
+    wechatCliConfigFile: readTextEnv("CYBERBOSS_WECHAT_CLI_CONFIG_FILE"),
+    wechatCliInboxChat: readTextEnv("CYBERBOSS_WECHAT_CLI_INBOX_CHAT"),
+    wechatCliInboxPollIntervalMs: readIntEnv("CYBERBOSS_WECHAT_CLI_POLL_INTERVAL_MS") || 5_000,
+    wechatCliInboxHistoryLimit: readIntEnv("CYBERBOSS_WECHAT_CLI_HISTORY_LIMIT") || 100,
+    wechatCliInboxReplayOnStart: readBoolEnv("CYBERBOSS_WECHAT_CLI_REPLAY_ON_START"),
+    wechatCliInboxReplayLimit: readIntEnv("CYBERBOSS_WECHAT_CLI_REPLAY_LIMIT") || 20,
+    wechatCliInboxReplyUserId: readTextEnv("CYBERBOSS_WECHAT_CLI_REPLY_USER_ID"),
+    wechatCliInboxReaderScript: path.resolve(__dirname, "..", "..", "scripts", "wechat-cli-inbox-read.py"),
+    wechatCliInboxCursorFile: path.join(stateDir, "wechat-cli-inbox-cursor.json"),
+    wechatCliImageKeyFile: path.join(stateDir, "wechat-image-keys.json"),
+    wechatCliImageKeyScannerScript: path.resolve(__dirname, "..", "..", "scripts", "wechat-image-key-scan.py"),
+    wechatCliImageAesKey: readTextEnv("CYBERBOSS_WECHAT_CLI_IMAGE_AES_KEY"),
+    wechatCliImageXorKey: readTextEnv("CYBERBOSS_WECHAT_CLI_IMAGE_XOR_KEY"),
+    wechatCliAutoImageKey: readOptionalBoolEnv("CYBERBOSS_WECHAT_CLI_AUTO_IMAGE_KEY") !== false,
+    startWithWechatCliInbox: mode === "start"
+      && readBoolEnv("CYBERBOSS_ENABLE_WECHAT_CLI_INBOX")
+      && Boolean(readTextEnv("CYBERBOSS_WECHAT_CLI_INBOX_CHAT")),
+    weflowBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BASE_URL") || "http://127.0.0.1:5031",
+    weflowBridgeBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BRIDGE_BASE_URL") || "http://127.0.0.1:8766",
+    weflowBridgeTimeoutMs: readIntEnv("CYBERBOSS_WEFLOW_BRIDGE_TIMEOUT_MS") || 30_000,
+    weflowToken: readTextEnv("CYBERBOSS_WEFLOW_TOKEN"),
+    weflowInboxChat: readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT"),
+    weflowInboxDisplayName: readTextEnv("CYBERBOSS_WEFLOW_INBOX_DISPLAY_NAME") || "yourself",
+    weflowInboxReplyUserId: readTextEnv("CYBERBOSS_WEFLOW_REPLY_USER_ID"),
+    weflowInboxCursorFile: path.join(stateDir, "weflow-inbox-cursor.json"),
+    weflowReconnectDelayMs: readIntEnv("CYBERBOSS_WEFLOW_RECONNECT_DELAY_MS") || 1_000,
+    weflowMessageLimit: readIntEnv("CYBERBOSS_WEFLOW_MESSAGE_LIMIT") || 50,
+    weflowMediaRoot: readTextEnv("CYBERBOSS_WEFLOW_MEDIA_ROOT")
+      || path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "weflow", "cache", "api-media"),
+    startWithWeflowInbox: mode === "start"
+      && readBoolEnv("CYBERBOSS_ENABLE_WEFLOW_INBOX")
+      && Boolean(readTextEnv("CYBERBOSS_WEFLOW_TOKEN"))
+      && Boolean(readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT")),
+    systemActionInstructionsFile: readTextEnv("CYBERBOSS_SYSTEM_ACTION_INSTRUCTIONS_FILE")
+      || path.resolve(__dirname, "..", "..", "templates", "system-action-instructions.md"),
     stickersDir: path.join(stateDir, "stickers"),
     stickerAssetsDir: path.join(stateDir, "stickers", "assets"),
     stickersIndexFile: path.join(stateDir, "stickers", "index.json"),
@@ -42,6 +79,9 @@ function readConfig() {
     stickerTagsTemplateFile: path.resolve(__dirname, "..", "..", "templates", "stickers", "tags.json"),
     stickerNormalizeGifScript: path.resolve(__dirname, "..", "..", "scripts", "normalize-sticker-gif.js"),
     diaryDir: path.join(stateDir, "diary"),
+    memoryFile: path.join(stateDir, "memory.json"),
+    memoryRecallLimit: readIntEnv("CYBERBOSS_MEMORY_RECALL_LIMIT") || 6,
+    memoryMaxEntries: readIntEnv("CYBERBOSS_MEMORY_MAX_ENTRIES") || 2_000,
     locationStoreFile: path.join(stateDir, "locations.json"),
     locationHost: readTextEnv("CYBERBOSS_LOCATION_HOST") || "0.0.0.0",
     locationPort: readIntEnv("CYBERBOSS_LOCATION_PORT") || 4318,
@@ -65,12 +105,30 @@ function readConfig() {
     codexModel: readTextEnv("CYBERBOSS_CODEX_MODEL"),
     codexModelProvider: readTextEnv("CYBERBOSS_CODEX_MODEL_PROVIDER"),
     codexNativeImageInput: readOptionalBoolEnv("CYBERBOSS_CODEX_NATIVE_IMAGE_INPUT"),
+    codexAccessMode: readTextEnv("CYBERBOSS_CODEX_ACCESS_MODE") || "trusted",
     visionMode: readTextEnv("CYBERBOSS_VISION_MODE") || "auto",
     visionProvider: readTextEnv("CYBERBOSS_VISION_PROVIDER") || "openai-compatible",
     visionApiBaseUrl: readTextEnv("CYBERBOSS_VISION_API_BASE_URL"),
     visionApiKey: readTextEnv("CYBERBOSS_VISION_API_KEY"),
     visionModel: readTextEnv("CYBERBOSS_VISION_MODEL"),
     visionTimeoutMs: readIntEnv("CYBERBOSS_VISION_TIMEOUT_MS") || 30_000,
+    voiceTranscriptionMode: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_MODE") || "auto",
+    voiceTranscriptionPythonCommand: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_PYTHON") || "python",
+    voiceTranscriptionWorkerScript: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_WORKER_SCRIPT")
+      || path.resolve(__dirname, "..", "..", "scripts", "sense-voice-worker.py"),
+    voiceTranscriptionModel: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_MODEL")
+      || path.join(stateDir, "models", "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"),
+    voiceTranscriptionDevice: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_DEVICE") || "cpu",
+    voiceTranscriptionComputeType: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_COMPUTE_TYPE") || "int8",
+    voiceTranscriptionLanguage: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_LANGUAGE") || "zh",
+    voiceTranscriptionHotwords: readTextEnv("CYBERBOSS_VOICE_TRANSCRIPTION_HOTWORDS")
+      || "大号 小号 微信 ClawBot Cyberboss WeFlow 引用 转发 回复 总结 图片 语音 文件 链接",
+    voiceTranscriptionBeamSize: readIntEnv("CYBERBOSS_VOICE_TRANSCRIPTION_BEAM_SIZE") || 1,
+    voiceTranscriptionCpuThreads: readIntEnv("CYBERBOSS_VOICE_TRANSCRIPTION_CPU_THREADS"),
+    voiceTranscriptionStartupTimeoutMs: readIntEnv("CYBERBOSS_VOICE_TRANSCRIPTION_STARTUP_TIMEOUT_MS") || 120_000,
+    voiceTranscriptionTimeoutMs: readIntEnv("CYBERBOSS_VOICE_TRANSCRIPTION_TIMEOUT_MS") || 120_000,
+    voiceTranscriptionLocalFilesOnly: readOptionalBoolEnv("CYBERBOSS_VOICE_TRANSCRIPTION_LOCAL_FILES_ONLY") !== false,
+    voiceTranscriptCacheDir: path.join(stateDir, "voice-transcripts"),
     claudeCommand: readTextEnv("CYBERBOSS_CLAUDE_COMMAND") || "claude",
     claudeModel: readTextEnv("CYBERBOSS_CLAUDE_MODEL") || "",
     claudeContextWindow: readIntEnv("CYBERBOSS_CLAUDE_CONTEXT_WINDOW"),
@@ -79,7 +137,11 @@ function readConfig() {
     claudeDisableVerbose: readBoolEnv("CYBERBOSS_CLAUDE_DISABLE_VERBOSE"),
     claudeExtraArgs: readListEnv("CYBERBOSS_CLAUDE_EXTRA_ARGS"),
     sessionsFile: path.join(stateDir, "sessions.json"),
-    startWithCheckin: (mode === "start" && hasArgFlag(argv, "--checkin")) || readBoolEnv("CYBERBOSS_ENABLE_CHECKIN"),
+    startWithCheckin: resolveCheckinEnabled({
+      mode,
+      argv,
+      enabled: readOptionalBoolEnv("CYBERBOSS_ENABLE_CHECKIN"),
+    }),
   };
 }
 
@@ -171,4 +233,14 @@ function resolveLocationServerEnabled({ mode, enabled }) {
   return false;
 }
 
-module.exports = { readConfig };
+function resolveCheckinEnabled({ mode, argv, enabled }) {
+  if (mode !== "start") {
+    return false;
+  }
+  if (enabled === false) {
+    return false;
+  }
+  return enabled === true || hasArgFlag(argv, "--checkin");
+}
+
+module.exports = { readConfig, resolveCheckinEnabled };

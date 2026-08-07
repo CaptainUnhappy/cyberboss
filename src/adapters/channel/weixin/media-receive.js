@@ -28,6 +28,9 @@ async function persistIncomingWeixinAttachments({
     } catch (error) {
       failed.push({
         kind: attachment?.kind || "file",
+        origin: normalizeAttachmentOrigin(attachment?.origin),
+        quoteIndex: normalizeQuoteIndex(attachment?.quoteIndex),
+        attachmentRef: normalizeText(attachment?.attachmentRef),
         sourceFileName: attachment?.fileName || "",
         reason: error instanceof Error ? error.message : String(error || "unknown attachment error"),
       });
@@ -52,6 +55,9 @@ async function persistSingleAttachment({ attachment, stateDir, cdnBaseUrl, messa
 
   return {
     kind: attachment.kind || "file",
+    origin: normalizeAttachmentOrigin(attachment.origin),
+    quoteIndex: normalizeQuoteIndex(attachment.quoteIndex),
+    attachmentRef: normalizeText(attachment.attachmentRef),
     contentType: download.contentType,
     isImage: isImageAttachment({
       kind: attachment.kind,
@@ -382,6 +388,14 @@ async function writeUniqueFile(targetDir, fileName, plaintext) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeAttachmentOrigin(value) {
+  return normalizeText(value).toLowerCase() === "quoted" ? "quoted" : "direct";
+}
+
+function normalizeQuoteIndex(value) {
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function normalizeContentType(value) {

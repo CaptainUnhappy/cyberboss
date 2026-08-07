@@ -27,10 +27,6 @@ class ChannelFileService {
 
     const contextTokens = loadPersistedContextTokens(this.config, account.accountId);
     const contextToken = String(contextTokens[targetUserId] || "").trim();
-    if (!contextToken) {
-      throw new Error(`Cannot find a context token for user ${targetUserId}. Let this user talk to the bot once first.`);
-    }
-
     const requestedPath = normalizeText(filePath);
     if (!requestedPath) {
       throw new Error("Missing file path to send.");

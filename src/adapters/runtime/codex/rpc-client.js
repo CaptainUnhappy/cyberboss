@@ -58,6 +58,7 @@ class CodexRpcClient {
           env: { ...this.env },
           stdio: ["pipe", "pipe", "pipe"],
           shell: false,
+          windowsHide: true,
         });
         break;
       } catch (error) {
@@ -402,7 +403,7 @@ function buildTurnStartParams({ threadId, input, model, modelProvider, effort, a
     params.effort = normalizedEffort;
   }
   if (normalizedAccessMode) {
-    params.accessMode = normalizedAccessMode;
+    params.accessMode = normalizedAccessMode === "trusted" ? "current" : normalizedAccessMode;
   }
   params.approvalPolicy = executionPolicies.approvalPolicy;
   params.sandboxPolicy = executionPolicies.sandboxPolicy;
@@ -414,7 +415,7 @@ function normalizeAccessMode(value) {
   if (normalized === "default") {
     return "current";
   }
-  return normalized === "full-access" ? normalized : "";
+  return ["current", "trusted", "full-access"].includes(normalized) ? normalized : "";
 }
 
 function buildExecutionPolicies(accessMode, workspaceRoot, extraWritableRoots = []) {
@@ -433,7 +434,7 @@ function buildExecutionPolicies(accessMode, workspaceRoot, extraWritableRoots = 
     ? { type: "workspaceWrite", writableRoots, networkAccess: true }
     : { type: "workspaceWrite", networkAccess: true };
   return {
-    approvalPolicy: "on-request",
+    approvalPolicy: accessMode === "trusted" ? "never" : "on-request",
     sandboxPolicy,
   };
 }

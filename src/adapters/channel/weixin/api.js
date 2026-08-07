@@ -201,9 +201,6 @@ async function getUpdates({ baseUrl, token, getUpdatesBuf = "", timeoutMs = DEFA
 }
 
 async function sendText({ baseUrl, token, toUserId, text, contextToken, clientId }) {
-  if (!String(contextToken || "").trim()) {
-    throw new Error("weixin sendText requires contextToken");
-  }
   const itemList = [];
   if (String(text || "").trim()) {
     itemList.push({
@@ -214,20 +211,24 @@ async function sendText({ baseUrl, token, toUserId, text, contextToken, clientId
   if (!itemList.length) {
     throw new Error("weixin sendText requires non-empty text");
   }
+  const msg = {
+    from_user_id: "",
+    to_user_id: toUserId,
+    client_id: clientId || `cb-${crypto.randomUUID()}`,
+    message_type: 2,
+    message_state: 2,
+    item_list: itemList,
+  };
+  const normalizedContextToken = String(contextToken || "").trim();
+  if (normalizedContextToken) {
+    msg.context_token = normalizedContextToken;
+  }
   const raw = await apiPost({
     baseUrl,
     endpoint: "ilink/bot/sendmessage",
     token,
     body: JSON.stringify({
-      msg: {
-        from_user_id: "",
-        to_user_id: toUserId,
-        client_id: clientId || `cb-${crypto.randomUUID()}`,
-        message_type: 2,
-        message_state: 2,
-        item_list: itemList,
-        context_token: contextToken,
-      },
+      msg,
       base_info: buildBaseInfo(),
     }),
     label: "sendMessage",

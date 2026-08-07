@@ -31,6 +31,36 @@ const appServerLogFile = path.join(logDir, "shared-app-server.log");
 const accountsDir = path.join(stateDir, "accounts");
 const sessionFile = process.env.CYBERBOSS_SESSIONS_FILE || path.join(stateDir, "sessions.json");
 
+function buildSharedCodexIsolationArgs(configText = readCodexConfigText()) {
+  const args = [];
+  const seen = new Set();
+  const sectionPattern = /^\s*\[(mcp_servers|plugins)\.((?:"[^"]+")|(?:[^\].]+))\]\s*$/gm;
+  for (const match of String(configText || "").matchAll(sectionPattern)) {
+    const group = match[1];
+    const rawName = match[2].trim();
+    const normalizedName = rawName.replace(/^"|"$/g, "");
+    if (!normalizedName || (group === "mcp_servers" && normalizedName === "cyberboss_tools")) {
+      continue;
+    }
+    const key = `${group}.${rawName}.enabled=false`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    args.push("-c", key);
+  }
+  return args;
+}
+
+function readCodexConfigText() {
+  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  try {
+    return fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
+  } catch {
+    return "";
+  }
+}
+
 function ensureLogDir() {
   fs.mkdirSync(logDir, { recursive: true });
 }
@@ -113,7 +143,8 @@ function spawnDetachedCommand(command, args, { logFile, cwd = rootDir, env = {} 
     env: { ...process.env, ...env },
     detached: true,
     stdio: ["ignore", stdoutFd, stderrFd],
-    shell: process.platform === "win32",
+    shell: false,
+    windowsHide: true,
   });
   child.unref();
   return child.pid;
@@ -147,10 +178,11 @@ async function ensureSharedAppServer() {
   }
 
   const command = process.env.CYBERBOSS_CODEX_COMMAND || "codex";
+  const isolationArgs = buildSharedCodexIsolationArgs();
   const mcpConfigArgs = buildCodexMcpConfigArgs(resolveCodexProjectToolMcpServerConfig({
     cyberbossHome: process.env.CYBERBOSS_HOME || rootDir,
   }));
-  const pid = spawnDetachedCommand(command, [...mcpConfigArgs, "app-server", "--listen", listenUrl], {
+  const pid = spawnDetachedCommand(command, [...isolationArgs, ...mcpConfigArgs, "app-server", "--listen", listenUrl], {
     logFile: appServerLogFile,
     env,
   });
@@ -279,6 +311,7 @@ module.exports = {
   readPidFile,
   writePidFile,
   removePidFileIfMatches,
+  buildSharedCodexIsolationArgs,
   ensureSharedAppServer,
   ensureBridgeNotRunning,
   resolveBoundThread,

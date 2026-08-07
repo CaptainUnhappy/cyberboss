@@ -11,6 +11,7 @@ const {
   parseCheckinRangeMinutes,
 } = require("../src/core/checkin-config-store");
 const { CyberbossApp } = require("../src/core/app");
+const { resolveCheckinEnabled } = require("../src/core/config");
 
 function createStore() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-checkin-test-"));
@@ -35,6 +36,12 @@ test("checkin config store falls back to defaults and persists overrides", () =>
     minIntervalMs: 4 * 60_000,
     maxIntervalMs: 25 * 60_000,
   });
+});
+
+test("explicit checkin disable overrides the legacy --checkin start flag", () => {
+  assert.equal(resolveCheckinEnabled({ mode: "start", argv: ["start", "--checkin"], enabled: false }), false);
+  assert.equal(resolveCheckinEnabled({ mode: "start", argv: ["start", "--checkin"], enabled: undefined }), true);
+  assert.equal(resolveCheckinEnabled({ mode: "start", argv: ["start"], enabled: true }), true);
 });
 
 test("handleCheckinCommand stores the new range and replies in English", async () => {
@@ -66,7 +73,7 @@ test("handleCheckinCommand stores the new range and replies in English", async (
 
 test("handleChunkCommand reports current value and persists updates through the channel adapter", async () => {
   const sent = [];
-  let minChunk = 20;
+  let minChunk = 3600;
   const appLike = {
     channelAdapter: {
       getMinChunkChars() {
@@ -92,10 +99,10 @@ test("handleChunkCommand reports current value and persists updates through the 
     senderId: "user-1",
     contextToken: "ctx-1",
   }, {
-    args: "50",
+    args: "3900",
   });
 
-  assert.equal(sent[0].text, "💡 Current minimum merge chunk is 20 characters. Usage: /chunk <number> (e.g. /chunk 50)");
-  assert.equal(sent[1].text, "✅ Minimum merge chunk set to 50 characters. Shorter fragments will be merged into one message up to this size.");
-  assert.equal(minChunk, 50);
+  assert.equal(sent[0].text, "💡 Current natural-boundary chunk target is 3600 characters. Usage: /chunk <number> (e.g. /chunk 3600)");
+  assert.equal(sent[1].text, "✅ Natural-boundary chunk target set to 3900 characters. Adjacent fragments are coalesced up to WeChat's 4000-character limit.");
+  assert.equal(minChunk, 3900);
 });

@@ -96,21 +96,29 @@ test("chunkReplyTextForWeixin merges short natural boundaries", () => {
   assert.deepEqual(chunks, ["A。\n\nB。\n\nC。"]);
 });
 
-test("chunkReplyTextForWeixin does not merge chunks above min length", () => {
+test("chunkReplyTextForWeixin keeps an ordinary multi-paragraph reply in one bubble", () => {
   const longA = "A".repeat(25) + "。";
   const longB = "B".repeat(25) + "。";
   const text = `${longA}\n\n${longB}`;
   const chunks = chunkReplyTextForWeixin(text);
-  assert.equal(chunks.length, 2);
-  assert.equal(chunks[0], `${longA}\n\n`);
-  assert.equal(chunks[1], longB);
+  assert.deepEqual(chunks, [text]);
 });
 
-test("chunkReplyTextForWeixin merges short adjacent chunks", () => {
+test("chunkReplyTextForWeixin coalesces short and long natural units below the target", () => {
   const text = ["短1", "短2", "这是一段比较长的话，不应该和前面的短句合并在一起"].join("\n\n");
   const chunks = chunkReplyTextForWeixin(text);
-  assert.equal(chunks[0], "短1\n\n短2\n\n");
-  assert.ok(!chunks[1].startsWith("短2"));
+  assert.deepEqual(chunks, [text]);
+});
+
+test("chunkReplyTextForWeixin cuts near an adjustable natural-boundary target", () => {
+  const first = `${"A".repeat(1850)}。\n\n`;
+  const second = `${"B".repeat(1850)}。\n\n`;
+  const third = `${"C".repeat(1850)}。`;
+  const chunks = chunkReplyTextForWeixin(`${first}${second}${third}`, 3600);
+  assert.equal(chunks.length, 2);
+  assert.equal(chunks[0], `${first}${second}`);
+  assert.equal(chunks[1], third);
+  assert.ok(chunks.every((chunk) => chunk.length <= 4000));
 });
 
 test("mergeShortChunks only merges when both sides are short", () => {
@@ -128,27 +136,27 @@ test("mergeShortChunks does not merge when one side is long", () => {
   assert.equal(merged[1], "c".repeat(100));
 });
 
-test("packChunksForWeixinDelivery limits to maxMessages", () => {
+test("packChunksForWeixinDelivery coalesces many small fragments", () => {
   const chunks = Array.from({ length: 15 }, (_, i) => `chunk-${i}`);
-  const packed = packChunksForWeixinDelivery(chunks, 10, 3800);
-  assert.equal(packed.length, 10);
+  const packed = packChunksForWeixinDelivery(chunks, 10, 4000);
+  assert.deepEqual(packed, [chunks.join("")]);
 });
 
-test("packChunksForWeixinDelivery groups tail when over limit", () => {
-  const chunks = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"];
-  const packed = packChunksForWeixinDelivery(chunks, 10, 3800);
-  assert.equal(packed.length, 10);
-  assert.equal(packed[0], "1");
-  assert.ok(packed[9].includes("11") || packed[9].includes("12"));
+test("packChunksForWeixinDelivery preserves replies longer than the soft message target", () => {
+  const chunks = Array.from({ length: 45 }, (_, index) => String(index % 10).repeat(1000));
+  const packed = packChunksForWeixinDelivery(chunks, 10, 4000);
+  assert.equal(packed.length, 12);
+  assert.equal(packed.join(""), chunks.join(""));
+  assert.ok(packed.every((chunk) => chunk.length <= 4000));
 });
 
 test("splitUtf8 hard-truncates oversized text", () => {
   const text = "a".repeat(10_000);
-  const chunks = splitUtf8(text, 3800);
+  const chunks = splitUtf8(text, 4000);
   assert.equal(chunks.length, 3);
-  assert.equal(chunks[0].length, 3800);
-  assert.equal(chunks[1].length, 3800);
-  assert.equal(chunks[2].length, 2400);
+  assert.equal(chunks[0].length, 4000);
+  assert.equal(chunks[1].length, 4000);
+  assert.equal(chunks[2].length, 2000);
 });
 
 test("trimOuterBlankLines strips leading and trailing blank lines", () => {

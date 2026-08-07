@@ -54,10 +54,6 @@ class ReminderService {
 
     const contextTokens = loadPersistedContextTokens(this.config, account.accountId);
     const contextToken = String(contextTokens[senderId] || "").trim();
-    if (!contextToken) {
-      throw new Error(`Cannot find context_token for ${senderId}. Let this user talk to the bot once first.`);
-    }
-
     const reminder = this.queue.enqueue({
       id: crypto.randomUUID(),
       accountId: account.accountId,
