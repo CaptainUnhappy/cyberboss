@@ -68,6 +68,11 @@ function readConfig() {
       && readBoolEnv("CYBERBOSS_ENABLE_WEFLOW_INBOX")
       && Boolean(readTextEnv("CYBERBOSS_WEFLOW_TOKEN"))
       && Boolean(readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT")),
+    startWithRestartNotification: mode === "start"
+      && readOptionalBoolEnv("CYBERBOSS_ENABLE_RESTART_NOTIFICATION") !== false,
+    restartNotificationText: readTextEnv("CYBERBOSS_RESTART_NOTIFICATION_TEXT")
+      || "✅ Cyberboss 已重启，服务已恢复。",
+    restartNotificationUserId: readTextEnv("CYBERBOSS_RESTART_NOTIFICATION_USER_ID"),
     systemActionInstructionsFile: readTextEnv("CYBERBOSS_SYSTEM_ACTION_INSTRUCTIONS_FILE")
       || path.resolve(__dirname, "..", "..", "templates", "system-action-instructions.md"),
     stickersDir: path.join(stateDir, "stickers"),

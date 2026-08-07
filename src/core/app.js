@@ -178,6 +178,11 @@ class CyberbossApp {
       console.warn(`[cyberboss] voice transcription warmup failed: ${formatErrorMessage(error)}`);
     });
     await this.ensureWeFlowInboxStarted();
+    if (this.config.startWithRestartNotification) {
+      void this.sendRestartNotification().catch((error) => {
+        console.warn(`[cyberboss] restart notification failed: ${formatErrorMessage(error)}`);
+      });
+    }
 
     const shutdown = createShutdownController(async () => {
       this.clearPendingImageInboundTimers();
@@ -332,6 +337,37 @@ class CyberbossApp {
 
   resolveWeFlowInboxReplyTarget() {
     return this.resolveLocalWechatReplyTarget(this.config.weflowInboxReplyUserId);
+  }
+
+  async sendRestartNotification() {
+    const explicitUserId = normalizeCommandArgument(this.config.restartNotificationUserId)
+      || normalizeCommandArgument(this.config.weflowInboxReplyUserId);
+    const target = this.resolveLocalWechatReplyTarget(explicitUserId);
+    if (!target) {
+      throw new Error("restart notification target is unavailable");
+    }
+    const text = normalizeCommandArgument(this.config.restartNotificationText)
+      || "✅ Cyberboss 已重启，服务已恢复。";
+    const payload = {
+      userId: target.userId,
+      text,
+      contextToken: target.contextToken,
+      preserveBlock: true,
+    };
+    try {
+      await this.channelAdapter.sendText(payload);
+    } catch (error) {
+      if (!isStaleWeixinContextError(error)) {
+        throw error;
+      }
+      await this.channelAdapter.sendText({
+        ...payload,
+        contextToken: "",
+        omitContextToken: true,
+      });
+    }
+    console.log(`[cyberboss] restart notification sent via bot user=${target.userId}`);
+    return { userId: target.userId, text };
   }
 
   async resolveWeFlowReplySource() {
@@ -2366,6 +2402,14 @@ function isPathWithinAllowedDirectories(rawPath) {
 
 function normalizeCommandArgument(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function isStaleWeixinContextError(error) {
+  const message = String(error?.message || error || "");
+  return Number(error?.ret) === -2
+    || Number(error?.errcode) === -2
+    || message.includes("sendMessage ret=-2")
+    || message.includes("errcode=-2");
 }
 
 function normalizeThreadId(value) {
