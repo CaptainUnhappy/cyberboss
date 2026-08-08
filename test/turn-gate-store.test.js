@@ -88,6 +88,91 @@ test("handlePreparedMessage queues a normal inbound message while the scope is b
   assert.equal(queued[0].text, "prepared-user-text");
 });
 
+test("small UIA inbound replies with processing before it is queued", async () => {
+  const order = [];
+  const sent = [];
+  const queued = [];
+  const appLike = {
+    channelAdapter: {
+      async sendText(payload) {
+        order.push("ack");
+        sent.push(payload);
+      },
+    },
+    acknowledgeWeFlowUiaInbound: CyberbossApp.prototype.acknowledgeWeFlowUiaInbound,
+    isTurnDispatchBlocked() {
+      return true;
+    },
+    bufferPendingInboundMessage(payload) {
+      order.push("queue");
+      queued.push(payload);
+    },
+    async dispatchPreparedTurn() {
+      throw new Error("should not dispatch while blocked");
+    },
+  };
+
+  const prepared = {
+    provider: "weflow-uia",
+    senderId: "user-1",
+    contextToken: "ctx-1",
+    messageId: "weflow:1",
+    text: "检查项目",
+  };
+  const dispatched = await CyberbossApp.prototype.routePreparedInbound.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    prepared,
+  });
+
+  assert.equal(dispatched, false);
+  assert.deepEqual(order, ["ack", "queue"]);
+  assert.deepEqual(sent, [{
+    userId: "user-1",
+    text: "处理中",
+    contextToken: "ctx-1",
+    provider: "weflow-uia",
+  }]);
+  assert.equal(queued.length, 1);
+});
+
+test("ClawBot inbound does not send the small UIA processing acknowledgement", async () => {
+  const sent = [];
+  let dispatched = false;
+  const appLike = {
+    channelAdapter: {
+      async sendText(payload) {
+        sent.push(payload);
+      },
+    },
+    acknowledgeWeFlowUiaInbound: CyberbossApp.prototype.acknowledgeWeFlowUiaInbound,
+    isTurnDispatchBlocked() {
+      return false;
+    },
+    bufferPendingInboundMessage() {},
+    async dispatchPreparedTurn() {
+      dispatched = true;
+      return true;
+    },
+  };
+
+  const result = await CyberbossApp.prototype.routePreparedInbound.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    prepared: {
+      provider: "weixin",
+      senderId: "user-1",
+      contextToken: "ctx-1",
+      messageId: "native:1",
+      text: "检查项目",
+    },
+  });
+
+  assert.equal(result, true);
+  assert.equal(dispatched, true);
+  assert.deepEqual(sent, []);
+});
+
 test("dispatchSystemMessage yields when a local pending turn already owns the workspace thread", async () => {
   let handled = false;
   const appLike = {

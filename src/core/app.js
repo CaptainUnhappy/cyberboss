@@ -68,6 +68,7 @@ const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_INBOUND_STICKER_IMAGE_BATCH = 10;
 const SHARED_CONTENT_FOLLOWUP_WINDOW_MS = 60_000;
+const WEFLOW_UIA_INBOUND_ACK_TEXT = "处理中";
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
@@ -992,7 +993,32 @@ class CyberbossApp {
     };
   }
 
+  async acknowledgeWeFlowUiaInbound(prepared) {
+    if (prepared?.provider !== "weflow-uia") {
+      return false;
+    }
+    try {
+      await this.channelAdapter.sendText({
+        userId: prepared.senderId,
+        text: WEFLOW_UIA_INBOUND_ACK_TEXT,
+        contextToken: prepared.contextToken,
+        provider: prepared.provider,
+      });
+      console.log(`[cyberboss] WeFlow UIA inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
+      return true;
+    } catch (error) {
+      console.warn(`[cyberboss] WeFlow UIA inbound acknowledgement failed: ${formatErrorMessage(error)}`);
+      return false;
+    }
+  }
+
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
+    if (
+      prepared?.provider === "weflow-uia"
+      && typeof this.acknowledgeWeFlowUiaInbound === "function"
+    ) {
+      await this.acknowledgeWeFlowUiaInbound(prepared);
+    }
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
       this.bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared });
       return false;
