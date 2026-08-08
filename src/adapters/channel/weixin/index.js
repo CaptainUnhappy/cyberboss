@@ -14,6 +14,7 @@ const LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_WEIXIN_CHUNK = 4000;
 const SEND_MESSAGE_CHUNK_INTERVAL_MS = 350;
 const WEIXIN_MAX_DELIVERY_MESSAGES = 10;
+const PROGRESS_MESSAGE_PREFIX = "【进度】 ";
 
 function createWeixinChannelAdapter(config) {
   let selectedAccount = null;
@@ -60,25 +61,22 @@ function createWeixinChannelAdapter(config) {
     return ensureContextTokenCache()[normalizedUserId] || "";
   }
 
-  function sendTextChunks({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "" }) {
+  function sendTextChunks({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "", messageKind = "" }) {
     const account = ensureAccount();
     const resolvedToken = omitContextToken ? "" : resolveContextToken(userId, contextToken);
     const content = String(text || "");
     if (!content.trim()) {
       return Promise.resolve();
     }
-    const normalizedContent = normalizeWeixinReplyText(content);
-    const textChunks = preserveBlock ? null : chunkReplyTextForWeixin(normalizedContent, minWeixinChunk);
-    const sendChunks = preserveBlock
-      ? splitUtf8(normalizedContent || "Completed.", MAX_WEIXIN_CHUNK)
-      : packChunksForWeixinDelivery(
-        textChunks?.length ? textChunks : ["Completed."],
-        WEIXIN_MAX_DELIVERY_MESSAGES,
-        MAX_WEIXIN_CHUNK
-      );
+    const sendChunks = buildWeixinDeliveryChunks({
+      text: content,
+      preserveBlock,
+      minChunk: minWeixinChunk,
+      messageKind,
+    });
     return sendChunks.reduce((promise, chunk, index) => promise
       .then(() => {
-        const deliveryChunk = finalizeWeixinDeliveryChunk(chunk) || "Completed.";
+        const deliveryChunk = chunk || "Completed.";
         if (provider === "weflow-uia") {
           return sendWeFlowUiaText(config, { text: deliveryChunk });
         }
@@ -168,8 +166,8 @@ function createWeixinChannelAdapter(config) {
       const account = ensureAccount();
       return inboundFilter.normalize(message, config, account.accountId);
     },
-    async sendText({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "" }) {
-      await sendTextChunks({ userId, text, contextToken, preserveBlock, omitContextToken, provider });
+    async sendText({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "", messageKind = "" }) {
+      await sendTextChunks({ userId, text, contextToken, preserveBlock, omitContextToken, provider, messageKind });
     },
     async sendTyping({ userId, status = 1, contextToken = "" }) {
       const account = ensureAccount();
@@ -302,6 +300,38 @@ function chunkReplyTextForWeixin(text, minChunk = DEFAULT_MIN_WEIXIN_CHUNK) {
     MAX_WEIXIN_CHUNK,
     normalizeChunkTarget(minChunk, DEFAULT_MIN_WEIXIN_CHUNK),
   );
+}
+
+function buildWeixinDeliveryChunks({ text, preserveBlock = false, minChunk = DEFAULT_MIN_WEIXIN_CHUNK, messageKind = "" } = {}) {
+  const normalizedContent = normalizeWeixinReplyText(text);
+  const prefix = normalizeMessageKind(messageKind) === "progress" ? PROGRESS_MESSAGE_PREFIX : "";
+  const contentLimit = Math.max(1, MAX_WEIXIN_CHUNK - prefix.length);
+  const textChunks = preserveBlock ? null : chunkReplyTextForWeixin(normalizedContent, minChunk);
+  const rawChunks = preserveBlock
+    ? splitUtf8(normalizedContent || "Completed.", contentLimit)
+    : packChunksForWeixinDelivery(
+      textChunks?.length ? textChunks : ["Completed."],
+      WEIXIN_MAX_DELIVERY_MESSAGES,
+      contentLimit
+    );
+  return rawChunks.map((chunk) => decorateWeixinDeliveryChunk(
+    finalizeWeixinDeliveryChunk(chunk) || "Completed.",
+    messageKind,
+  ));
+}
+
+function decorateWeixinDeliveryChunk(text, messageKind = "") {
+  const normalized = String(text || "");
+  if (normalizeMessageKind(messageKind) !== "progress") {
+    return normalized;
+  }
+  return normalized.startsWith(PROGRESS_MESSAGE_PREFIX.trim())
+    ? normalized
+    : `${PROGRESS_MESSAGE_PREFIX}${normalized}`;
+}
+
+function normalizeMessageKind(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
 function coalesceNaturalChunks(chunks, maxLength, targetLength) {
@@ -510,6 +540,8 @@ module.exports = {
   splitUtf8,
   normalizeWeixinReplyText,
   finalizeWeixinDeliveryChunk,
+  buildWeixinDeliveryChunks,
+  decorateWeixinDeliveryChunk,
   stripChunkTailChineseFullStops,
   chunkReplyText,
   chunkReplyTextForWeixin,

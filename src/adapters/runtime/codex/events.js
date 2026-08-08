@@ -85,6 +85,7 @@ function mapCodexMessageToRuntimeEvent(message) {
         turnId,
         itemId: normalizeString(params?.item?.id),
         text,
+        phase: normalizeMessagePhase(params?.item?.phase),
       },
     };
   }
@@ -315,6 +316,13 @@ function normalizeString(value) {
 
 function normalizeLineEndings(value) {
   return typeof value === "string" ? value.replace(/\r\n/g, "\n").trim() : "";
+}
+
+function normalizeMessagePhase(value) {
+  const normalized = normalizeString(value).toLowerCase();
+  return normalized === "commentary" || normalized === "final_answer"
+    ? normalized
+    : "";
 }
 
 function numberOrZero(value) {

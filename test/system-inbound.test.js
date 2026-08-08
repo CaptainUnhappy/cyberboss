@@ -7,6 +7,7 @@ const path = require("path");
 const { CyberbossApp } = require("../src/core/app");
 const {
   assembleRuntimeTurnText,
+  buildImplicitReferencedPrepared,
   buildMergedInboundPrepared,
   takeImageOnlyBatchMessages,
 } = require("../src/core/inbound-turn");
@@ -480,7 +481,7 @@ test("tool image-capable runtimes keep local image paths without caption fallbac
   }
 });
 
-test("image-only inbound turns enter the dedicated debounce queue", async () => {
+test("shared-content-only inbound turns enter the one-minute prompt queue", async () => {
   const queued = [];
   let routed = 0;
   await CyberbossApp.prototype.handlePreparedMessage.call({
@@ -504,10 +505,11 @@ test("image-only inbound turns enter the dedicated debounce queue", async () => 
         workspaceId: "default",
         accountId: "wx-account",
         senderId: "user-1",
+        chatId: "chat-1",
         contextToken: "ctx-1",
         provider: "weixin",
         originalText: "",
-        text: "image prompt",
+        text: "",
         attachments: [{
           kind: "image",
           contentType: "image/jpeg",
@@ -515,13 +517,13 @@ test("image-only inbound turns enter the dedicated debounce queue", async () => 
           absolutePath: "/tmp/a.jpg",
         }],
         attachmentFailures: [],
+        contentKind: "image",
+        sharedContent: true,
+        explicitPrompt: false,
         receivedAt: "2026-04-30T10:00:00.000Z",
       };
     },
-    isTurnDispatchBlocked() {
-      return false;
-    },
-    enqueuePendingImageInbound(payload) {
+    enqueuePendingSharedContentInbound(payload) {
       queued.push(payload);
     },
     async routePreparedInbound() {
@@ -542,64 +544,68 @@ test("image-only inbound turns enter the dedicated debounce queue", async () => 
   assert.equal(routed, 0);
 });
 
-test("debounced image batches merge with a trailing text message into one prepared turn", async () => {
-  const scopeKey = "binding-1::/workspace";
+test("shared content becomes implicit quoted context when a prompt follows within 59 seconds", async () => {
+  const scopeKey = "binding-1::/workspace::chat-1";
   let routed = null;
   const app = {
-    config: {
-      userName: "User",
-    },
-    pendingImageInboundByScope: new Map([[scopeKey, {
+    pendingSharedContentInboundByScope: new Map([[scopeKey, {
       bindingKey: "binding-1",
       workspaceRoot: "/workspace",
+      chatId: "chat-1",
       messages: [{
         senderId: "user-1",
         accountId: "wx-account",
         workspaceId: "default",
         provider: "weixin",
+        chatId: "chat-1",
+        messageId: "image-1",
         contextToken: "ctx-1",
         originalText: "",
-        text: "image prompt 1",
+        text: "",
         attachments: [{
           kind: "image",
           contentType: "image/jpeg",
           isImage: true,
           absolutePath: "/tmp/a.jpg",
+          attachmentRef: "direct:image-1",
         }],
         attachmentFailures: [],
+        contentKind: "image",
+        contentTitle: "截图",
+        sharedContent: true,
+        explicitPrompt: false,
         receivedAt: "2026-04-30T10:00:00.000Z",
       }, {
         senderId: "user-1",
         accountId: "wx-account",
         workspaceId: "default",
         provider: "weixin",
+        chatId: "chat-1",
+        messageId: "link-1",
         contextToken: "ctx-1",
-        originalText: "",
-        text: "image prompt 2",
-        attachments: [{
-          kind: "image",
-          contentType: "image/png",
-          isImage: true,
-          absolutePath: "/tmp/b.png",
-        }],
+        originalText: "项目资料\nhttps://example.com/report",
+        text: "项目资料\nhttps://example.com/report",
+        attachments: [],
         attachmentFailures: [],
+        contentKind: "link",
+        contentTitle: "项目资料",
+        contentText: "项目资料",
+        contentUrl: "https://example.com/report",
+        sharedContent: true,
+        explicitPrompt: false,
         receivedAt: "2026-04-30T10:00:01.000Z",
       }],
       timer: null,
+      lastContentAtMs: Date.parse("2026-04-30T10:00:01.000Z"),
     }]]),
-    runtimeAdapter: {
-      describe() {
-        return { id: "codex" };
-      },
-    },
-    clearPendingImageInboundTimer: CyberbossApp.prototype.clearPendingImageInboundTimer,
+    clearPendingSharedContentInboundTimer: CyberbossApp.prototype.clearPendingSharedContentInboundTimer,
     async routePreparedInbound({ prepared }) {
       routed = prepared;
       return true;
     },
   };
 
-  await CyberbossApp.prototype.flushPendingImageInboundBatch.call(app, {
+  await CyberbossApp.prototype.consumePendingSharedContentInbound.call(app, {
     bindingKey: "binding-1",
     workspaceRoot: "/workspace",
     trailingPrepared: {
@@ -607,58 +613,64 @@ test("debounced image batches merge with a trailing text message into one prepar
       accountId: "wx-account",
       workspaceId: "default",
       provider: "weixin",
+      chatId: "chat-1",
       contextToken: "ctx-2",
-      originalText: "这是补充文字",
-      text: "text prompt",
+      originalText: "总结一下",
+      text: "总结一下",
       attachments: [],
       attachmentFailures: [],
-      receivedAt: "2026-04-30T10:00:02.000Z",
+      sharedContent: false,
+      explicitPrompt: true,
+      receivedAt: "2026-04-30T10:01:00.000Z",
     },
   });
 
   assert.ok(routed);
-  assert.equal(routed.attachments.length, 2);
+  assert.equal(routed.attachments.length, 1);
   assert.equal(routed.contextToken, "ctx-2");
-  assert.match(routed.originalText, /这是补充文字/);
-  assert.match(routed.text, /这是补充文字/);
-  assert.doesNotMatch(routed.text, /Saved attachments:/i);
-  assert.doesNotMatch(routed.text, /Read every image first/i);
+  assert.equal(routed.originalText, "总结一下");
+  assert.equal(routed.text, "总结一下");
+  assert.deepEqual(routed.quotedContexts.map((item) => item.kind), ["image", "link"]);
+  assert.equal(routed.quotedContexts[0].attachmentRefs[0], "direct:image-1");
+  assert.equal(routed.quotedContexts[1].url, "https://example.com/report");
+  assert.equal(routed.attachments[0].origin, "quoted");
 });
 
-test("debounced image batches still hand off to the normal pending buffer when the runtime is blocked", async () => {
-  const scopeKey = "binding-1::/workspace";
+test("implicit referenced content enters the ordinary pending buffer as one turn when runtime is blocked", async () => {
+  const scopeKey = "binding-1::/workspace::chat-1";
   const buffered = [];
   const app = {
-    pendingImageInboundByScope: new Map([[scopeKey, {
+    pendingSharedContentInboundByScope: new Map([[scopeKey, {
       bindingKey: "binding-1",
       workspaceRoot: "/workspace",
+      chatId: "chat-1",
       messages: [{
         senderId: "user-1",
         accountId: "wx-account",
         workspaceId: "default",
         provider: "weixin",
+        chatId: "chat-1",
+        messageId: "file-1",
         contextToken: "ctx-1",
         originalText: "",
-        text: "image prompt",
+        text: "",
         attachments: [{
-          kind: "image",
-          contentType: "image/jpeg",
-          isImage: true,
-          absolutePath: "/tmp/a.jpg",
+          kind: "file",
+          contentType: "application/pdf",
+          absolutePath: "/tmp/a.pdf",
+          sourceFileName: "a.pdf",
+          attachmentRef: "direct:file-1",
         }],
         attachmentFailures: [],
+        contentKind: "file",
+        contentTitle: "a.pdf",
+        sharedContent: true,
+        explicitPrompt: false,
         receivedAt: "2026-04-30T10:00:00.000Z",
       }],
       timer: null,
+      lastContentAtMs: Date.parse("2026-04-30T10:00:00.000Z"),
     }]]),
-    config: {
-      userName: "User",
-    },
-    runtimeAdapter: {
-      describe() {
-        return { id: "codex" };
-      },
-    },
     isTurnDispatchBlocked() {
       return true;
     },
@@ -668,17 +680,212 @@ test("debounced image batches still hand off to the normal pending buffer when t
     async dispatchPreparedTurn() {
       throw new Error("should not dispatch while blocked");
     },
-    clearPendingImageInboundTimer: CyberbossApp.prototype.clearPendingImageInboundTimer,
+    clearPendingSharedContentInboundTimer: CyberbossApp.prototype.clearPendingSharedContentInboundTimer,
     routePreparedInbound: CyberbossApp.prototype.routePreparedInbound,
   };
 
-  await CyberbossApp.prototype.flushPendingImageInboundBatch.call(app, {
+  await CyberbossApp.prototype.consumePendingSharedContentInbound.call(app, {
     bindingKey: "binding-1",
     workspaceRoot: "/workspace",
+    trailingPrepared: {
+      senderId: "user-1",
+      accountId: "wx-account",
+      workspaceId: "default",
+      provider: "weixin",
+      chatId: "chat-1",
+      contextToken: "ctx-2",
+      originalText: "提取要点",
+      text: "提取要点",
+      attachments: [],
+      attachmentFailures: [],
+      explicitPrompt: true,
+      receivedAt: "2026-04-30T10:00:30.000Z",
+    },
   });
 
   assert.equal(buffered.length, 1);
   assert.equal(buffered[0].prepared.attachments.length, 1);
+  assert.equal(buffered[0].prepared.originalText, "提取要点");
+  assert.equal(buffered[0].prepared.quotedContexts[0].kind, "file");
+});
+
+test("all shared content kinds are rendered as ordered implicit references", () => {
+  const messages = ["image", "voice", "video", "file"].map((kind, index) => ({
+    messageId: `${kind}-${index}`,
+    contentKind: kind,
+    contentTitle: `${kind} title`,
+    contentText: kind === "voice" ? "语音转写内容" : "",
+    contentUrl: "",
+    attachments: [{
+      kind,
+      absolutePath: `/tmp/${kind}`,
+      attachmentRef: `direct:${kind}`,
+    }],
+    attachmentFailures: [],
+  }));
+  messages.push({
+    messageId: "link-1",
+    contentKind: "link",
+    contentTitle: "链接标题",
+    contentText: "链接摘要",
+    contentUrl: "https://example.com/item",
+    attachments: [],
+    attachmentFailures: [],
+  });
+
+  const prepared = buildImplicitReferencedPrepared({
+    messages,
+    prompt: {
+      originalText: "统一分析",
+      text: "统一分析",
+      quotedContexts: [],
+      attachments: [],
+      attachmentFailures: [],
+    },
+  });
+
+  assert.equal(prepared.originalText, "统一分析");
+  assert.deepEqual(prepared.quotedContexts.map((item) => item.kind), [
+    "image", "voice", "video", "file", "link",
+  ]);
+  assert.equal(prepared.quotedContexts[1].text, "语音转写内容");
+  assert.equal(prepared.attachments.length, 4);
+});
+
+test("shared content timeout clears silently and logical chats remain isolated", async () => {
+  const scopeKey = "binding-1::/workspace::chat-a";
+  const app = {
+    pendingSharedContentInboundByScope: new Map([[scopeKey, {
+      bindingKey: "binding-1",
+      workspaceRoot: "/workspace",
+      chatId: "chat-a",
+      messages: [{ contentKind: "image" }],
+      timer: null,
+      lastContentAtMs: Date.now(),
+    }]]),
+    clearPendingSharedContentInboundTimer: CyberbossApp.prototype.clearPendingSharedContentInboundTimer,
+    dropPendingSharedContentInboundByScopeKey: CyberbossApp.prototype.dropPendingSharedContentInboundByScopeKey,
+  };
+
+  assert.equal(CyberbossApp.prototype.hasPendingSharedContentInbound.call(
+    app, "binding-1", "/workspace", "chat-a"
+  ), true);
+  assert.equal(CyberbossApp.prototype.hasPendingSharedContentInbound.call(
+    app, "binding-1", "/workspace", "chat-b"
+  ), false);
+
+  CyberbossApp.prototype.schedulePendingSharedContentInboundExpiry.call(app, scopeKey, 0);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(app.pendingSharedContentInboundByScope.size, 0);
+});
+
+test("a prompt after 60 seconds is routed normally without the expired implicit reference", async () => {
+  const scopeKey = "binding-1::/workspace::chat-1";
+  let routed = null;
+  const preparedPrompt = {
+    workspaceId: "default",
+    accountId: "wx-account",
+    senderId: "user-1",
+    provider: "weixin",
+    chatId: "chat-1",
+    contextToken: "ctx-2",
+    originalText: "这是新问题",
+    text: "这是新问题",
+    quotedContexts: [],
+    attachments: [],
+    attachmentFailures: [],
+    explicitPrompt: true,
+    receivedAt: "2026-04-30T10:01:01.000Z",
+  };
+  const app = {
+    pendingSharedContentInboundByScope: new Map([[scopeKey, {
+      bindingKey: "binding-1",
+      workspaceRoot: "/workspace",
+      chatId: "chat-1",
+      messages: [{ contentKind: "image", attachments: [] }],
+      timer: null,
+      lastContentAtMs: Date.parse("2026-04-30T10:00:00.000Z"),
+    }]]),
+    runtimeAdapter: {
+      getSessionStore() {
+        return { buildBindingKey() { return "binding-1"; } };
+      },
+    },
+    streamDelivery: { setReplyTarget() {} },
+    resolveWorkspaceRoot() { return "/workspace"; },
+    async prepareIncomingMessageForRuntime() { return preparedPrompt; },
+    hasPendingSharedContentInbound: CyberbossApp.prototype.hasPendingSharedContentInbound,
+    consumePendingSharedContentInbound: CyberbossApp.prototype.consumePendingSharedContentInbound,
+    clearPendingSharedContentInboundTimer: CyberbossApp.prototype.clearPendingSharedContentInboundTimer,
+    async routePreparedInbound({ prepared }) {
+      routed = prepared;
+      return true;
+    },
+  };
+
+  await CyberbossApp.prototype.handlePreparedMessage.call(app, preparedPrompt, { allowCommands: false });
+
+  assert.equal(routed.originalText, "这是新问题");
+  assert.deepEqual(routed.quotedContexts, []);
+  assert.equal(app.pendingSharedContentInboundByScope.size, 0);
+});
+
+test("an explicit quote takes priority and clears pending implicit content", async () => {
+  const scopeKey = "binding-1::/workspace::chat-1";
+  let routed = null;
+  const explicitPrompt = {
+    workspaceId: "default",
+    accountId: "wx-account",
+    senderId: "user-1",
+    provider: "weixin",
+    chatId: "chat-1",
+    contextToken: "ctx-2",
+    originalText: "分析引用内容",
+    text: "分析引用内容",
+    quotedContexts: [{
+      kind: "link",
+      title: "显式引用",
+      text: "",
+      url: "https://example.com/explicit",
+      attachmentRefs: [],
+    }],
+    attachments: [],
+    attachmentFailures: [],
+    explicitPrompt: true,
+    receivedAt: "2026-04-30T10:00:30.000Z",
+  };
+  const app = {
+    pendingSharedContentInboundByScope: new Map([[scopeKey, {
+      bindingKey: "binding-1",
+      workspaceRoot: "/workspace",
+      chatId: "chat-1",
+      messages: [{ contentKind: "image" }],
+      timer: null,
+      lastContentAtMs: Date.parse("2026-04-30T10:00:00.000Z"),
+    }]]),
+    runtimeAdapter: {
+      getSessionStore() {
+        return { buildBindingKey() { return "binding-1"; } };
+      },
+    },
+    streamDelivery: { setReplyTarget() {} },
+    resolveWorkspaceRoot() { return "/workspace"; },
+    async prepareIncomingMessageForRuntime() { return explicitPrompt; },
+    hasPendingSharedContentInbound: CyberbossApp.prototype.hasPendingSharedContentInbound,
+    dropPendingSharedContentInbound: CyberbossApp.prototype.dropPendingSharedContentInbound,
+    dropPendingSharedContentInboundByScopeKey: CyberbossApp.prototype.dropPendingSharedContentInboundByScopeKey,
+    clearPendingSharedContentInboundTimer: CyberbossApp.prototype.clearPendingSharedContentInboundTimer,
+    async routePreparedInbound({ prepared }) {
+      routed = prepared;
+      return true;
+    },
+  };
+
+  await CyberbossApp.prototype.handlePreparedMessage.call(app, explicitPrompt, { allowCommands: false });
+
+  assert.equal(routed.quotedContexts.length, 1);
+  assert.equal(routed.quotedContexts[0].url, "https://example.com/explicit");
+  assert.equal(app.pendingSharedContentInboundByScope.size, 0);
 });
 
 test("pending image-only inbox messages merge into one clean inbound draft", () => {

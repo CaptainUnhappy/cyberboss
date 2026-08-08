@@ -325,6 +325,7 @@ function normalizeWeFlowMessage(value, { quoteMessage = null } = {}) {
     receivedAt: timestamp ? new Date(timestamp * 1000).toISOString() : new Date().toISOString(),
     direction: isSentMessage(raw) ? "outgoing" : "incoming",
     kind,
+    isLinkCard: kind === "link" && (appType > 0 || /<appmsg\b/iu.test(rawContent)),
     title: collapseText(title, 500),
     text: collapseText(text, 12_000, { preserveNewlines: true }),
     url,

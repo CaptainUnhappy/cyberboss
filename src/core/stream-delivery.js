@@ -131,6 +131,7 @@ class StreamDelivery {
           itemId: normalizeText(event.payload.itemId) || `item-${state.itemOrder.length + 1}`,
           text: normalizeLineEndings(event.payload.text),
           completed: true,
+          phase: normalizeMessagePhase(event.payload.phase),
         });
         await this.flush(state, { force: false });
         return;
@@ -221,7 +222,7 @@ class StreamDelivery {
     });
   }
 
-  upsertItem(state, { itemId, text, completed }) {
+  upsertItem(state, { itemId, text, completed, phase = "" }) {
     if (!text) {
       return;
     }
@@ -231,10 +232,15 @@ class StreamDelivery {
         currentText: "",
         completedText: "",
         completed: false,
+        phase: "",
       });
     }
 
     const current = state.items.get(itemId);
+    const normalizedPhase = normalizeMessagePhase(phase);
+    if (normalizedPhase) {
+      current.phase = normalizedPhase;
+    }
     if (completed) {
       current.currentText = text;
       current.completedText = text;
@@ -255,6 +261,7 @@ class StreamDelivery {
         currentText: "",
         completedText: "",
         completed: false,
+        phase: "",
       });
     }
 
@@ -375,6 +382,9 @@ class StreamDelivery {
       text: prependDeferredPrefix ? buildEffectiveReplyText(state.deferredReplyPrefix, baseText) : baseText,
       contextToken: state.replyTarget.contextToken,
     };
+    if (delivery.messageKind) {
+      payload.messageKind = delivery.messageKind;
+    }
     if (state.replyTarget.provider === "weflow-uia") {
       payload.provider = "weflow-uia";
     }
@@ -437,6 +447,13 @@ class StreamDelivery {
       }
     }
 
+    if (payload.messageKind === "progress") {
+      console.warn(
+        `[cyberboss] dropped stale progress reply thread=${state.threadId} user=${initialTarget?.userId || ""}`
+      );
+      return;
+    }
+
     const deferred = await this.deferSystemReply(state, payload.text, latestError, kind);
     if (deferred) {
       return;
@@ -455,6 +472,9 @@ class StreamDelivery {
     }
     if (payload.provider) {
       retryPayload.provider = payload.provider;
+    }
+    if (payload.messageKind) {
+      retryPayload.messageKind = payload.messageKind;
     }
     return retryPayload;
   }
@@ -635,8 +655,9 @@ function collectPendingReplyDeliveries(state, { force }) {
       continue;
     }
     const structuredAction = classifyReplyItemSourceText(sourceText);
+    const messageKind = normalizeMessagePhase(item.phase) === "commentary" ? "progress" : "";
     if (structuredAction) {
-      pending.push(buildActionDelivery(itemId, sourceText, structuredAction));
+      pending.push(buildActionDelivery(itemId, sourceText, structuredAction, messageKind));
       continue;
     }
     const plainText = markdownToPlainText(sourceText);
@@ -644,7 +665,7 @@ function collectPendingReplyDeliveries(state, { force }) {
     if (!sanitizedText) {
       continue;
     }
-    pending.push({ itemId, kind: "plain", text: sanitizedText });
+    pending.push({ itemId, kind: "plain", text: sanitizedText, messageKind });
   }
   return pending;
 }
@@ -907,21 +928,22 @@ function unwrapJsonCodeFence(text) {
   return match ? String(match[1] || "").trim() : "";
 }
 
-function buildActionDelivery(itemId, sourceText, action) {
+function buildActionDelivery(itemId, sourceText, action, messageKind = "") {
   if (!action || typeof action !== "object") {
     return null;
   }
   if (action.kind === "silent") {
-    return { itemId, kind: "silent", sourceText };
+    return { itemId, kind: "silent", sourceText, messageKind };
   }
   if (action.kind === "send_message") {
-    return { itemId, kind: "action", sourceText, message: action.message };
+    return { itemId, kind: "action", sourceText, message: action.message, messageKind };
   }
   return {
     itemId,
     kind: "invalid_action",
     sourceText,
     reason: action.reason || "invalid structured action",
+    messageKind,
   };
 }
 
@@ -943,6 +965,13 @@ function normalizeSystemActionName(value) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "_");
+}
+
+function normalizeMessagePhase(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  return normalized === "commentary" || normalized === "final_answer"
+    ? normalized
+    : "";
 }
 
 function normalizeRuntimeId(value) {

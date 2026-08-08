@@ -68,10 +68,27 @@ test("WeFlow normalizes plain links without exposing raw protocol fields", () =>
   }));
 
   assert.equal(message.kind, "link");
+  assert.equal(message.isLinkCard, false);
   assert.equal(message.url, "https://example.com/report?a=1");
   assert.equal(message.text, "资料 https://example.com/report?a=1");
   assert.equal("downloadKey" in message, false);
   assert.equal("rawContent" in message, false);
+});
+
+test("WeFlow identifies structured link cards for the follow-up prompt window", () => {
+  const message = normalizeWeFlowMessage(detail({
+    content: "[链接]",
+    parsedContent: "[链接]",
+    rawContent: [
+      "<msg><appmsg><title>文章标题</title><des>文章摘要</des><type>5</type>",
+      "<url>https://example.com/card</url></appmsg></msg>",
+    ].join(""),
+  }));
+
+  assert.equal(message.kind, "link");
+  assert.equal(message.isLinkCard, true);
+  assert.equal(message.url, "https://example.com/card");
+  assert.equal(message.title, "文章标题");
 });
 
 test("WeFlow expands merged-forward records into an ordered readable transcript", () => {
@@ -413,6 +430,8 @@ test("Cyberboss maps a WeFlow item onto the existing ClawBot reply binding", asy
   assert.equal(received[0].normalized.provider, "weixin");
   assert.equal(received[0].normalized.chatId, "weflow:wxid_main");
   assert.match(received[0].normalized.text, /WeFlow 微信入站/);
+  assert.equal(received[0].normalized.sharedContent, false);
+  assert.equal(received[0].normalized.explicitPrompt, true);
   assert.deepEqual(received[0].options, { allowCommands: false });
 });
 
@@ -612,4 +631,6 @@ test("Cyberboss transcribes direct WeFlow WAV before task routing", async () => 
   assert.match(received[0].text, /\[语音转写\]\n请回复这条语音/);
   assert.equal(received[0].persistedAttachments[0].contentType, "audio/wav");
   assert.equal(received[0].persistedAttachmentFailures.length, 0);
+  assert.equal(received[0].sharedContent, true);
+  assert.equal(received[0].explicitPrompt, false);
 });

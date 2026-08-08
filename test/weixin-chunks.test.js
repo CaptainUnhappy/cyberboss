@@ -5,6 +5,7 @@ const {
   splitUtf8,
   normalizeWeixinReplyText,
   finalizeWeixinDeliveryChunk,
+  buildWeixinDeliveryChunks,
   stripChunkTailChineseFullStops,
   chunkReplyText,
   chunkReplyTextForWeixin,
@@ -102,6 +103,26 @@ test("chunkReplyTextForWeixin keeps an ordinary multi-paragraph reply in one bub
   const text = `${longA}\n\n${longB}`;
   const chunks = chunkReplyTextForWeixin(text);
   assert.deepEqual(chunks, [text]);
+});
+
+test("channel delivery adds the progress prefix after chunking", () => {
+  const chunks = buildWeixinDeliveryChunks({
+    text: "进度正文".repeat(2_000),
+    messageKind: "progress",
+    preserveBlock: true,
+  });
+
+  assert.ok(chunks.length > 1);
+  assert.ok(chunks.every((chunk) => chunk.startsWith("【进度】 ")));
+  assert.ok(chunks.every((chunk) => chunk.length <= 4_000));
+  assert.ok(chunks.every((chunk) => !chunk.slice("【进度】 ".length).includes("【进度】")));
+});
+
+test("ordinary channel delivery keeps final reply text undecorated", () => {
+  assert.deepEqual(buildWeixinDeliveryChunks({
+    text: "最终回复。",
+    messageKind: "",
+  }), ["最终回复"]);
 });
 
 test("chunkReplyTextForWeixin coalesces short and long natural units below the target", () => {

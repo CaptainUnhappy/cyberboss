@@ -47,7 +47,8 @@ function createInboundFilter() {
         referenceScope: messageId || String(createdAtMs || "message"),
       });
       const attachments = [...directAttachments, ...quoted.attachments];
-      if (!text && !attachments.length && !quoted.contexts.length) {
+      const sharedContent = extractDirectSharedContentMetadata(itemList, text, directAttachments);
+      if (!text && !attachments.length && !quoted.contexts.length && !sharedContent.sharedContent) {
         return null;
       }
 
@@ -62,6 +63,7 @@ function createInboundFilter() {
         text,
         attachments,
         quotedContexts: quoted.contexts,
+        ...sharedContent,
         contextToken: normalizeText(message.context_token),
         receivedAt: createdAtMs > 0 ? new Date(createdAtMs).toISOString() : new Date().toISOString(),
       };
@@ -206,6 +208,55 @@ function extractKnownLink(messageItem) {
   const text = normalizeText(messageItem?.text_item?.text);
   url ||= extractHttpUrl(text);
   return { url, title, description };
+}
+
+function extractDirectSharedContentMetadata(itemList, text, directAttachments) {
+  const items = Array.isArray(itemList) ? itemList : [];
+  const attachments = Array.isArray(directAttachments) ? directAttachments : [];
+  const structuredLink = items
+    .map((item) => extractKnownLink(item))
+    .find((item) => item.url) || { url: "", title: "", description: "" };
+  const plainUrl = structuredLink.url || extractHttpUrl(text);
+  const attachmentKind = attachments.map((item) => normalizeText(item?.kind).toLowerCase()).find(Boolean) || "";
+  const hasVoiceItem = items.some((item) => Number(item?.type) === MESSAGE_ITEM_VOICE);
+  const contentKind = attachmentKind || (hasVoiceItem ? "voice" : "") || (plainUrl ? "link" : "");
+  if (!contentKind) {
+    return {
+      contentKind: "",
+      contentTitle: "",
+      contentText: "",
+      contentUrl: "",
+      sharedContent: false,
+      explicitPrompt: Boolean(normalizeText(text)),
+    };
+  }
+
+  const textItems = items
+    .filter((item) => Number(item?.type) === MESSAGE_ITEM_TEXT)
+    .map((item) => normalizeText(item?.text_item?.text))
+    .filter(Boolean);
+  const linkContentText = normalizeText(structuredLink.description || structuredLink.title || text);
+  const structuredLinkText = new Set([
+    normalizeComparableText(structuredLink.title),
+    normalizeComparableText(structuredLink.description),
+    normalizeComparableText([structuredLink.title, structuredLink.description].filter(Boolean).join(" ")),
+  ].filter(Boolean));
+  const explicitPrompt = textItems.some((itemText) => {
+    const withoutUrls = normalizeComparableText(itemText.replace(/https?:\/\/[^\s<>"']+/giu, " "));
+    if (!withoutUrls) {
+      return false;
+    }
+    return !structuredLinkText.has(withoutUrls);
+  });
+
+  return {
+    contentKind,
+    contentTitle: normalizeText(structuredLink.title || attachments[0]?.fileName),
+    contentText: contentKind === "link" || contentKind === "voice" ? linkContentText : "",
+    contentUrl: plainUrl,
+    sharedContent: true,
+    explicitPrompt,
+  };
 }
 
 function extractHttpUrl(value) {
@@ -400,6 +451,10 @@ function pruneSeen(seen) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeComparableText(value) {
+  return normalizeText(value).replace(/\s+/gu, " ").toLowerCase();
 }
 
 module.exports = {

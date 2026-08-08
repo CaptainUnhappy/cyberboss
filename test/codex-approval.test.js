@@ -36,6 +36,38 @@ test("codex MCP config auto-approves cyberboss tools", () => {
   );
 });
 
+test("codex agent message completion exposes commentary and final phases", () => {
+  const commentary = mapCodexMessageToRuntimeEvent({
+    method: "item/completed",
+    params: {
+      threadId: "thread-phase",
+      turnId: "turn-phase",
+      item: {
+        id: "item-commentary",
+        type: "agentMessage",
+        text: "正在检查",
+        phase: "commentary",
+      },
+    },
+  });
+  const finalAnswer = mapCodexMessageToRuntimeEvent({
+    method: "item/completed",
+    params: {
+      threadId: "thread-phase",
+      turnId: "turn-phase",
+      item: {
+        id: "item-final",
+        type: "agentMessage",
+        text: "检查完成",
+        phase: "final_answer",
+      },
+    },
+  });
+
+  assert.equal(commentary.payload.phase, "commentary");
+  assert.equal(finalAnswer.payload.phase, "final_answer");
+});
+
 test("codex MCP elicitation approvals map to runtime approval events", () => {
   const event = mapCodexMessageToRuntimeEvent({
     id: "req-mcp-1",

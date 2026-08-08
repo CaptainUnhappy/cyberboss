@@ -24,9 +24,11 @@ const {
 const {
   assembleRuntimeTurnText,
   buildInboundDraft,
+  buildImplicitReferencedPrepared,
   buildMergedInboundPrepared,
   clonePreparedInboundMessage,
-  isPlainTextPreparedMessage,
+  isImplicitReferencePromptPreparedMessage,
+  isSharedContentOnlyPreparedMessage,
   shouldBatchImageOnlyInbound,
   takeImageOnlyBatchMessages,
 } = require("./inbound-turn");
@@ -65,7 +67,7 @@ const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_INBOUND_STICKER_IMAGE_BATCH = 10;
-const INBOUND_IMAGE_BATCH_IDLE_MS = 1_500;
+const SHARED_CONTENT_FOLLOWUP_WINDOW_MS = 60_000;
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
@@ -95,7 +97,7 @@ class CyberbossApp {
     this.reminderQueue = new ReminderQueueStore({ filePath: config.reminderQueueFile });
     this.turnGateStore = new TurnGateStore();
     this.pendingInboundByScope = new Map();
-    this.pendingImageInboundByScope = new Map();
+    this.pendingSharedContentInboundByScope = new Map();
     this.turnBoundaryScopeKeys = new Set();
     this.systemMessageDispatcher = null;
     this.wechatCliInboxSource = null;
@@ -185,7 +187,7 @@ class CyberbossApp {
     }
 
     const shutdown = createShutdownController(async () => {
-      this.clearPendingImageInboundTimers();
+      this.clearPendingSharedContentInboundTimers();
       await this.closeWechatCliInbox();
       await this.closeWeFlowInbox();
       await this.closeVoiceTranscription();
@@ -238,7 +240,7 @@ class CyberbossApp {
       }
     } finally {
       shutdown.dispose();
-      this.clearPendingImageInboundTimers();
+      this.clearPendingSharedContentInboundTimers();
       await this.closeWechatCliInbox();
       await this.closeWeFlowInbox();
       await this.closeVoiceTranscription();
@@ -419,6 +421,12 @@ class CyberbossApp {
       receivedAt: message.receivedAt,
       config: this.config,
     });
+    const sharedContent = isSharedInboxContentMessage(message, {
+      assumeLinkCard: normalizeSharedContentKind(message.kind) === "link",
+    });
+    const explicitPrompt = isExplicitInboxPromptMessage(message, {
+      assumeLinkCard: normalizeSharedContentKind(message.kind) === "link",
+    });
     const normalized = {
       provider: "weixin",
       accountId: this.activeAccountId,
@@ -432,6 +440,12 @@ class CyberbossApp {
       attachments: [],
       persistedAttachments: persisted.saved,
       persistedAttachmentFailures: persisted.failed,
+      contentKind: normalizeSharedContentKind(message.kind),
+      contentTitle: normalizeCommandArgument(message.title),
+      contentText: normalizeCommandArgument(message.text),
+      contentUrl: normalizeHttpUrl(message.url),
+      sharedContent,
+      explicitPrompt,
       receivedAt: normalizeIsoTime(message.receivedAt)
         || (message.timestamp ? new Date(message.timestamp * 1000).toISOString() : new Date().toISOString()),
     };
@@ -474,6 +488,8 @@ class CyberbossApp {
     }
     const chatUsername = normalizeCommandArgument(snapshot.chatUsername)
       || normalizeCommandArgument(this.config.weflowInboxChat);
+    const sharedContent = isSharedInboxContentMessage(enrichedMessage);
+    const explicitPrompt = isExplicitInboxPromptMessage(enrichedMessage);
     const normalized = {
       provider: sendSource === "azzy" ? "weflow-uia" : "weixin",
       accountId: this.activeAccountId,
@@ -487,6 +503,12 @@ class CyberbossApp {
       attachments: [],
       persistedAttachments: persisted.saved,
       persistedAttachmentFailures: [...persisted.failed, ...voice.failures],
+      contentKind: normalizeSharedContentKind(enrichedMessage.kind),
+      contentTitle: normalizeCommandArgument(enrichedMessage.title),
+      contentText: normalizeCommandArgument(enrichedMessage.text),
+      contentUrl: normalizeHttpUrl(enrichedMessage.url),
+      sharedContent,
+      explicitPrompt,
       receivedAt: normalizeIsoTime(enrichedMessage.receivedAt)
         || (enrichedMessage.timestamp ? new Date(enrichedMessage.timestamp * 1000).toISOString() : new Date().toISOString()),
     };
@@ -687,27 +709,157 @@ class CyberbossApp {
       return;
     }
 
-    if (shouldBatchImageOnlyInbound(prepared)) {
-      this.enqueuePendingImageInbound({ bindingKey, workspaceRoot, prepared });
-      return;
-    }
-
-    if (this.hasPendingImageInbound(bindingKey, workspaceRoot) && isPlainTextPreparedMessage(prepared)) {
-      const merged = await this.flushPendingImageInboundBatch({
-        bindingKey,
-        workspaceRoot,
-        trailingPrepared: prepared,
-      });
-      if (merged) {
+    if (isSharedContentOnlyPreparedMessage(prepared)) {
+      if (typeof this.enqueuePendingSharedContentInbound === "function") {
+        this.enqueuePendingSharedContentInbound({ bindingKey, workspaceRoot, prepared });
         return;
       }
     }
 
-    if (this.hasPendingImageInbound(bindingKey, workspaceRoot)) {
-      await this.flushPendingImageInboundBatch({ bindingKey, workspaceRoot });
+    const hasPendingSharedContent = typeof this.hasPendingSharedContentInbound === "function"
+      && this.hasPendingSharedContentInbound(bindingKey, workspaceRoot, prepared.chatId);
+    if (hasPendingSharedContent) {
+      if (isImplicitReferencePromptPreparedMessage(prepared)) {
+        const merged = await this.consumePendingSharedContentInbound({
+          bindingKey,
+          workspaceRoot,
+          trailingPrepared: prepared,
+        });
+        if (merged) {
+          return;
+        }
+      } else {
+        this.dropPendingSharedContentInbound({
+          bindingKey,
+          workspaceRoot,
+          chatId: prepared.chatId,
+          reason: "superseded",
+        });
+      }
     }
 
     await this.routePreparedInbound({ bindingKey, workspaceRoot, prepared });
+  }
+
+  hasPendingSharedContentInbound(bindingKey, workspaceRoot, chatId = "") {
+    return this.pendingSharedContentInboundByScope.has(
+      buildSharedContentScopeKey(bindingKey, workspaceRoot, chatId)
+    );
+  }
+
+  enqueuePendingSharedContentInbound({ bindingKey, workspaceRoot, prepared }) {
+    const scopeKey = buildSharedContentScopeKey(bindingKey, workspaceRoot, prepared?.chatId);
+    if (!scopeKey || !prepared) {
+      return;
+    }
+
+    const current = this.pendingSharedContentInboundByScope.get(scopeKey) || {
+      bindingKey,
+      workspaceRoot,
+      chatId: normalizeText(prepared.chatId),
+      messages: [],
+      timer: null,
+      lastContentAtMs: 0,
+    };
+    current.messages.push(clonePreparedInboundMessage(prepared));
+    current.lastContentAtMs = resolvePreparedMessageTimeMs(prepared) || Date.now();
+    this.pendingSharedContentInboundByScope.set(scopeKey, current);
+    this.schedulePendingSharedContentInboundExpiry(scopeKey);
+    console.log(
+      `[cyberboss] shared content waiting for prompt scope=${scopeKey} count=${current.messages.length}`
+    );
+  }
+
+  schedulePendingSharedContentInboundExpiry(scopeKey, delayMs = null) {
+    const draft = this.pendingSharedContentInboundByScope.get(scopeKey);
+    if (!draft) {
+      return;
+    }
+    if (draft.timer) {
+      clearTimeout(draft.timer);
+    }
+    const remainingMs = delayMs == null
+      ? Math.max(0, draft.lastContentAtMs + SHARED_CONTENT_FOLLOWUP_WINDOW_MS - Date.now())
+      : Math.max(0, Number(delayMs) || 0);
+    draft.timer = setTimeout(() => {
+      this.dropPendingSharedContentInboundByScopeKey(scopeKey, "timeout");
+    }, remainingMs);
+    this.pendingSharedContentInboundByScope.set(scopeKey, draft);
+  }
+
+  clearPendingSharedContentInboundTimer(scopeKey) {
+    const draft = this.pendingSharedContentInboundByScope.get(scopeKey);
+    if (!draft?.timer) {
+      return;
+    }
+    clearTimeout(draft.timer);
+    draft.timer = null;
+  }
+
+  clearPendingSharedContentInboundTimers() {
+    for (const [scopeKey] of this.pendingSharedContentInboundByScope.entries()) {
+      this.clearPendingSharedContentInboundTimer(scopeKey);
+    }
+    this.pendingSharedContentInboundByScope.clear();
+  }
+
+  dropPendingSharedContentInbound({ bindingKey = "", workspaceRoot = "", chatId = "", reason = "cleared" } = {}) {
+    const scopeKey = buildSharedContentScopeKey(bindingKey, workspaceRoot, chatId);
+    return this.dropPendingSharedContentInboundByScopeKey(scopeKey, reason);
+  }
+
+  dropPendingSharedContentInboundByScopeKey(scopeKey, reason = "cleared") {
+    const draft = scopeKey ? this.pendingSharedContentInboundByScope.get(scopeKey) || null : null;
+    if (!draft) {
+      return false;
+    }
+    this.clearPendingSharedContentInboundTimer(scopeKey);
+    this.pendingSharedContentInboundByScope.delete(scopeKey);
+    console.log(
+      `[cyberboss] shared content cleared scope=${scopeKey} reason=${reason} count=${draft.messages?.length || 0}`
+    );
+    return true;
+  }
+
+  async consumePendingSharedContentInbound({ bindingKey = "", workspaceRoot = "", trailingPrepared = null } = {}) {
+    const scopeKey = buildSharedContentScopeKey(bindingKey, workspaceRoot, trailingPrepared?.chatId);
+    const draft = scopeKey ? this.pendingSharedContentInboundByScope.get(scopeKey) || null : null;
+    if (!draft?.bindingKey || !draft?.workspaceRoot || !trailingPrepared) {
+      return false;
+    }
+
+    this.clearPendingSharedContentInboundTimer(scopeKey);
+    this.pendingSharedContentInboundByScope.delete(scopeKey);
+    const promptAtMs = resolvePreparedMessageTimeMs(trailingPrepared) || Date.now();
+    const elapsedMs = promptAtMs - Number(draft.lastContentAtMs || 0);
+    if (elapsedMs < 0 || elapsedMs > SHARED_CONTENT_FOLLOWUP_WINDOW_MS) {
+      console.log(`[cyberboss] shared content prompt missed window scope=${scopeKey} elapsedMs=${elapsedMs}`);
+      return false;
+    }
+
+    const queued = Array.isArray(draft.messages)
+      ? draft.messages
+        .filter((message) => message && typeof message === "object")
+        .slice()
+        .sort(comparePendingInboundMessages)
+      : [];
+    if (!queued.length) {
+      return false;
+    }
+
+    const preparedWithReference = buildImplicitReferencedPrepared({
+      messages: queued,
+      prompt: trailingPrepared,
+    });
+    await this.routePreparedInbound({
+      bindingKey: draft.bindingKey,
+      workspaceRoot: draft.workspaceRoot,
+      prepared: preparedWithReference,
+    });
+    console.log(
+      `[cyberboss] shared content attached to prompt scope=${scopeKey} count=${queued.length} elapsedMs=${elapsedMs}`
+    );
+    return true;
   }
 
   isTurnDispatchBlocked(bindingKey, workspaceRoot, { ignoreBoundary = false } = {}) {
@@ -846,123 +998,6 @@ class CyberbossApp {
       return false;
     }
     return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
-  }
-
-  hasPendingImageInbound(bindingKey, workspaceRoot) {
-    return this.pendingImageInboundByScope.has(buildScopeKey(bindingKey, workspaceRoot));
-  }
-
-  enqueuePendingImageInbound({ bindingKey, workspaceRoot, prepared }) {
-    const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
-    if (!scopeKey || !prepared) {
-      return;
-    }
-
-    const current = this.pendingImageInboundByScope.get(scopeKey) || {
-      bindingKey,
-      workspaceRoot,
-      messages: [],
-      timer: null,
-    };
-    current.messages.push(clonePreparedInboundMessage(prepared));
-    this.pendingImageInboundByScope.set(scopeKey, current);
-    this.schedulePendingImageInboundFlush(scopeKey, bindingKey, workspaceRoot);
-    void this.channelAdapter.sendTyping({
-      userId: prepared.senderId,
-      status: 1,
-      contextToken: prepared.contextToken,
-    }).catch(() => {});
-  }
-
-  schedulePendingImageInboundFlush(scopeKey, bindingKey, workspaceRoot, delayMs = INBOUND_IMAGE_BATCH_IDLE_MS) {
-    const draft = this.pendingImageInboundByScope.get(scopeKey);
-    if (!draft) {
-      return;
-    }
-    if (draft.timer) {
-      clearTimeout(draft.timer);
-    }
-    draft.timer = setTimeout(() => {
-      void this.flushPendingImageInboundBatch({ bindingKey, workspaceRoot }).catch((error) => {
-        const message = error instanceof Error ? error.stack || error.message : String(error);
-        console.error(`[cyberboss] image inbound debounce flush failed ${message}`);
-      });
-    }, Math.max(0, Number(delayMs) || 0));
-    this.pendingImageInboundByScope.set(scopeKey, draft);
-  }
-
-  clearPendingImageInboundTimer(scopeKey) {
-    const draft = this.pendingImageInboundByScope.get(scopeKey);
-    if (!draft?.timer) {
-      return;
-    }
-    clearTimeout(draft.timer);
-    draft.timer = null;
-  }
-
-  clearPendingImageInboundTimers() {
-    for (const [scopeKey] of this.pendingImageInboundByScope.entries()) {
-      this.clearPendingImageInboundTimer(scopeKey);
-    }
-  }
-
-  async flushPendingImageInboundBatch({ bindingKey = "", workspaceRoot = "", trailingPrepared = null } = {}) {
-    const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
-    const draft = scopeKey ? this.pendingImageInboundByScope.get(scopeKey) || null : null;
-    if (!draft?.bindingKey || !draft?.workspaceRoot) {
-      if (scopeKey) {
-        this.pendingImageInboundByScope.delete(scopeKey);
-      }
-      return false;
-    }
-
-    this.clearPendingImageInboundTimer(scopeKey);
-    this.pendingImageInboundByScope.delete(scopeKey);
-
-    const queued = Array.isArray(draft.messages)
-      ? draft.messages
-        .filter((message) => message && typeof message === "object")
-        .slice()
-        .sort(comparePendingInboundMessages)
-      : [];
-    if (!queued.length) {
-      return false;
-    }
-
-    const { batchMessages, remainingMessages } = takeImageOnlyBatchMessages(queued, MAX_INBOUND_STICKER_IMAGE_BATCH);
-    if (!batchMessages.length) {
-      return false;
-    }
-
-    if (remainingMessages.length) {
-      this.pendingImageInboundByScope.set(scopeKey, {
-        bindingKey: draft.bindingKey,
-        workspaceRoot: draft.workspaceRoot,
-        messages: remainingMessages,
-        timer: null,
-      });
-    }
-
-    const prepared = buildMergedInboundPrepared({
-      bindingKey: draft.bindingKey,
-      workspaceRoot: draft.workspaceRoot,
-      messages: batchMessages,
-      trailingPrepared,
-    });
-    await this.routePreparedInbound({
-      bindingKey: draft.bindingKey,
-      workspaceRoot: draft.workspaceRoot,
-      prepared,
-    });
-
-    if (remainingMessages.length) {
-      await this.flushPendingImageInboundBatch({
-        bindingKey: draft.bindingKey,
-        workspaceRoot: draft.workspaceRoot,
-      });
-    }
-
-    return true;
   }
 
   bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared }) {
@@ -2629,6 +2664,80 @@ function buildScopeKey(bindingKey, workspaceRoot) {
     return "";
   }
   return `${normalizedBindingKey}::${normalizedWorkspaceRoot}`;
+}
+
+function buildSharedContentScopeKey(bindingKey, workspaceRoot, chatId = "") {
+  const baseScopeKey = buildScopeKey(bindingKey, workspaceRoot);
+  const normalizedChatId = normalizeText(chatId);
+  if (!baseScopeKey || !normalizedChatId) {
+    return "";
+  }
+  return `${baseScopeKey}::${normalizedChatId}`;
+}
+
+function resolvePreparedMessageTimeMs(prepared) {
+  const parsed = Date.parse(String(prepared?.receivedAt || ""));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function normalizeSharedContentKind(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (normalized === "audio") {
+    return "voice";
+  }
+  return ["image", "voice", "video", "file", "link"].includes(normalized)
+    ? normalized
+    : "";
+}
+
+function isSharedInboxContentMessage(message, { assumeLinkCard = false } = {}) {
+  const kind = normalizeSharedContentKind(message?.kind);
+  if (!kind) {
+    return false;
+  }
+  if (kind !== "link") {
+    return true;
+  }
+  return Boolean(assumeLinkCard || message?.isLinkCard || isUrlOnlyText(message?.text));
+}
+
+function isExplicitInboxPromptMessage(message, { assumeLinkCard = false } = {}) {
+  const text = normalizeText(message?.text);
+  if (!text) {
+    return false;
+  }
+  const kind = normalizeSharedContentKind(message?.kind);
+  if (!kind) {
+    return true;
+  }
+  if (kind === "voice" && message?.voiceTranscript) {
+    return false;
+  }
+  if (kind === "link") {
+    return !(assumeLinkCard || message?.isLinkCard || isUrlOnlyText(text));
+  }
+  const title = normalizeText(message?.title);
+  return normalizeComparableInboxText(text) !== normalizeComparableInboxText(title);
+}
+
+function normalizeComparableInboxText(value) {
+  return normalizeText(value).replace(/\s+/gu, " ").trim().toLowerCase();
+}
+
+function isUrlOnlyText(value) {
+  const normalized = normalizeText(value);
+  if (!normalized || !/https?:\/\//iu.test(normalized)) {
+    return false;
+  }
+  const withoutUrls = normalized
+    .replace(/https?:\/\/[^\s<>"']+/giu, " ")
+    .replace(/[\s,，。.!！?？;；:：()（）\[\]【】<>《》]+/gu, "");
+  return withoutUrls.length === 0;
+}
+
+function normalizeHttpUrl(value) {
+  const normalized = normalizeText(value);
+  return /^https?:\/\//iu.test(normalized) ? normalized : "";
 }
 
 function isAutoApprovedStateDirOperation(approval, config = {}) {

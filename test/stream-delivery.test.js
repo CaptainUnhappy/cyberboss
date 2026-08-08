@@ -436,6 +436,107 @@ test("plain weixin reply sends finalized item text even if earlier streaming tex
   });
 });
 
+test("commentary carries progress metadata while reply text remains unprefixed", async () => {
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-progress", {
+    userId: "user-progress",
+    contextToken: "ctx-progress",
+    provider: "weflow-uia",
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-progress", turnId: "turn-progress" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      itemId: "item-progress",
+      text: "正在检查项目",
+      phase: "commentary",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-progress",
+      turnId: "turn-progress",
+      itemId: "item-final",
+      text: "检查完成",
+      phase: "final_answer",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: { threadId: "thread-progress", turnId: "turn-progress" },
+  });
+
+  assert.deepEqual(sent, [{
+    userId: "user-progress",
+    text: "正在检查项目",
+    contextToken: "ctx-progress",
+    messageKind: "progress",
+    provider: "weflow-uia",
+  }, {
+    userId: "user-progress",
+    text: "检查完成",
+    contextToken: "ctx-progress",
+    provider: "weflow-uia",
+  }]);
+  assert.doesNotMatch(sent[0].text, /【进度】/u);
+});
+
+test("expired progress is dropped after context retries instead of entering deferred delivery", async () => {
+  const attempts = [];
+  const deferred = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText(payload) {
+      attempts.push(payload);
+      const error = new Error("sendMessage ret=-2 errcode= errmsg=");
+      error.ret = -2;
+      throw error;
+    },
+    getKnownContextTokens() {
+      return { "user-progress-expired": "ctx-progress-expired" };
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  streamDelivery.queueReplyTargetForThread("thread-progress-expired", {
+    userId: "user-progress-expired",
+    contextToken: "ctx-progress-expired",
+    provider: "weixin",
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-progress-expired", turnId: "turn-progress-expired" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-progress-expired",
+      turnId: "turn-progress-expired",
+      itemId: "item-progress-expired",
+      text: "still working",
+      phase: "commentary",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: { threadId: "thread-progress-expired", turnId: "turn-progress-expired" },
+  });
+
+  assert.deepEqual(sent, []);
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].messageKind, "progress");
+  assert.equal(attempts[1].omitContextToken, true);
+  assert.deepEqual(deferred, []);
+});
+
 test("system send_message retries with the latest context token on ret=-2", async () => {
   const attempts = [];
   const { sent, streamDelivery } = createHarness({

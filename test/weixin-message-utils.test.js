@@ -166,4 +166,44 @@ test("direct attachments retain a direct origin", () => {
   assert.equal(normalized.attachments[0].quoteIndex, null);
   assert.equal(normalized.attachments[0].attachmentRef, "");
   assert.deepEqual(normalized.quotedContexts, []);
+  assert.equal(normalized.contentKind, "image");
+  assert.equal(normalized.sharedContent, true);
+  assert.equal(normalized.explicitPrompt, false);
+});
+
+test("direct link cards and URL-only text are shared content without an explicit prompt", () => {
+  const card = normalizeItemList([{
+    type: 1,
+    text_item: {
+      text: "文章标题",
+      link: {
+        title: "文章标题",
+        description: "文章简介",
+        url: "https://example.com/card",
+      },
+    },
+  }]);
+  const urlOnly = normalizeItemList([{
+    type: 1,
+    text_item: { text: "https://example.com/plain" },
+  }], { message_id: "message-url-only" });
+
+  assert.equal(card.contentKind, "link");
+  assert.equal(card.contentUrl, "https://example.com/card");
+  assert.equal(card.sharedContent, true);
+  assert.equal(card.explicitPrompt, false);
+  assert.equal(urlOnly.contentKind, "link");
+  assert.equal(urlOnly.sharedContent, true);
+  assert.equal(urlOnly.explicitPrompt, false);
+});
+
+test("text containing an instruction and URL is handled as an explicit same-message prompt", () => {
+  const normalized = normalizeItemList([{
+    type: 1,
+    text_item: { text: "总结这个链接 https://example.com/report" },
+  }], { message_id: "message-url-prompt" });
+
+  assert.equal(normalized.contentKind, "link");
+  assert.equal(normalized.sharedContent, true);
+  assert.equal(normalized.explicitPrompt, true);
 });

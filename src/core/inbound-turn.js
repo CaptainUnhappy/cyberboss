@@ -154,6 +154,85 @@ function assembleRuntimeTurnText({ prepared, config = {}, visionContext = {}, me
   return lines.join("\n").trim();
 }
 
+function buildImplicitReferencedPrepared({ messages = [], prompt = null } = {}) {
+  const trailing = prompt && typeof prompt === "object" ? prompt : {};
+  const queued = Array.isArray(messages)
+    ? messages.filter((message) => message && typeof message === "object")
+    : [];
+  const quotedContexts = [];
+  const attachments = [];
+  const attachmentFailures = [];
+
+  queued.forEach((message, messageIndex) => {
+    const sourceAttachments = Array.isArray(message.attachments) ? message.attachments : [];
+    const quoteIndexBase = quotedContexts.length;
+    const messageAttachments = sourceAttachments.map((attachment, attachmentIndex) => {
+      const attachmentRef = normalizeAttachmentRef(attachment?.attachmentRef)
+        || `implicit:${normalizeAttachmentRef(message?.messageId) || messageIndex + 1}:${attachmentIndex + 1}`;
+      return {
+        ...attachment,
+        attachmentRef,
+        origin: "quoted",
+        quoteIndex: quoteIndexBase + attachmentIndex,
+      };
+    });
+    const contentKind = normalizeSharedContentKind(message.contentKind)
+      || inferSharedContentKind(messageAttachments, message.contentUrl);
+    const contentTitle = collapsePromptText(message.contentTitle, 500);
+    const contentText = collapsePromptText(message.contentText, 4_000);
+    const contentUrl = normalizeQuotedUrl(message.contentUrl);
+
+    if (messageAttachments.length) {
+      messageAttachments.forEach((attachment, attachmentIndex) => {
+        quotedContexts.push({
+          kind: normalizeSharedContentKind(attachment.kind) || contentKind || "unknown",
+          title: collapsePromptText(
+            attachmentIndex === 0 ? (contentTitle || attachment.sourceFileName) : attachment.sourceFileName,
+            500,
+          ),
+          text: attachmentIndex === 0 ? contentText : "",
+          url: attachmentIndex === 0 ? contentUrl : "",
+          attachmentRefs: [attachment.attachmentRef],
+        });
+      });
+      attachments.push(...messageAttachments);
+    } else if (contentKind || contentTitle || contentText || contentUrl) {
+      quotedContexts.push({
+        kind: contentKind || (contentUrl ? "link" : "unknown"),
+        title: contentTitle,
+        text: contentText,
+        url: contentUrl,
+        attachmentRefs: [],
+      });
+    }
+
+    if (Array.isArray(message.attachmentFailures)) {
+      attachmentFailures.push(...message.attachmentFailures);
+    }
+  });
+
+  const originalText = normalizeText(trailing.originalText ?? trailing.text);
+  return {
+    ...trailing,
+    originalText,
+    text: originalText,
+    quotedContexts: [
+      ...quotedContexts,
+      ...normalizeQuotedContexts(trailing.quotedContexts),
+    ],
+    attachments: [
+      ...attachments,
+      ...(Array.isArray(trailing.attachments) ? trailing.attachments : []),
+    ],
+    attachmentFailures: [
+      ...attachmentFailures,
+      ...(Array.isArray(trailing.attachmentFailures) ? trailing.attachmentFailures : []),
+    ],
+    sharedContent: false,
+    explicitPrompt: true,
+  };
+}
+
 function shouldBatchImageOnlyInbound(message) {
   const originalText = normalizeText(message?.originalText);
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
@@ -215,6 +294,7 @@ function clonePreparedInboundMessage(prepared) {
     workspaceId: prepared.workspaceId,
     accountId: prepared.accountId,
     senderId: prepared.senderId,
+    chatId: prepared.chatId,
     messageId: prepared.messageId,
     contextToken: prepared.contextToken,
     provider: prepared.provider,
@@ -224,7 +304,31 @@ function clonePreparedInboundMessage(prepared) {
     attachments: Array.isArray(prepared.attachments) ? prepared.attachments : [],
     attachmentFailures: Array.isArray(prepared.attachmentFailures) ? prepared.attachmentFailures : [],
     receivedAt: prepared.receivedAt,
+    contentKind: normalizeSharedContentKind(prepared.contentKind),
+    contentTitle: normalizeText(prepared.contentTitle),
+    contentText: normalizeText(prepared.contentText),
+    contentUrl: normalizeQuotedUrl(prepared.contentUrl),
+    sharedContent: Boolean(prepared.sharedContent),
+    explicitPrompt: Boolean(prepared.explicitPrompt),
   };
+}
+
+function isSharedContentOnlyPreparedMessage(message) {
+  const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+  const inferredSharedContent = attachments.length > 0
+    || Boolean(normalizeQuotedUrl(message?.contentUrl))
+    || Boolean(normalizeSharedContentKind(message?.contentKind));
+  const classifiedSharedContent = Boolean(message?.sharedContent);
+  return (classifiedSharedContent || (inferredSharedContent && !normalizeText(message?.originalText)))
+    && !message?.explicitPrompt
+    && normalizeQuotedContexts(message?.quotedContexts).length === 0;
+}
+
+function isImplicitReferencePromptPreparedMessage(message) {
+  return isPlainTextPreparedMessage(message)
+    && !message?.sharedContent
+    && message?.explicitPrompt !== false
+    && normalizeQuotedContexts(message?.quotedContexts).length === 0;
 }
 
 function isPlainTextPreparedMessage(prepared) {
@@ -243,6 +347,26 @@ function pushSectionBreak(lines) {
   if (lines.length) {
     lines.push("");
   }
+}
+
+function inferSharedContentKind(attachments, contentUrl = "") {
+  const firstKind = (Array.isArray(attachments) ? attachments : [])
+    .map((item) => normalizeSharedContentKind(item?.kind))
+    .find(Boolean);
+  if (firstKind) {
+    return firstKind;
+  }
+  return normalizeQuotedUrl(contentUrl) ? "link" : "";
+}
+
+function normalizeSharedContentKind(value) {
+  const normalized = normalizeText(value).toLowerCase();
+  if (normalized === "audio") {
+    return "voice";
+  }
+  return ["image", "voice", "video", "file", "link"].includes(normalized)
+    ? normalized
+    : "";
 }
 
 function filterQuotedContextsForAttachments(contexts, attachments, { includeUnattached } = {}) {
@@ -344,10 +468,13 @@ function formatWechatLocalTime(receivedAt) {
 module.exports = {
   assembleRuntimeTurnText,
   buildInboundDraft,
+  buildImplicitReferencedPrepared,
   buildMergedInboundPrepared,
   clonePreparedInboundMessage,
+  isImplicitReferencePromptPreparedMessage,
   isImageAttachmentItem,
   isPlainTextPreparedMessage,
+  isSharedContentOnlyPreparedMessage,
   normalizeQuotedContexts,
   shouldBatchImageOnlyInbound,
   takeImageOnlyBatchMessages,
