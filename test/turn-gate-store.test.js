@@ -136,6 +136,159 @@ test("small UIA inbound replies with processing before it is queued", async () =
   assert.equal(queued.length, 1);
 });
 
+test("reminder requests on both channels acknowledge once and keep the runtime turn silent", async () => {
+  for (const provider of ["weixin", "weflow-uia"]) {
+    const sent = [];
+    const queued = [];
+    const appLike = {
+      channelAdapter: {
+        async sendText(payload) {
+          sent.push(payload);
+        },
+      },
+      acknowledgeWeFlowUiaInbound: CyberbossApp.prototype.acknowledgeWeFlowUiaInbound,
+      isTurnDispatchBlocked() {
+        return true;
+      },
+      bufferPendingInboundMessage(payload) {
+        queued.push(payload);
+      },
+      async dispatchPreparedTurn() {
+        throw new Error("should not dispatch while blocked");
+      },
+    };
+    const prepared = {
+      provider,
+      senderId: "user-1",
+      contextToken: "ctx-1",
+      messageId: `${provider}:1`,
+      text: "明天上午9点提醒我请假",
+      deliveryPolicy: "silent",
+    };
+
+    const dispatched = await CyberbossApp.prototype.routePreparedInbound.call(appLike, {
+      bindingKey: "binding-1",
+      workspaceRoot: "/workspace",
+      prepared,
+    });
+
+    assert.equal(dispatched, false);
+    assert.deepEqual(sent, [{
+      userId: "user-1",
+      text: "已记录",
+      contextToken: "ctx-1",
+      provider,
+    }]);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].prepared.deliveryPolicy, "silent");
+  }
+});
+
+test("handlePreparedMessage recognizes an actionable reminder before runtime dispatch", async () => {
+  const replyTargets = [];
+  const routed = [];
+  const appLike = {
+    runtimeAdapter: {
+      getSessionStore() {
+        return {
+          buildBindingKey() { return "binding-1"; },
+        };
+      },
+    },
+    streamDelivery: {
+      setReplyTarget(bindingKey, target) {
+        replyTargets.push({ bindingKey, target });
+      },
+    },
+    resolveWorkspaceRoot() { return "/workspace"; },
+    async prepareIncomingMessageForRuntime(normalized) {
+      return { ...normalized, originalText: normalized.text };
+    },
+    async routePreparedInbound(payload) {
+      routed.push(payload);
+    },
+  };
+
+  await CyberbossApp.prototype.handlePreparedMessage.call(appLike, {
+    workspaceId: "default",
+    accountId: "acc-1",
+    senderId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weixin",
+    text: "明天上午9点提醒我周五请假",
+  }, { allowCommands: true });
+
+  await CyberbossApp.prototype.handlePreparedMessage.call(appLike, {
+    workspaceId: "default",
+    accountId: "acc-1",
+    senderId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weixin",
+    text: "明天的提醒是什么",
+  }, { allowCommands: true });
+
+  assert.equal(replyTargets[0].target.deliveryPolicy, "silent");
+  assert.equal(routed[0].prepared.deliveryPolicy, "silent");
+  assert.equal(replyTargets[1].target.deliveryPolicy, undefined);
+  assert.equal(routed[1].prepared.deliveryPolicy, undefined);
+});
+
+test("a mixed pending batch stays replyable while an all-reminder batch stays silent", () => {
+  const appLike = {};
+  const base = {
+    workspaceId: "default",
+    accountId: "acc-1",
+    senderId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weixin",
+  };
+  const mixed = CyberbossApp.prototype.mergePendingInboundDraft.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    messages: [
+      { ...base, text: "明天提醒我请假", deliveryPolicy: "silent", receivedAt: "2026-08-10T00:00:00Z" },
+      { ...base, text: "顺便检查项目", receivedAt: "2026-08-10T00:00:01Z" },
+    ],
+  });
+  const reminders = CyberbossApp.prototype.mergePendingInboundDraft.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    messages: [
+      { ...base, text: "明天提醒我请假", deliveryPolicy: "silent", receivedAt: "2026-08-10T00:00:00Z" },
+      { ...base, text: "后天提醒我交材料", deliveryPolicy: "silent", receivedAt: "2026-08-10T00:00:01Z" },
+    ],
+  });
+
+  assert.equal(mixed.prepared.deliveryPolicy, "");
+  assert.equal(reminders.prepared.deliveryPolicy, "silent");
+});
+
+test("background reminder turns suppress approval prompts", async () => {
+  const sent = [];
+  const appLike = {
+    channelAdapter: {
+      async sendTyping(payload) { sent.push({ type: "typing", payload }); },
+      async sendText(payload) { sent.push({ type: "text", payload }); },
+    },
+    resolveReplyTargetForBinding() {
+      throw new Error("explicit run target should be used");
+    },
+  };
+
+  await CyberbossApp.prototype.sendApprovalPrompt.call(appLike, {
+    bindingKey: "binding-1",
+    approval: { requestId: "approval-1" },
+    replyTarget: {
+      userId: "user-1",
+      contextToken: "ctx-1",
+      provider: "weixin",
+      deliveryPolicy: "silent",
+    },
+  });
+
+  assert.deepEqual(sent, []);
+});
+
 test("ClawBot inbound does not send the small UIA processing acknowledgement", async () => {
   const sent = [];
   let dispatched = false;

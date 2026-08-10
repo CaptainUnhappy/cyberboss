@@ -24,14 +24,11 @@ class StreamDelivery {
   }
 
   setReplyTarget(bindingKey, target) {
-    if (!bindingKey || !target?.userId) {
+    const normalizedTarget = normalizeReplyTarget(target);
+    if (!bindingKey || !normalizedTarget) {
       return;
     }
-    this.replyTargetByBindingKey.set(bindingKey, {
-      userId: String(target.userId).trim(),
-      contextToken: normalizeText(target.contextToken),
-      provider: normalizeText(target.provider),
-    });
+    this.replyTargetByBindingKey.set(bindingKey, normalizedTarget);
   }
 
   queueReplyTargetForThread(threadId, target) {
@@ -293,6 +290,13 @@ class StreamDelivery {
       return;
     }
 
+    if (state.replyTarget.deliveryPolicy === "silent") {
+      this.restoreDeferredReplyPrefix(state);
+      this.markAllItemsSent(state);
+      console.log(`[cyberboss] suppressed background reply thread=${state.threadId}`);
+      return;
+    }
+
     if (state.replyTarget.provider === "system") {
       await this.flushSystemReply(state, { force });
       return;
@@ -480,13 +484,9 @@ class StreamDelivery {
   }
 
   rememberSuccessfulReplyTarget(state, target) {
-    state.replyTarget = target;
+    state.replyTarget = normalizeReplyTarget(target);
     if (state.bindingKey) {
-      this.replyTargetByBindingKey.set(state.bindingKey, {
-        userId: target.userId,
-        contextToken: target.contextToken,
-        provider: target.provider,
-      });
+      this.replyTargetByBindingKey.set(state.bindingKey, normalizeReplyTarget(target));
     }
   }
 
@@ -534,22 +534,24 @@ class StreamDelivery {
     if (!refreshedContextToken || refreshedContextToken === currentTarget.contextToken) {
       return null;
     }
-    return {
+    return normalizeReplyTarget({
       userId: currentTarget.userId,
       contextToken: refreshedContextToken,
       provider: currentTarget.provider,
-    };
+      deliveryPolicy: currentTarget.deliveryPolicy,
+    });
   }
 
   resolveContextlessReplyTarget(currentTarget, error) {
     if (!isSystemReplyContextFailure(error) || !currentTarget?.userId) {
       return null;
     }
-    return {
+    return normalizeReplyTarget({
       userId: currentTarget.userId,
       contextToken: "",
       provider: currentTarget.provider,
-    };
+      deliveryPolicy: currentTarget.deliveryPolicy,
+    });
   }
 
   disposeRunState(runKey) {
@@ -598,12 +600,18 @@ class StreamDelivery {
   }
 
   applyThreadReplyTarget(state, target) {
-    state.replyTarget = {
-      userId: target.userId,
-      contextToken: target.contextToken,
-      provider: target.provider,
-    };
+    state.replyTarget = normalizeReplyTarget(target);
     state.threadReplyTargetAttached = true;
+  }
+
+  restoreDeferredReplyPrefix(state) {
+    if (!state?.bindingKey || !state.deferredReplyPrefix) {
+      return;
+    }
+    if (!this.deferredReplyPrefixByBindingKey.has(state.bindingKey)) {
+      this.deferredReplyPrefixByBindingKey.set(state.bindingKey, state.deferredReplyPrefix);
+    }
+    state.deferredReplyPrefix = "";
   }
 
   markAllItemsSent(state) {
@@ -761,11 +769,16 @@ function normalizeReplyTarget(target) {
   if (!target?.userId) {
     return null;
   }
-  return {
+  const normalized = {
     userId: String(target.userId).trim(),
     contextToken: normalizeText(target.contextToken),
     provider: normalizeText(target.provider),
   };
+  const deliveryPolicy = normalizeText(target.deliveryPolicy);
+  if (deliveryPolicy) {
+    normalized.deliveryPolicy = deliveryPolicy;
+  }
+  return normalized;
 }
 
 function normalizeLineEndings(value) {

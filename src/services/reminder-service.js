@@ -40,7 +40,7 @@ class ReminderService {
       throw new Error("Missing a valid time. Use delayMinutes or dueAt like 2026-04-07T21:30+08:00.");
     }
 
-    const account = resolveSelectedAccount(this.config);
+    const account = resolveReminderAccount(this.config, context);
     const senderId = resolveReminderSenderId({
       config: this.config,
       accountId: account.accountId,
@@ -65,6 +65,17 @@ class ReminderService {
     });
     return reminder;
   }
+}
+
+function resolveReminderAccount(config, context = {}) {
+  const contextualAccountId = normalizeText(context?.accountId);
+  if (!contextualAccountId) {
+    return resolveSelectedAccount(config);
+  }
+  return resolveSelectedAccount({
+    ...config,
+    accountId: contextualAccountId,
+  });
 }
 
 function resolveReminderSenderId({ config, accountId, explicitUser = "", context = {}, sessionStore = null }) {
@@ -188,5 +199,6 @@ module.exports = {
   parseAbsoluteTime,
   parseDelay,
   parseDelayMinutes,
+  resolveReminderAccount,
   resolveDueAtMs,
 };

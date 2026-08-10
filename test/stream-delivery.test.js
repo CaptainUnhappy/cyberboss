@@ -99,6 +99,47 @@ test("plain weixin turns may use the silent action for receipt-only material", a
   assert.deepEqual(sent, []);
 });
 
+test("a silent delivery target suppresses commentary and final replies", async () => {
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-reminder", {
+    userId: "user-reminder",
+    contextToken: "ctx-reminder",
+    provider: "weflow-uia",
+    deliveryPolicy: "silent",
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-reminder", turnId: "turn-reminder" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-reminder",
+      turnId: "turn-reminder",
+      itemId: "progress-reminder",
+      text: "正在设置提醒",
+      phase: "commentary",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-reminder",
+      turnId: "turn-reminder",
+      itemId: "final-reminder",
+      text: "提醒已设置",
+      phase: "final_answer",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: { threadId: "thread-reminder", turnId: "turn-reminder" },
+  });
+
+  assert.deepEqual(sent, []);
+});
+
 test("system send_message JSON sends only the message text", async () => {
   const { sent, streamDelivery } = createHarness();
   streamDelivery.queueReplyTargetForThread("thread-2", {

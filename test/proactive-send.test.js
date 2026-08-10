@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 
 const { saveWeixinAccount } = require("../src/adapters/channel/weixin/account-store");
+const { CyberbossApp } = require("../src/core/app");
 const { ReminderService } = require("../src/services/reminder-service");
 const { SystemMessageService } = require("../src/services/system-message-service");
 
@@ -54,4 +55,43 @@ test("reminders can be created for a platform user without a context token", asy
   assert.equal(reminder.senderId, "platform-user@im.wechat");
   assert.equal(reminder.contextToken, "");
   assert.equal(reminder.text, "记得喝水");
+});
+
+test("reminders use the active runtime account when the tool process has multiple accounts", async () => {
+  const config = createConfig();
+  saveWeixinAccount(config, "account-2", {
+    token: "second-token",
+    userId: "second-bot-user",
+    baseUrl: config.weixinBaseUrl,
+  });
+  config.accountId = "";
+  const service = new ReminderService({ config, sessionStore: null });
+
+  const reminder = await service.create({
+    delay: "5m",
+    text: "记得请假",
+  }, {
+    accountId: "account-1",
+    senderId: "platform-user@im.wechat",
+  });
+
+  assert.equal(reminder.accountId, "account-1");
+  assert.equal(reminder.senderId, "platform-user@im.wechat");
+  assert.equal(reminder.text, "记得请假");
+});
+
+test("the inbound poll wakes at the next reminder deadline without enabling check-ins", () => {
+  const originalNow = Date.now;
+  Date.now = () => 1_000_000;
+  try {
+    const timeoutMs = CyberbossApp.prototype.resolveLongPollTimeoutMs.call({
+      activeAccountId: "account-1",
+      systemMessageDispatcher: { hasPending() { return false; } },
+      timelineScreenshotQueue: { hasPendingForAccount() { return false; } },
+      reminderQueue: { peekNextDueAtMs() { return 1_009_000; } },
+    });
+    assert.equal(timeoutMs, 9_000);
+  } finally {
+    Date.now = originalNow;
+  }
 });

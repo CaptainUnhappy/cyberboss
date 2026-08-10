@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 
 const { ProjectToolHost } = require("../src/tools/tool-host");
 
-function createHost() {
+function createHost({ reminderCreate = null, resolveActiveContext = null } = {}) {
   return new ProjectToolHost({
     services: {
       diary: {
@@ -23,7 +23,10 @@ function createHost() {
         },
       },
       reminder: {
-        async create(args) {
+        async create(args, context) {
+          if (typeof reminderCreate === "function") {
+            return reminderCreate(args, context);
+          }
           return { id: "reminder-1", ...args };
         },
       },
@@ -200,7 +203,10 @@ function createHost() {
       },
     },
     runtimeContextStore: {
-      resolveActiveContext() {
+      resolveActiveContext(input) {
+        if (typeof resolveActiveContext === "function") {
+          return resolveActiveContext(input);
+        }
         return {};
       },
     },
@@ -241,6 +247,44 @@ test("tool host validates structured reminder input types", async () => {
       delayMinutes: "30",
     }, {});
   }, /input\.delayMinutes must be an integer/);
+});
+
+test("tool host supplies the active account and sender to reminder creation", async () => {
+  let received = null;
+  const host = createHost({
+    resolveActiveContext({ workspaceRoot, runtimeId }) {
+      assert.equal(workspaceRoot, "/workspace");
+      assert.equal(runtimeId, "codex");
+      return {
+        workspaceRoot,
+        runtimeId,
+        accountId: "account-1",
+        senderId: "platform-user@im.wechat",
+      };
+    },
+    async reminderCreate(args, context) {
+      received = { args, context };
+      return {
+        id: "reminder-context",
+        accountId: context.accountId,
+        senderId: context.senderId,
+        ...args,
+      };
+    },
+  });
+
+  const result = await host.invokeTool("cyberboss_reminder_create", {
+    text: "请假",
+    dueAt: "2026-08-11T09:00:00+08:00",
+  }, {
+    workspaceRoot: "/workspace",
+    runtimeId: "codex",
+  });
+
+  assert.equal(received.context.accountId, "account-1");
+  assert.equal(received.context.senderId, "platform-user@im.wechat");
+  assert.equal(result.data.accountId, "account-1");
+  assert.equal(result.data.senderId, "platform-user@im.wechat");
 });
 
 test("tool host exposes durable memory remember, search, and forget operations", async () => {

@@ -69,6 +69,8 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_INBOUND_STICKER_IMAGE_BATCH = 10;
 const SHARED_CONTENT_FOLLOWUP_WINDOW_MS = 60_000;
 const WEFLOW_UIA_INBOUND_ACK_TEXT = "处理中";
+const REMINDER_INBOUND_ACK_TEXT = "已记录";
+const SILENT_DELIVERY_POLICY = "silent";
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
@@ -692,11 +694,18 @@ class CyberbossApp {
       accountId: normalized.accountId,
       senderId: normalized.senderId,
     });
-    this.streamDelivery.setReplyTarget(bindingKey, {
+    const deliveryPolicy = isReminderCreationRequestText(normalized.text)
+      ? SILENT_DELIVERY_POLICY
+      : "";
+    const initialReplyTarget = {
       userId: normalized.senderId,
       contextToken: normalized.contextToken,
       provider: normalized.provider,
-    });
+    };
+    if (deliveryPolicy) {
+      initialReplyTarget.deliveryPolicy = deliveryPolicy;
+    }
+    this.streamDelivery.setReplyTarget(bindingKey, initialReplyTarget);
 
     const command = parseChannelCommand(normalized.text);
     if (allowCommands && command) {
@@ -708,6 +717,9 @@ class CyberbossApp {
     const prepared = await this.prepareIncomingMessageForRuntime(normalized, workspaceRoot);
     if (!prepared) {
       return;
+    }
+    if (deliveryPolicy) {
+      prepared.deliveryPolicy = deliveryPolicy;
     }
 
     if (isSharedContentOnlyPreparedMessage(prepared)) {
@@ -918,6 +930,9 @@ class CyberbossApp {
         contextToken: prepared.contextToken,
         provider: prepared.provider,
       };
+      if (prepared.deliveryPolicy) {
+        replyTarget.deliveryPolicy = prepared.deliveryPolicy;
+      }
       if (turn.turnId) {
         this.streamDelivery.bindReplyTargetForTurn({
           threadId: turn.threadId,
@@ -931,6 +946,10 @@ class CyberbossApp {
     } catch (error) {
       this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
       const messageText = error instanceof Error ? error.message : String(error || "unknown error");
+      if (prepared.deliveryPolicy === SILENT_DELIVERY_POLICY) {
+        console.error(`[cyberboss] background reminder turn failed: ${messageText}`);
+        return false;
+      }
       await this.channelAdapter.sendText({
         userId: prepared.senderId,
         text: `❌ Request failed\n${messageText}`,
@@ -994,17 +1013,18 @@ class CyberbossApp {
   }
 
   async acknowledgeWeFlowUiaInbound(prepared) {
-    if (prepared?.provider !== "weflow-uia") {
+    const isReminderRequest = prepared?.deliveryPolicy === SILENT_DELIVERY_POLICY;
+    if (!isReminderRequest && prepared?.provider !== "weflow-uia") {
       return false;
     }
     try {
       await this.channelAdapter.sendText({
         userId: prepared.senderId,
-        text: WEFLOW_UIA_INBOUND_ACK_TEXT,
+        text: isReminderRequest ? REMINDER_INBOUND_ACK_TEXT : WEFLOW_UIA_INBOUND_ACK_TEXT,
         contextToken: prepared.contextToken,
         provider: prepared.provider,
       });
-      console.log(`[cyberboss] WeFlow UIA inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
+      console.log(`[cyberboss] inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
       return true;
     } catch (error) {
       console.warn(`[cyberboss] WeFlow UIA inbound acknowledgement failed: ${formatErrorMessage(error)}`);
@@ -1013,10 +1033,7 @@ class CyberbossApp {
   }
 
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
-    if (
-      prepared?.provider === "weflow-uia"
-      && typeof this.acknowledgeWeFlowUiaInbound === "function"
-    ) {
+    if (typeof this.acknowledgeWeFlowUiaInbound === "function") {
       await this.acknowledgeWeFlowUiaInbound(prepared);
     }
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
@@ -1044,6 +1061,7 @@ class CyberbossApp {
       messageId: prepared.messageId,
       contextToken: prepared.contextToken,
       provider: prepared.provider,
+      deliveryPolicy: prepared.deliveryPolicy,
       originalText: prepared.originalText,
       text: prepared.text,
       quotedContexts: Array.isArray(prepared.quotedContexts) ? prepared.quotedContexts : [],
@@ -1092,6 +1110,7 @@ class CyberbossApp {
           senderId: pendingDispatch.prepared.senderId,
           contextToken: pendingDispatch.prepared.contextToken,
           provider: pendingDispatch.prepared.provider,
+          deliveryPolicy: pendingDispatch.prepared.deliveryPolicy,
           originalText: pendingDispatch.prepared.originalText,
           text: pendingDispatch.prepared.text,
           quotedContexts: Array.isArray(pendingDispatch.prepared.quotedContexts)
@@ -1150,6 +1169,9 @@ class CyberbossApp {
     }
 
     const latest = queued[queued.length - 1];
+    const deliveryPolicy = queued.every(
+      (message) => message.deliveryPolicy === SILENT_DELIVERY_POLICY
+    ) ? SILENT_DELIVERY_POLICY : "";
     const blocks = queued
       .map((message) => String(message.text || "").trim())
       .filter(Boolean);
@@ -1159,6 +1181,7 @@ class CyberbossApp {
         bindingKey: draft.bindingKey,
         workspaceRoot: draft.workspaceRoot,
         ...latest,
+        deliveryPolicy,
         text: [
           "Multiple newer WeChat messages arrived while you were still handling the previous turn.",
           "Treat the following blocks as one ordered batch of fresh user input and respond once after considering all of them.",
@@ -1962,6 +1985,12 @@ class CyberbossApp {
     if (event.type !== "runtime.approval.requested") {
       return;
     }
+    const approvalReplyTarget = typeof this.streamDelivery.resolveReplyTargetForRun === "function"
+      ? this.streamDelivery.resolveReplyTargetForRun({
+          threadId: event.payload.threadId,
+          turnId: event.payload.turnId,
+        })
+      : null;
     const sessionStore = this.runtimeAdapter.getSessionStore();
     const linked = sessionStore.findBindingForThreadId(event.payload.threadId);
     if (!linked?.workspaceRoot) {
@@ -1985,6 +2014,7 @@ class CyberbossApp {
       await this.sendApprovalPrompt({
         bindingKey: linked.bindingKey,
         approval: event.payload,
+        replyTarget: approvalReplyTarget,
       }).catch((error) => {
         sessionStore.clearApprovalPrompt(event.payload.threadId);
         throw error;
@@ -1997,6 +2027,7 @@ class CyberbossApp {
       await this.sendApprovalPrompt({
         bindingKey: linked.bindingKey,
         approval: event.payload,
+        replyTarget: approvalReplyTarget,
       }).catch(() => {});
       return;
     }
@@ -2019,10 +2050,19 @@ class CyberbossApp {
 
   async sendFailureToThread(threadId, text, fallbackTarget = null) {
     const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(threadId);
+    const fallback = normalizeReplyTarget(fallbackTarget);
+    if (fallback?.deliveryPolicy === SILENT_DELIVERY_POLICY) {
+      console.error(`[cyberboss] suppressed background turn failure thread=${threadId}`);
+      return;
+    }
     const target = normalizeReplyTarget(
       linked?.bindingKey ? this.resolveReplyTargetForBinding(linked.bindingKey) : null
-    ) || normalizeReplyTarget(fallbackTarget);
+    ) || fallback;
     if (!target) {
+      return;
+    }
+    if (target.deliveryPolicy === SILENT_DELIVERY_POLICY) {
+      console.error(`[cyberboss] suppressed background turn failure thread=${threadId}`);
       return;
     }
     await this.channelAdapter.sendText({
@@ -2032,11 +2072,17 @@ class CyberbossApp {
     }).catch(() => {});
   }
 
-  async sendApprovalPrompt({ bindingKey, approval }) {
-    const target = this.resolveReplyTargetForBinding(bindingKey);
+  async sendApprovalPrompt({ bindingKey, approval, replyTarget = null }) {
+    const target = normalizeReplyTarget(replyTarget) || this.resolveReplyTargetForBinding(bindingKey);
     if (!target) {
       console.warn(
         `[cyberboss] approval prompt skipped binding=${bindingKey} requestId=${approval?.requestId || ""} reason=no_reply_target`
+      );
+      return;
+    }
+    if (target.deliveryPolicy === SILENT_DELIVERY_POLICY) {
+      console.log(
+        `[cyberboss] approval prompt suppressed for background reminder binding=${bindingKey} requestId=${approval?.requestId || ""}`
       );
       return;
     }
@@ -2115,11 +2161,16 @@ function normalizeReplyTarget(target) {
   if (!target?.userId) {
     return null;
   }
-  return {
+  const normalized = {
     userId: String(target.userId).trim(),
     contextToken: normalizeText(target.contextToken),
     provider: normalizeText(target.provider),
   };
+  const deliveryPolicy = normalizeText(target.deliveryPolicy);
+  if (deliveryPolicy) {
+    normalized.deliveryPolicy = deliveryPolicy;
+  }
+  return normalized;
 }
 
 function formatCompactNumber(value) {
@@ -2690,6 +2741,18 @@ function buildScopeKey(bindingKey, workspaceRoot) {
     return "";
   }
   return `${normalizedBindingKey}::${normalizedWorkspaceRoot}`;
+}
+
+function isReminderCreationRequestText(value) {
+  const text = normalizeText(value);
+  if (!text || /^(?:为什么|为何|怎么|如何|是否|能否|可不可以|(?:请)?(?:查|检查|解释|列出|显示|取消|删除|修改))/u.test(text)) {
+    return false;
+  }
+  const hasReminderAction = /(?:提醒(?:我|一下|下|[：:])|(?:设置|新建|创建|新增|安排|定(?:个)?)\S{0,8}提醒|记得(?:叫|喊|提醒)?我|到时(?:叫|喊|提醒)我|届时(?:叫|喊|提醒)我|别忘了(?:叫|喊|提醒)我|叫我|喊我)/u.test(text);
+  if (!hasReminderAction) {
+    return false;
+  }
+  return /(?:今天|明天|后天|大后天|今晚|今早|明早|明晚|早上|上午|中午|下午|傍晚|晚上|夜里|凌晨|周[一二三四五六日天]|星期[一二三四五六日天]|礼拜[一二三四五六日天]|这周|本周|下周|下下周|这个月|本月|下个月|每天|每日|每周|每月|\d{1,2}号|\d{1,2}[：:]\d{2}|\d{1,2}\s*点(?:\d{1,2}\s*分)?|\d+\s*(?:秒|分钟|分|小时|天|周|个月|月)后|\d{4}[年/-]\d{1,2}[月/-]\d{1,2}日?)/u.test(text);
 }
 
 function buildSharedContentScopeKey(bindingKey, workspaceRoot, chatId = "") {
