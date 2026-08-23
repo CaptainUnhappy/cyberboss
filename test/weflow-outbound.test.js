@@ -83,3 +83,26 @@ test("sendWeFlowUiaText uses only the verified UIA bridge endpoint", async () =>
     timeout: 20,
   });
 });
+
+test("sendWeFlowUiaText supports a short verification window for processing acknowledgements", async () => {
+  const calls = [];
+  await sendWeFlowUiaText({
+    weflowBridgeBaseUrl: "http://bridge.local:8766",
+    weflowBridgeTimeoutMs: 20_000,
+    weflowInboxDisplayName: "fixture-contact",
+    weflowInboxChat: "fixture-talker",
+  }, { text: "处理中", timeoutMs: 5_000 }, async (url, init) => {
+    calls.push({ url: String(url), init });
+    return {
+      ok: true,
+      status: 200,
+      async json() { return { dispatched: true, verified: true, localId: 8 }; },
+    };
+  });
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    contact: "fixture-contact",
+    talker: "fixture-talker",
+    text: "处理中",
+    timeout: 5,
+  });
+});

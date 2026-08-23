@@ -6,6 +6,7 @@ const {
   writePidFile,
   removePidFileIfMatches,
   ensureSharedAppServer,
+  ensureWeFlowUiaBridge,
   ensureBridgeNotRunning,
 } = require("./shared-common");
 
@@ -19,6 +20,10 @@ async function main() {
   } else {
     console.log(`shared app-server ${appServer.status}${appServerPidLabel} listen=${listenUrl}`);
   }
+
+  const weflowBridge = await ensureWeFlowUiaBridge();
+  const weflowBridgePidLabel = weflowBridge.pid ? ` pid=${weflowBridge.pid}` : "";
+  console.log(`WeFlow UIA bridge ${weflowBridge.status}${weflowBridgePidLabel}`);
 
   const existingBridgePid = ensureBridgeNotRunning();
   if (existingBridgePid) {
@@ -41,7 +46,9 @@ async function main() {
 
   writePidFile(bridgePidFile, child.pid);
   const cleanup = () => removePidFileIfMatches(bridgePidFile, child.pid);
-  process.on("exit", cleanup);
+  // Keep the child PID recorded until the child itself exits. If the launcher
+  // closes first on Windows, removing this file would orphan a live bridge and
+  // let the next shared:start launch a duplicate responder.
   process.on("SIGINT", () => {
     child.kill("SIGINT");
   });

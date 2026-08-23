@@ -348,11 +348,13 @@ class CyberbossApp {
     const explicitUserId = normalizeCommandArgument(this.config.restartNotificationUserId)
       || normalizeCommandArgument(this.config.weflowInboxReplyUserId);
     const target = this.resolveLocalWechatReplyTarget(explicitUserId);
-    if (!target) {
-      throw new Error("restart notification target is unavailable");
-    }
     const text = normalizeCommandArgument(this.config.restartNotificationText)
       || "✅ Cyberboss 已重启，服务已恢复。";
+    if (!target) {
+      await this.sendRestartNotificationViaWeFlow(text);
+      console.log("[cyberboss] restart notification sent via weflow-uia");
+      return { userId: explicitUserId, text };
+    }
     const payload = {
       userId: target.userId,
       text,
@@ -362,17 +364,32 @@ class CyberbossApp {
     try {
       await this.channelAdapter.sendText(payload);
     } catch (error) {
-      if (!isStaleWeixinContextError(error)) {
-        throw error;
+      try {
+        if (!isStaleWeixinContextError(error)) {
+          throw error;
+        }
+        await this.channelAdapter.sendText({
+          ...payload,
+          contextToken: "",
+          omitContextToken: true,
+        });
+      } catch (nativeError) {
+        await this.sendRestartNotificationViaWeFlow(text);
+        console.log("[cyberboss] restart notification sent via weflow-uia");
+        return { userId: target.userId, text };
       }
-      await this.channelAdapter.sendText({
-        ...payload,
-        contextToken: "",
-        omitContextToken: true,
-      });
     }
     console.log(`[cyberboss] restart notification sent via bot user=${target.userId}`);
     return { userId: target.userId, text };
+  }
+
+  async sendRestartNotificationViaWeFlow(text) {
+    return this.channelAdapter.sendText({
+      userId: normalizeCommandArgument(this.config.weflowInboxReplyUserId),
+      text,
+      preserveBlock: true,
+      provider: "weflow-uia",
+    });
   }
 
   async resolveWeFlowReplySource() {
@@ -1023,6 +1040,7 @@ class CyberbossApp {
         text: isReminderRequest ? REMINDER_INBOUND_ACK_TEXT : WEFLOW_UIA_INBOUND_ACK_TEXT,
         contextToken: prepared.contextToken,
         provider: prepared.provider,
+        messageKind: isReminderRequest ? "reminder_ack" : "inbound_ack",
       });
       console.log(`[cyberboss] inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
       return true;
@@ -1033,14 +1051,17 @@ class CyberbossApp {
   }
 
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
-    if (typeof this.acknowledgeWeFlowUiaInbound === "function") {
-      await this.acknowledgeWeFlowUiaInbound(prepared);
-    }
+    const acknowledgement = typeof this.acknowledgeWeFlowUiaInbound === "function"
+      ? this.acknowledgeWeFlowUiaInbound(prepared)
+      : Promise.resolve(false);
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
       this.bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared });
+      await acknowledgement;
       return false;
     }
-    return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
+    const dispatch = this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
+    await acknowledgement;
+    return dispatch;
   }
 
   bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared }) {

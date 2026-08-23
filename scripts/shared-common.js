@@ -28,8 +28,15 @@ const logDir = path.join(stateDir, "logs");
 const appServerPidFile = path.join(logDir, "shared-app-server.pid");
 const bridgePidFile = path.join(logDir, "shared-wechat.pid");
 const appServerLogFile = path.join(logDir, "shared-app-server.log");
+const weflowUiaBridgePidFile = path.join(logDir, "weflow-uia-bridge.pid");
+const weflowUiaBridgeLogFile = path.join(logDir, "weflow-uia-bridge.log");
 const accountsDir = path.join(stateDir, "accounts");
 const sessionFile = process.env.CYBERBOSS_SESSIONS_FILE || path.join(stateDir, "sessions.json");
+const sharedCodexEnabledPlugins = new Set([
+  "browser@openai-bundled",
+  "chrome@openai-bundled",
+  "computer-use@openai-bundled",
+]);
 
 function buildSharedCodexIsolationArgs(configText = readCodexConfigText()) {
   const args = [];
@@ -39,7 +46,11 @@ function buildSharedCodexIsolationArgs(configText = readCodexConfigText()) {
     const group = match[1];
     const rawName = match[2].trim();
     const normalizedName = rawName.replace(/^"|"$/g, "");
-    if (!normalizedName || (group === "mcp_servers" && normalizedName === "cyberboss_tools")) {
+    if (
+      !normalizedName
+      || (group === "mcp_servers" && normalizedName === "cyberboss_tools")
+      || (group === "plugins" && sharedCodexEnabledPlugins.has(normalizedName))
+    ) {
       continue;
     }
     const key = `${group}.${rawName}.enabled=false`;
@@ -106,6 +117,28 @@ function checkReadyz() {
         hostname: "127.0.0.1",
         port: Number(port),
         path: "/readyz",
+        timeout: 500,
+      },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode >= 200 && res.statusCode < 300);
+      }
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+function checkHttpEndpoint({ hostname = "127.0.0.1", port: endpointPort, pathname = "/healthz" }) {
+  return new Promise((resolve) => {
+    const req = http.get(
+      {
+        hostname,
+        port: Number(endpointPort),
+        path: pathname,
         timeout: 500,
       },
       (res) => {
@@ -195,6 +228,51 @@ async function ensureSharedAppServer() {
 
   writePidFile(appServerPidFile, pid);
   return { pid, status: "started" };
+}
+
+async function ensureWeFlowUiaBridge() {
+  const enabled = ["1", "true", "yes", "on"].includes(
+    normalizeText(process.env.CYBERBOSS_ENABLE_WEFLOW_INBOX).toLowerCase()
+  );
+  if (!enabled || process.platform !== "win32") {
+    return { pid: 0, status: "skipped" };
+  }
+
+  const bridgeUrl = new URL(
+    normalizeText(process.env.CYBERBOSS_WEFLOW_BRIDGE_BASE_URL) || "http://127.0.0.1:8766"
+  );
+  if (!["127.0.0.1", "localhost", "::1", "[::1]"].includes(bridgeUrl.hostname)) {
+    return { pid: 0, status: "external" };
+  }
+  const bridgePort = Number(bridgeUrl.port || (bridgeUrl.protocol === "https:" ? 443 : 80));
+  const isReady = () => checkHttpEndpoint({ hostname: bridgeUrl.hostname, port: bridgePort });
+  ensureLogDir();
+  const pidFromFile = readPidFile(weflowUiaBridgePidFile);
+  if (pidFromFile && isPidAlive(pidFromFile) && (await isReady())) {
+    return { pid: pidFromFile, status: "already_running" };
+  }
+  if (await isReady()) {
+    return { pid: pidFromFile || 0, status: "already_running_unknown_pid" };
+  }
+  if (pidFromFile) {
+    fs.rmSync(weflowUiaBridgePidFile, { force: true });
+  }
+
+  const pythonCommand = normalizeText(process.env.CYBERBOSS_WEFLOW_UIA_PYTHON) || "python";
+  const script = path.join(rootDir, "scripts", "weflow-uia-bridge.py");
+  const pid = spawnDetachedCommand(
+    pythonCommand,
+    [script, "--host", bridgeUrl.hostname, "--port", String(bridgePort)],
+    { logFile: weflowUiaBridgeLogFile }
+  );
+  writePidFile(weflowUiaBridgePidFile, pid);
+  for (let index = 0; index < 30; index += 1) {
+    if (await isReady()) {
+      return { pid, status: "started" };
+    }
+    await sleep(200);
+  }
+  throw new Error(`failed to start WeFlow UIA bridge; check ${weflowUiaBridgeLogFile}`);
 }
 
 function ensureBridgeNotRunning() {
@@ -306,6 +384,8 @@ module.exports = {
   appServerPidFile,
   bridgePidFile,
   appServerLogFile,
+  weflowUiaBridgePidFile,
+  weflowUiaBridgeLogFile,
   ensureLogDir,
   isPidAlive,
   readPidFile,
@@ -313,6 +393,7 @@ module.exports = {
   removePidFileIfMatches,
   buildSharedCodexIsolationArgs,
   ensureSharedAppServer,
+  ensureWeFlowUiaBridge,
   ensureBridgeNotRunning,
   resolveBoundThread,
 };

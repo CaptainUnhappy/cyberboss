@@ -8,6 +8,7 @@ const { renderInstructionTemplate } = require("./core/instructions-template");
 const { CyberbossApp } = require("./core/app");
 const { runSystemCheckinPoller } = require("./app/system-checkin-poller");
 const { buildTerminalHelpText } = require("./core/command-registry");
+const { acquireCyberbossProcessLock } = require("./core/process-lock");
 const { ensureStickerCatalogFilesSync } = require("./services/sticker-service");
 const { createProjectTooling } = require("./tools/create-project-tooling");
 const { runToolMcpServer } = require("./tools/mcp-stdio-server");
@@ -129,7 +130,15 @@ async function main() {
   }
 
   if (command === "start") {
-    await getApp().start();
+    const processLock = acquireCyberbossProcessLock();
+    const releaseProcessLock = () => processLock.release();
+    process.once("exit", releaseProcessLock);
+    try {
+      await getApp().start();
+    } finally {
+      process.off("exit", releaseProcessLock);
+      processLock.release();
+    }
     return;
   }
 

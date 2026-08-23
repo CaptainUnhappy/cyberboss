@@ -88,7 +88,7 @@ test("handlePreparedMessage queues a normal inbound message while the scope is b
   assert.equal(queued[0].text, "prepared-user-text");
 });
 
-test("small UIA inbound replies with processing before it is queued", async () => {
+test("small UIA inbound sends one processing acknowledgement before it waits in the queue", async () => {
   const order = [];
   const sent = [];
   const queued = [];
@@ -132,6 +132,7 @@ test("small UIA inbound replies with processing before it is queued", async () =
     text: "处理中",
     contextToken: "ctx-1",
     provider: "weflow-uia",
+    messageKind: "inbound_ack",
   }]);
   assert.equal(queued.length, 1);
 });
@@ -178,6 +179,7 @@ test("reminder requests on both channels acknowledge once and keep the runtime t
       text: "已记录",
       contextToken: "ctx-1",
       provider,
+      messageKind: "reminder_ack",
     }]);
     assert.equal(queued.length, 1);
     assert.equal(queued[0].prepared.deliveryPolicy, "silent");

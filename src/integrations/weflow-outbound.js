@@ -60,13 +60,16 @@ async function resolveWeFlowSendSource(config, fetchImpl = globalThis.fetch) {
   return source;
 }
 
-async function sendWeFlowUiaText(config, { text = "" } = {}, fetchImpl = globalThis.fetch) {
+async function sendWeFlowUiaText(config, { text = "", timeoutMs = 0 } = {}, fetchImpl = globalThis.fetch) {
   const contact = normalizeText(config?.weflowInboxDisplayName);
   const talker = normalizeText(config?.weflowInboxChat);
   const content = String(text || "");
   if (!contact || !talker || !content.trim()) {
     throw new Error("WeFlow UIA send requires contact, talker, and text");
   }
+  const verificationTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+    ? Number(timeoutMs)
+    : resolveTimeoutMs(config);
   const payload = await requestBridgeJson(config, "/api/send", {
     method: "POST",
     headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -74,21 +77,20 @@ async function sendWeFlowUiaText(config, { text = "" } = {}, fetchImpl = globalT
       contact,
       talker,
       text: content,
-      timeout: Math.max(1, Math.ceil(resolveTimeoutMs(config) / 1000)),
+      timeout: Math.max(1, Math.ceil(verificationTimeoutMs / 1000)),
     }),
-  }, fetchImpl);
+  }, fetchImpl, { timeoutMs: verificationTimeoutMs + 5_000 });
   if (payload?.dispatched !== true || payload?.verified !== true) {
     throw new Error("WeFlow UIA send was not verified");
   }
   return payload;
 }
 
-async function requestBridgeJson(config, pathname, init, fetchImpl) {
+async function requestBridgeJson(config, pathname, init, fetchImpl, { timeoutMs = resolveTimeoutMs(config) } = {}) {
   if (typeof fetchImpl !== "function") {
     throw new Error("WeFlow bridge requires fetch support");
   }
   const baseUrl = normalizeText(config?.weflowBridgeBaseUrl) || "http://127.0.0.1:8766";
-  const timeoutMs = resolveTimeoutMs(config);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();

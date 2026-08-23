@@ -63,3 +63,38 @@ test("restart notification retries without a stale context token", async () => {
   assert.equal(sent[1].omitContextToken, true);
   assert.equal("provider" in sent[1], false);
 });
+
+test("restart notification falls back to the verified WeFlow UIA channel", async () => {
+  const sent = [];
+  const appLike = {
+    config: {
+      restartNotificationText: "✅ Cyberboss 已重启，服务已恢复。",
+      restartNotificationUserId: "platform-user@im.wechat",
+      weflowInboxReplyUserId: "platform-user@im.wechat",
+    },
+    resolveLocalWechatReplyTarget(userId) {
+      return { userId, contextToken: "stale-token", provider: "weixin" };
+    },
+    async sendRestartNotificationViaWeFlow(text) {
+      sent.push({ provider: "weflow-uia", text });
+    },
+    channelAdapter: {
+      async sendText(payload) {
+        sent.push(payload);
+        throw new Error("sendMessage ret=-2 errmsg=prepare failed");
+      },
+    },
+  };
+
+  const result = await CyberbossApp.prototype.sendRestartNotification.call(appLike);
+  assert.deepEqual(result, {
+    userId: "platform-user@im.wechat",
+    text: "✅ Cyberboss 已重启，服务已恢复。",
+  });
+  assert.equal(sent.length, 3);
+  assert.equal(sent[1].omitContextToken, true);
+  assert.deepEqual(sent[2], {
+    provider: "weflow-uia",
+    text: "✅ Cyberboss 已重启，服务已恢复。",
+  });
+});

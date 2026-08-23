@@ -18,3 +18,8 @@ user/
 .env.codex-backup-*
 __pycache__/
 *.py[cod]
+
+# Generated local previews, exports, and diagnostics
+.tmp/
+output/
+outputs/

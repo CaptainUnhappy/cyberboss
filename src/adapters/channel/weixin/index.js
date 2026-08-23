@@ -78,7 +78,10 @@ function createWeixinChannelAdapter(config) {
       .then(() => {
         const deliveryChunk = chunk || "Completed.";
         if (provider === "weflow-uia") {
-          return sendWeFlowUiaText(config, { text: deliveryChunk });
+          return sendWeFlowUiaText(config, {
+            text: deliveryChunk,
+            timeoutMs: messageKind === "inbound_ack" ? 5_000 : 0,
+          });
         }
         return sendText({
           baseUrl: account.baseUrl,
