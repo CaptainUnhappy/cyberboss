@@ -3,8 +3,14 @@ const fsPromises = require("fs/promises");
 const path = require("path");
 
 const MAX_SEEN_IDS = 4_000;
+const MAX_PENDING_EVENTS = 1_000;
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
 const DEFAULT_MESSAGE_LIMIT = 50;
+const DEFAULT_OUTGOING_POLL_INTERVAL_MS = 2_000;
+const DEFAULT_OUTGOING_REPLAY_WINDOW_MS = 10 * 60_000;
+const DEFAULT_OUTGOING_POLL_MAX_REQUESTS = 64;
+const DEFAULT_PENDING_RETRY_MAX_MS = 60_000;
+const DEFAULT_POLL_STALL_RETRY_MAX_MS = 60_000;
 const MEDIA_RETRY_DELAYS_MS = [0, 250, 750, 1_500];
 
 class WeFlowInboxSource {
@@ -14,18 +20,39 @@ class WeFlowInboxSource {
     isReady = () => true,
     fetchImpl = globalThis.fetch,
     logger = console,
+    now = () => Date.now(),
   }) {
     this.config = config || {};
     this.onMessage = typeof onMessage === "function" ? onMessage : async () => true;
     this.isReady = typeof isReady === "function" ? isReady : () => true;
     this.fetchImpl = fetchImpl;
     this.logger = logger;
-    this.state = loadCursorState(this.config.weflowInboxCursorFile);
+    this.now = typeof now === "function" ? now : () => Date.now();
+    this.state = loadCursorState(this.config.weflowInboxCursorFile, {
+      chat: this.config.weflowInboxChat,
+    });
     this.running = false;
+    this.stopping = false;
     this.abortController = null;
     this.loopPromise = null;
-    this.pendingEvents = new Map();
+    this.outgoingPollAbortController = null;
+    this.outgoingPollPromise = null;
+    this.pendingEvents = new Map(
+      this.state.pendingEvents
+        .filter((item) => {
+          const chat = normalizeText(item?.push?.sessionId || item?.push?.talker || item?.push?.chatUsername);
+          return item?.key
+            && !this.state.seenIds.includes(item.key)
+            && chat === normalizeText(this.config.weflowInboxChat);
+        })
+        .map((item) => [item.key, { eventType: item.eventType, push: item.push }])
+    );
+    this.syncPendingState();
     this.pendingTimer = null;
+    this.pendingDrainPromise = null;
+    this.pendingRetryAttempt = 0;
+    this.pendingRetryNotBeforeMs = 0;
+    this.stateWriteChain = Promise.resolve();
   }
 
   async start() {
@@ -35,24 +62,58 @@ class WeFlowInboxSource {
     if (typeof this.fetchImpl !== "function") {
       throw new Error("WeFlow inbox requires fetch support");
     }
+    this.stopping = false;
     this.running = true;
     this.loopPromise = this.runLoop().catch((error) => {
       if (this.running && !isAbortError(error)) {
         this.logger.error?.(`[cyberboss] WeFlow inbox stopped: ${formatError(error)}`);
       }
     });
+    if (normalizeText(this.config.weflowInboxChat)) {
+      this.outgoingPollAbortController = new AbortController();
+      this.outgoingPollPromise = this.runOutgoingPollLoop(this.outgoingPollAbortController.signal)
+        .catch((error) => {
+          if (this.running && !isAbortError(error)) {
+            this.logger.error?.(`[cyberboss] WeFlow outgoing poll stopped: ${formatError(error)}`);
+          }
+        });
+    }
   }
 
   async stop() {
     this.running = false;
+    this.stopping = true;
     if (this.pendingTimer) {
       clearTimeout(this.pendingTimer);
       this.pendingTimer = null;
     }
     this.abortController?.abort();
-    await Promise.resolve(this.loopPromise).catch(() => {});
+    this.outgoingPollAbortController?.abort();
+    const pendingWork = [
+      this.pendingDrainPromise,
+      this.loopPromise,
+      this.outgoingPollPromise,
+      this.stateWriteChain,
+    ].filter(Boolean).map((promise) => Promise.resolve(promise).catch(() => {}));
+    if (pendingWork.length) {
+      let stopTimer = null;
+      try {
+        await Promise.race([
+          Promise.all(pendingWork),
+          new Promise((resolve) => {
+            stopTimer = setTimeout(resolve, 5_000);
+          }),
+        ]);
+      } finally {
+        if (stopTimer) {
+          clearTimeout(stopTimer);
+        }
+      }
+    }
     this.abortController = null;
     this.loopPromise = null;
+    this.outgoingPollAbortController = null;
+    this.outgoingPollPromise = null;
   }
 
   async runLoop() {
@@ -61,6 +122,21 @@ class WeFlowInboxSource {
       try {
         if (this.pendingEvents.size) {
           await this.drainPendingEvents();
+        }
+        if (this.pendingEvents.size >= MAX_PENDING_EVENTS) {
+          const retryDelayMs = Math.max(
+            normalizePositiveInt(
+              this.config.weflowReconnectDelayMs,
+              DEFAULT_RECONNECT_DELAY_MS,
+              100
+            ),
+            Math.min(
+              DEFAULT_PENDING_RETRY_MAX_MS,
+              Math.max(0, this.pendingRetryNotBeforeMs - Date.now())
+            )
+          );
+          await delayUntilAbort(retryDelayMs, this.abortController.signal);
+          continue;
         }
         await this.consumePushStream(this.abortController.signal);
       } catch (error) {
@@ -92,6 +168,183 @@ class WeFlowInboxSource {
     });
   }
 
+  async runOutgoingPollLoop(signal) {
+    let consecutiveFailures = 0;
+    while (this.running && !signal.aborted) {
+      let retryAfterMs = 0;
+      try {
+        const result = await this.pollOutgoingMessagesOnce({ signal });
+        const nextRetryAtMs = Date.parse(normalizeText(result?.nextRetryAt));
+        retryAfterMs = Number.isFinite(nextRetryAtMs)
+          ? Math.max(0, nextRetryAtMs - Date.now())
+          : 0;
+        consecutiveFailures = 0;
+      } catch (error) {
+        consecutiveFailures += 1;
+        if (this.running && !isAbortError(error)) {
+          this.logger.error?.(`[cyberboss] WeFlow outgoing poll failed: ${formatError(error)}`);
+        }
+      }
+      if (this.running && !signal.aborted) {
+        const baseDelayMs = normalizePositiveInt(
+          this.config.weflowOutgoingPollIntervalMs,
+          DEFAULT_OUTGOING_POLL_INTERVAL_MS,
+          250
+        );
+        const delayMs = consecutiveFailures
+          ? Math.min(60_000, baseDelayMs * (2 ** Math.min(5, consecutiveFailures)))
+          : Math.max(baseDelayMs, Math.min(DEFAULT_PENDING_RETRY_MAX_MS, retryAfterMs));
+        await delayUntilAbort(delayMs, signal);
+      }
+    }
+  }
+
+  async pollOutgoingMessagesOnce({ signal } = {}) {
+    const chat = normalizeText(this.config.weflowInboxChat);
+    if (!chat) {
+      return { status: "disabled", fetched: 0, queued: 0, processed: 0 };
+    }
+    if (this.pendingEvents.size >= MAX_PENDING_EVENTS) {
+      const pendingResult = await this.drainPendingEvents();
+      if (this.pendingEvents.size >= MAX_PENDING_EVENTS) {
+        return {
+          ...pendingResult,
+          status: pendingResult?.status === "cooldown" ? "cooldown" : "backlog",
+          fetched: 0,
+          queued: 0,
+          processed: Number(pendingResult?.processed) || 0,
+          backlog: true,
+        };
+      }
+    }
+    const rawNowMs = Number(this.now());
+    const nowMs = Number.isFinite(rawNowMs) ? rawNowMs : Date.now();
+    const nowSeconds = Math.max(0, Math.floor(nowMs / 1_000));
+    const replayWindowMs = normalizePositiveInt(
+      this.config.weflowOutgoingReplayWindowMs,
+      DEFAULT_OUTGOING_REPLAY_WINDOW_MS,
+      1_000
+    );
+    const replayWindowSeconds = Math.max(1, Math.ceil(replayWindowMs / 1_000));
+    const cursor = normalizeOutgoingPollCursor(this.state.outgoingPollCursor);
+    const cursorRetryNotBeforeMs = Date.parse(cursor.retryNotBefore);
+    if (Number.isFinite(cursorRetryNotBeforeMs) && Date.now() < cursorRetryNotBeforeMs) {
+      return {
+        status: "cooldown",
+        fetched: 0,
+        queued: 0,
+        processed: 0,
+        requestCount: 0,
+        backfillActive: cursor.backfillActive,
+        nextRetryAt: cursor.retryNotBefore,
+      };
+    }
+    const cursorThroughSeconds = cursor.chat === chat ? cursor.polledThrough : 0;
+    const replayStartSeconds = cursor.chat === chat && cursor.backfillActive && cursorThroughSeconds
+      ? cursorThroughSeconds + 1
+      : Math.max(0, (cursorThroughSeconds || nowSeconds) - replayWindowSeconds);
+    const limit = normalizePositiveInt(this.config.weflowMessageLimit, DEFAULT_MESSAGE_LIMIT, 1);
+    const range = await fetchMessageRangePaginated({
+      config: this.config,
+      chat,
+      startSeconds: replayStartSeconds,
+      endSeconds: nowSeconds,
+      limit,
+      maxRequests: normalizePositiveInt(
+        this.config.weflowOutgoingPollMaxRequests,
+        DEFAULT_OUTGOING_POLL_MAX_REQUESTS,
+        1
+      ),
+      fetchImpl: this.fetchImpl,
+      signal,
+    });
+    const { rows, requestCount } = range;
+    const candidates = rows
+      .map((row) => buildPolledMessagePush(row, chat, replayStartSeconds))
+      .filter(Boolean)
+      .sort(comparePolledPushes);
+    let queued = 0;
+    let backlog = false;
+    let backlogAtSeconds = 0;
+    for (const push of candidates) {
+      const key = buildEventKey("message.new", push);
+      if (!key || this.state.seenIds.includes(key) || this.pendingEvents.has(key)) {
+        continue;
+      }
+      if (this.pendingEvents.size >= MAX_PENDING_EVENTS) {
+        backlog = true;
+        backlogAtSeconds = normalizeEpochSeconds(push.timestamp);
+        break;
+      }
+      this.pendingEvents.set(key, { eventType: "message.new", push });
+      queued += 1;
+    }
+    const rangeComplete = range.complete && !backlog;
+    const safeThrough = backlogAtSeconds
+      ? Math.min(range.throughSeconds, Math.max(0, backlogAtSeconds - 1))
+      : range.throughSeconds;
+    const nextPolledThrough = rangeComplete
+      ? nowSeconds
+      : Math.max(cursorThroughSeconds, safeThrough);
+    const madeCursorProgress = rangeComplete || nextPolledThrough > cursorThroughSeconds;
+    const stalled = !rangeComplete && !madeCursorProgress;
+    const stallAttempt = stalled ? Math.min(16, cursor.stallAttempt + 1) : 0;
+    const retryNotBefore = stalled
+      ? new Date(Date.now() + Math.min(
+        DEFAULT_POLL_STALL_RETRY_MAX_MS,
+        1_000 * (2 ** Math.min(6, stallAttempt - 1))
+      )).toISOString()
+      : "";
+    if (rangeComplete
+      || nextPolledThrough > cursorThroughSeconds
+      || (!rangeComplete && cursor.chat === chat && !cursor.backfillActive)) {
+      this.state.outgoingPollCursor = advanceOutgoingPollCursor({
+        previous: cursor.chat === chat ? cursor : null,
+        chat,
+        polledThrough: nextPolledThrough,
+        backfillActive: !rangeComplete,
+        candidates,
+        stallAttempt,
+        retryNotBefore,
+      });
+    } else if (stalled) {
+      this.state.outgoingPollCursor = {
+        ...cursor,
+        chat,
+        backfillActive: true,
+        stallAttempt,
+        retryNotBefore,
+      };
+    }
+    this.syncPendingState();
+    await this.saveState();
+    if (!this.pendingEvents.size) {
+      return {
+        status: backlog ? "backlog" : "ok",
+        fetched: rows.length,
+        queued: 0,
+        processed: 0,
+        requestCount,
+        backfillActive: !rangeComplete,
+        ...(stalled ? { status: "stalled", nextRetryAt: retryNotBefore } : {}),
+      };
+    }
+    const result = await this.drainPendingEvents();
+    if (this.pendingEvents.size) {
+      this.schedulePendingDrain();
+    }
+    return {
+      ...result,
+      fetched: rows.length,
+      queued,
+      processed: Number(result?.processed) || 0,
+      requestCount,
+      backlog,
+      backfillActive: !rangeComplete,
+      ...(stalled ? { status: "stalled", nextRetryAt: retryNotBefore } : {}),
+    };
+  }
+
   async handleSseEvent(event) {
     const eventType = normalizeText(event?.event) || "message";
     if (eventType !== "message.new") {
@@ -106,7 +359,16 @@ class WeFlowInboxSource {
     if (!key || this.state.seenIds.includes(key)) {
       return { status: "duplicate" };
     }
+    if (this.pendingEvents.size >= MAX_PENDING_EVENTS) {
+      this.logger.error?.(
+        `[cyberboss] WeFlow pending queue is full (${MAX_PENDING_EVENTS}); reconnecting while poll backfill catches up`
+      );
+      this.abortController?.abort();
+      return { status: "backpressure" };
+    }
     this.pendingEvents.set(key, { eventType, push });
+    this.syncPendingState();
+    await this.saveState();
     const result = await this.drainPendingEvents();
     if (this.pendingEvents.size) {
       this.schedulePendingDrain();
@@ -118,18 +380,87 @@ class WeFlowInboxSource {
     if (!this.running || this.pendingTimer) {
       return;
     }
+    const delayMs = Math.max(
+      250,
+      (this.pendingRetryNotBeforeMs || (Date.now() + 1_000)) - Date.now()
+    );
     this.pendingTimer = setTimeout(() => {
       this.pendingTimer = null;
-      void this.drainPendingEvents().finally(() => {
-        if (this.pendingEvents.size) {
-          this.schedulePendingDrain();
-        }
-      });
-    }, 1_000);
+      void this.drainPendingEvents()
+        .catch((error) => {
+          if (this.running && !isAbortError(error)) {
+            this.logger.error?.(`[cyberboss] WeFlow pending retry failed: ${formatError(error)}`);
+          }
+        })
+        .finally(() => {
+          if (this.pendingEvents.size) {
+            this.schedulePendingDrain();
+          }
+        });
+    }, delayMs);
     this.pendingTimer.unref?.();
   }
 
   async drainPendingEvents() {
+    if (this.pendingDrainPromise) {
+      return this.pendingDrainPromise;
+    }
+    if (this.pendingEvents.size && Date.now() < this.pendingRetryNotBeforeMs) {
+      return {
+        status: "cooldown",
+        processed: 0,
+        nextRetryAt: new Date(this.pendingRetryNotBeforeMs).toISOString(),
+      };
+    }
+    const drainPromise = (async () => {
+      try {
+        const result = await this.drainPendingEventsExclusive();
+        this.updatePendingRetryState(result);
+        return this.pendingRetryNotBeforeMs && this.pendingEvents.size
+          ? { ...result, nextRetryAt: new Date(this.pendingRetryNotBeforeMs).toISOString() }
+          : result;
+      } catch (error) {
+        this.recordPendingRetryFailure();
+        throw error;
+      }
+    })();
+    this.pendingDrainPromise = drainPromise;
+    try {
+      return await drainPromise;
+    } finally {
+      if (this.pendingDrainPromise === drainPromise) {
+        this.pendingDrainPromise = null;
+      }
+    }
+  }
+
+  updatePendingRetryState(result) {
+    if (!this.pendingEvents.size || result?.status === "ok") {
+      this.pendingRetryAttempt = 0;
+      this.pendingRetryNotBeforeMs = 0;
+      return;
+    }
+    if (result?.status === "stopped" || result?.status === "cooldown") {
+      return;
+    }
+    if (Number(result?.processed) > 0) {
+      this.pendingRetryAttempt = 0;
+    }
+    this.recordPendingRetryFailure();
+  }
+
+  recordPendingRetryFailure() {
+    this.pendingRetryAttempt = Math.min(16, this.pendingRetryAttempt + 1);
+    const delayMs = Math.min(
+      DEFAULT_PENDING_RETRY_MAX_MS,
+      1_000 * (2 ** Math.min(6, this.pendingRetryAttempt - 1))
+    );
+    this.pendingRetryNotBeforeMs = Date.now() + delayMs;
+  }
+
+  async drainPendingEventsExclusive() {
+    this.syncPendingState();
+    await this.saveState();
     if (!await this.isReady()) {
       return { status: "waiting_for_reply_target", processed: 0 };
     }
@@ -137,18 +468,28 @@ class WeFlowInboxSource {
     for (const [key, item] of [...this.pendingEvents.entries()]) {
       if (this.state.seenIds.includes(key)) {
         this.pendingEvents.delete(key);
+        this.syncPendingState();
+        await this.saveState();
         continue;
       }
-      const resolved = await this.resolvePushMessage(item.push);
-      if (resolved.message.direction === "incoming") {
-        const accepted = await this.onMessage(resolved.message, resolved.snapshot);
-        if (accepted === false) {
-          return { status: "deferred", processed };
-        }
-        processed += 1;
+      if (this.stopping) {
+        return { status: "stopped", processed };
       }
+      const resolved = await this.resolvePushMessage(item.push);
+      if (this.stopping) {
+        return { status: "stopped", processed };
+      }
+      const accepted = await this.onMessage(resolved.message, resolved.snapshot);
+      if (this.stopping) {
+        return { status: "stopped", processed };
+      }
+      if (accepted === false) {
+        return { status: "deferred", processed };
+      }
+      processed += 1;
       this.rememberSeen(key);
       this.pendingEvents.delete(key);
+      this.syncPendingState();
       await this.saveState();
     }
     return { status: "ok", processed };
@@ -219,9 +560,35 @@ class WeFlowInboxSource {
 
   async saveState() {
     const filePath = normalizeText(this.config.weflowInboxCursorFile);
-    if (filePath) {
-      await writeJsonAtomic(filePath, this.state);
+    if (!filePath) {
+      return;
     }
+    const snapshot = {
+      version: 2,
+      seenIds: [...this.state.seenIds],
+      lastEventAt: this.state.lastEventAt,
+      outgoingPollCursor: normalizeOutgoingPollCursor(this.state.outgoingPollCursor),
+      pendingEvents: this.state.pendingEvents.map((item) => ({
+        key: item.key,
+        eventType: item.eventType,
+        push: { ...item.push },
+      })),
+    };
+    const write = this.stateWriteChain
+      .catch(() => {})
+      .then(() => writeJsonAtomic(filePath, snapshot));
+    this.stateWriteChain = write;
+    await write;
+  }
+
+  syncPendingState() {
+    this.state.pendingEvents = [...this.pendingEvents.entries()]
+      .slice(-MAX_PENDING_EVENTS)
+      .map(([key, item]) => ({
+        key,
+        eventType: normalizeText(item?.eventType) || "message.new",
+        push: normalizePushData(item?.push),
+      }));
   }
 }
 
@@ -606,6 +973,186 @@ function buildEventKey(eventType, push) {
   return rawId ? `${eventType}:${rawId}` : "";
 }
 
+function buildPolledMessagePush(row, chat, replayStartSeconds) {
+  const rowChat = normalizeText(row?.talker || row?.sessionId || row?.chatUsername);
+  if (rowChat && rowChat !== chat) {
+    return null;
+  }
+  const serverId = normalizeText(String(row?.serverId ?? ""));
+  const timestamp = normalizeEpochSeconds(row?.createTime || row?.timestamp);
+  if (!serverId || !timestamp || timestamp < replayStartSeconds) {
+    return null;
+  }
+  return {
+    sessionId: chat,
+    talker: chat,
+    rawid: serverId,
+    serverId,
+    timestamp,
+    createTime: timestamp,
+    localId: Number.parseInt(row?.localId, 10) || 0,
+    isSend: isSentMessage(row) ? 1 : 0,
+    localType: Number(row?.localType) || 0,
+    senderUsername: normalizeText(row?.senderUsername),
+    content: normalizeText(row?.content),
+    parsedContent: normalizeText(row?.parsedContent),
+    rawContent: normalizeText(row?.rawContent),
+  };
+}
+
+function comparePolledPushes(left, right) {
+  return normalizeEpochSeconds(left?.timestamp) - normalizeEpochSeconds(right?.timestamp)
+    || (Number(left?.localId) || 0) - (Number(right?.localId) || 0)
+    || normalizeText(left?.serverId).localeCompare(normalizeText(right?.serverId));
+}
+
+async function fetchMessageRangePaginated({
+  config,
+  chat,
+  startSeconds,
+  endSeconds,
+  limit,
+  maxRequests,
+  fetchImpl,
+  signal,
+}) {
+  let requestCount = 0;
+  const requestRange = async (rangeStart, rangeEnd, offset = 0) => {
+    if (requestCount >= maxRequests) {
+      return null;
+    }
+    requestCount += 1;
+    const params = new URLSearchParams({
+      talker: chat,
+      limit: String(limit),
+      start: String(rangeStart),
+      end: String(rangeEnd),
+    });
+    if (offset > 0) {
+      params.set("offset", String(offset));
+    }
+    const response = await fetchImpl(buildApiUrl(config, `/api/v1/messages?${params}`), {
+      headers: buildHeaders(config),
+      signal,
+    });
+    assertHttpOk(response, "WeFlow outgoing message poll");
+    const payload = await response.json();
+    const rows = Array.isArray(payload?.messages)
+      ? payload.messages.filter((item) => item && typeof item === "object")
+      : [];
+    return { rows, hasMore: payload?.hasMore === true };
+  };
+
+  const fetchSingleSecond = async (timestamp, firstPage) => {
+    const rows = [...firstPage.rows];
+    let page = firstPage;
+    let offset = page.rows.length;
+    while (page.hasMore) {
+      page = await requestRange(timestamp, timestamp, offset);
+      if (!page) {
+        return { rows: [], complete: false, throughSeconds: timestamp - 1 };
+      }
+      if (!page.rows.length) {
+        throw new Error(`WeFlow outgoing pagination made no progress at ${timestamp} offset ${offset}`);
+      }
+      rows.push(...page.rows);
+      offset += page.rows.length;
+    }
+    return { rows, complete: true, throughSeconds: timestamp };
+  };
+
+  const fetchRange = async (rangeStart, rangeEnd) => {
+    const page = await requestRange(rangeStart, rangeEnd);
+    if (!page) {
+      return { rows: [], complete: false, throughSeconds: rangeStart - 1 };
+    }
+    if (!page.hasMore) {
+      return { rows: page.rows, complete: true, throughSeconds: rangeEnd };
+    }
+    if (rangeStart >= rangeEnd) {
+      return fetchSingleSecond(rangeStart, page);
+    }
+    const midpoint = rangeStart + Math.floor((rangeEnd - rangeStart) / 2);
+    const older = await fetchRange(rangeStart, midpoint);
+    if (!older.complete) {
+      return older;
+    }
+    const newer = await fetchRange(midpoint + 1, rangeEnd);
+    return {
+      rows: [...older.rows, ...newer.rows],
+      complete: newer.complete,
+      throughSeconds: newer.complete ? rangeEnd : newer.throughSeconds,
+    };
+  };
+
+  const fetched = await fetchRange(startSeconds, Math.max(startSeconds, endSeconds));
+  const deduplicated = new Map();
+  for (const row of fetched.rows) {
+    const serverId = normalizeText(String(row?.serverId ?? row?.rawid ?? row?.id ?? ""));
+    const localId = Number.parseInt(row?.localId, 10) || 0;
+    const timestamp = normalizeEpochSeconds(row?.createTime || row?.timestamp);
+    const key = serverId || `${timestamp}:${localId}:${normalizeText(row?.content || row?.parsedContent)}`;
+    if (key && !deduplicated.has(key)) {
+      deduplicated.set(key, row);
+    }
+  }
+  return {
+    rows: [...deduplicated.values()],
+    requestCount,
+    complete: fetched.complete,
+    throughSeconds: Math.max(0, normalizeEpochSeconds(fetched.throughSeconds)),
+  };
+}
+
+function normalizeOutgoingPollCursor(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    chat: normalizeText(raw.chat),
+    polledThrough: normalizeEpochSeconds(raw.polledThrough),
+    backfillActive: raw.backfillActive === true,
+    latestTimestamp: normalizeEpochSeconds(raw.latestTimestamp),
+    latestLocalId: Number.parseInt(raw.latestLocalId, 10) || 0,
+    latestServerId: normalizeText(raw.latestServerId),
+    stallAttempt: Math.max(0, Number.parseInt(raw.stallAttempt, 10) || 0),
+    retryNotBefore: normalizeIsoDate(raw.retryNotBefore),
+  };
+}
+
+function advanceOutgoingPollCursor({
+  previous,
+  chat,
+  polledThrough,
+  backfillActive = false,
+  candidates,
+  stallAttempt = 0,
+  retryNotBefore = "",
+}) {
+  const prior = normalizeOutgoingPollCursor(previous);
+  const latest = [...(Array.isArray(candidates) ? candidates : [])].sort(comparePolledPushes).pop() || null;
+  const latestTimestamp = normalizeEpochSeconds(latest?.timestamp);
+  const priorTuple = {
+    timestamp: prior.latestTimestamp,
+    localId: prior.latestLocalId,
+    serverId: prior.latestServerId,
+  };
+  const latestTuple = {
+    timestamp: latestTimestamp,
+    localId: Number(latest?.localId) || 0,
+    serverId: normalizeText(latest?.serverId),
+  };
+  const selected = latest && comparePolledPushes(latestTuple, priorTuple) >= 0 ? latestTuple : priorTuple;
+  return {
+    chat: normalizeText(chat),
+    polledThrough: normalizeEpochSeconds(polledThrough),
+    backfillActive: Boolean(backfillActive),
+    latestTimestamp: normalizeEpochSeconds(selected.timestamp),
+    latestLocalId: Number(selected.localId) || 0,
+    latestServerId: normalizeText(selected.serverId),
+    stallAttempt: Math.max(0, Number.parseInt(stallAttempt, 10) || 0),
+    retryNotBefore: normalizeIsoDate(retryNotBefore),
+  };
+}
+
 function isSentMessage(raw) {
   return raw?.isSend === true || Number(raw?.isSend) === 1;
 }
@@ -707,22 +1254,62 @@ function normalizePositiveInt(value, fallback, minimum = 1) {
   return Number.isFinite(parsed) && parsed >= minimum ? parsed : fallback;
 }
 
-function loadCursorState(filePath) {
-  const empty = { version: 1, seenIds: [], lastEventAt: "" };
+function loadCursorState(filePath, { chat = "" } = {}) {
+  const empty = {
+    version: 2,
+    seenIds: [],
+    lastEventAt: "",
+    pendingEvents: [],
+    outgoingPollCursor: normalizeOutgoingPollCursor(null),
+  };
   const normalizedPath = normalizeText(filePath);
   if (!normalizedPath) return empty;
   try {
     const parsed = JSON.parse(fs.readFileSync(normalizedPath, "utf8"));
+    const lastEventAt = normalizeText(parsed?.lastEventAt);
+    const persistedPollCursor = normalizeOutgoingPollCursor(parsed?.outgoingPollCursor);
+    const migratedPollCursor = !persistedPollCursor.chat && lastEventAt
+      ? buildLegacyOutgoingPollCursor({ chat, lastEventAt })
+      : persistedPollCursor;
     return {
       ...empty,
       seenIds: Array.isArray(parsed?.seenIds)
         ? parsed.seenIds.map(normalizeText).filter(Boolean).slice(-MAX_SEEN_IDS)
         : [],
-      lastEventAt: normalizeText(parsed?.lastEventAt),
+      lastEventAt,
+      outgoingPollCursor: migratedPollCursor,
+      pendingEvents: Array.isArray(parsed?.pendingEvents)
+        ? parsed.pendingEvents
+          .map((item) => {
+            const eventType = normalizeText(item?.eventType) || "message.new";
+            const push = normalizePushData(item?.push);
+            const key = normalizeText(item?.key) || buildEventKey(eventType, push);
+            return eventType === "message.new" && key ? { key, eventType, push } : null;
+          })
+          .filter(Boolean)
+          .slice(-MAX_PENDING_EVENTS)
+        : [],
     };
   } catch {
     return empty;
   }
+}
+
+function buildLegacyOutgoingPollCursor({ chat, lastEventAt }) {
+  const normalizedChat = normalizeText(chat);
+  const lastEventMs = Date.parse(normalizeText(lastEventAt));
+  if (!normalizedChat || !Number.isFinite(lastEventMs) || lastEventMs <= 0) {
+    return normalizeOutgoingPollCursor(null);
+  }
+  const lastEventSeconds = Math.floor(lastEventMs / 1_000);
+  return normalizeOutgoingPollCursor({
+    chat: normalizedChat,
+    // The v1 cursor only recorded wall-clock receipt time. Start at the same
+    // second (rather than the following one) and let persisted serverId keys
+    // remove overlap, so an event racing the old save is still recovered.
+    polledThrough: Math.max(0, lastEventSeconds - 1),
+    backfillActive: true,
+  });
 }
 
 async function writeJsonAtomic(filePath, value) {
@@ -737,6 +1324,23 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function delayUntilAbort(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, ms);
+    timer.unref?.();
+    signal?.addEventListener("abort", finish, { once: true });
+
+    function finish() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    }
+  });
+}
+
 function isAbortError(error) {
   return error?.name === "AbortError" || /aborted/i.test(String(error?.message || ""));
 }
@@ -747,6 +1351,11 @@ function formatError(error) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeIsoDate(value) {
+  const normalized = normalizeText(value);
+  return normalized && Number.isFinite(Date.parse(normalized)) ? normalized : "";
 }
 
 module.exports = {

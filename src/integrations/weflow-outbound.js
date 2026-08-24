@@ -60,7 +60,11 @@ async function resolveWeFlowSendSource(config, fetchImpl = globalThis.fetch) {
   return source;
 }
 
-async function sendWeFlowUiaText(config, { text = "", timeoutMs = 0 } = {}, fetchImpl = globalThis.fetch) {
+async function sendWeFlowUiaText(
+  config,
+  { text = "", timeoutMs = 0, messageKind = "", messageLedger = null } = {},
+  fetchImpl = globalThis.fetch
+) {
   const contact = normalizeText(config?.weflowInboxDisplayName);
   const talker = normalizeText(config?.weflowInboxChat);
   const content = String(text || "");
@@ -70,20 +74,83 @@ async function sendWeFlowUiaText(config, { text = "", timeoutMs = 0 } = {}, fetc
   const verificationTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
     ? Number(timeoutMs)
     : resolveTimeoutMs(config);
-  const payload = await requestBridgeJson(config, "/api/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify({
-      contact,
-      talker,
-      text: content,
-      timeout: Math.max(1, Math.ceil(verificationTimeoutMs / 1000)),
-    }),
-  }, fetchImpl, { timeoutMs: verificationTimeoutMs + 5_000 });
-  if (payload?.dispatched !== true || payload?.verified !== true) {
-    throw new Error("WeFlow UIA send was not verified");
+  let operation = null;
+  let requestStarted = false;
+  try {
+    operation = messageLedger
+      ? await messageLedger.planOutbound({
+        talker,
+        text: content,
+        messageKind,
+        expectedDirection: "outgoing",
+      })
+      : null;
+    if (operation) {
+      await messageLedger.markSending(operation);
+    }
+    requestStarted = true;
+    const payload = await requestBridgeJson(config, "/api/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        contact,
+        talker,
+        text: content,
+        timeout: Math.max(1, Math.ceil(verificationTimeoutMs / 1000)),
+      }),
+    }, fetchImpl, { timeoutMs: verificationTimeoutMs + 15_000 });
+    const verifiedLocalId = normalizePositiveLocalId(payload?.localId);
+    if (payload?.dispatched === true && (payload?.verified !== true || !verifiedLocalId)) {
+      const verificationError = normalizeText(payload?.verificationError)
+        || "WeFlow UIA dispatch was not observed with a stable local id";
+      if (operation) {
+        await Promise.resolve().then(() => messageLedger.markFailed(operation, {
+          uncertain: true,
+          error: verificationError,
+        })).catch(() => {});
+      }
+      // UI Automation already pressed Enter. Treat this as delivered so the
+      // stream layer does not retry and create a duplicate while WeFlow's read
+      // API is still catching up.
+      return {
+        ...payload,
+        verified: false,
+        uncertain: true,
+        verificationError,
+      };
+    }
+    if (payload?.dispatched !== true) {
+      const error = new Error("WeFlow UIA send was not verified");
+      error.deliveryUncertain = false;
+      throw error;
+    }
+    if (operation) {
+      try {
+        await messageLedger.markVerified(operation, { localId: verifiedLocalId });
+      } catch (error) {
+        // The UI action is already verified. Keep the previous planned/sending
+        // row as a content-hash safety net and never invite a duplicate retry
+        // merely because the verification update could not be persisted.
+        await Promise.resolve().then(() => messageLedger.markFailed(operation, {
+          uncertain: true,
+          error: error instanceof Error ? error.message : String(error),
+        })).catch(() => {});
+        return { ...payload, ledgerUncertain: true };
+      }
+    }
+    return payload;
+  } catch (error) {
+    if (error && typeof error === "object" && error.deliveryUncertain == null) {
+      error.deliveryUncertain = requestStarted;
+    }
+    if (operation) {
+      await Promise.resolve().then(() => messageLedger.markFailed(operation, {
+        uncertain: requestStarted && error?.deliveryUncertain !== false,
+        error: error instanceof Error ? error.message : String(error),
+      })).catch(() => {});
+    }
+    throw error;
   }
-  return payload;
 }
 
 async function requestBridgeJson(config, pathname, init, fetchImpl, { timeoutMs = resolveTimeoutMs(config) } = {}) {
@@ -111,7 +178,13 @@ async function requestBridgeJson(config, pathname, init, fetchImpl, { timeoutMs 
   }
   if (!response.ok) {
     const detail = normalizeText(payload?.error) || `HTTP ${response.status}`;
-    throw new Error(`WeFlow bridge request failed: ${detail}`);
+    const error = new Error(`WeFlow bridge request failed: ${detail}`);
+    error.bridgeStatus = response.status;
+    // A completed HTTP error response is a certain pre-dispatch failure unless
+    // the bridge explicitly says UI Automation already sent the message. A
+    // transport interruption still has no such flag and remains uncertain.
+    error.deliveryUncertain = payload?.dispatched === true;
+    throw error;
   }
   return payload && typeof payload === "object" ? payload : {};
 }
@@ -123,6 +196,19 @@ function resolveTimeoutMs(config) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizePositiveLocalId(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text)) {
+    return "";
+  }
+  try {
+    const parsed = BigInt(text);
+    return parsed > 0n ? parsed.toString() : "";
+  } catch {
+    return "";
+  }
 }
 
 module.exports = {

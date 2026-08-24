@@ -88,7 +88,7 @@ test("handlePreparedMessage queues a normal inbound message while the scope is b
   assert.equal(queued[0].text, "prepared-user-text");
 });
 
-test("small UIA inbound sends one processing acknowledgement before it waits in the queue", async () => {
+test("small UIA inbound queues durably before sending one processing acknowledgement", async () => {
   const order = [];
   const sent = [];
   const queued = [];
@@ -126,7 +126,7 @@ test("small UIA inbound sends one processing acknowledgement before it waits in 
   });
 
   assert.equal(dispatched, false);
-  assert.deepEqual(order, ["ack", "queue"]);
+  assert.deepEqual(order, ["queue", "ack"]);
   assert.deepEqual(sent, [{
     userId: "user-1",
     text: "处理中",
@@ -135,6 +135,51 @@ test("small UIA inbound sends one processing acknowledgement before it waits in 
     messageKind: "inbound_ack",
   }]);
   assert.equal(queued.length, 1);
+});
+
+test("processing acknowledgement retries one certain pre-dispatch failure but not an uncertain send", async () => {
+  let certainAttempts = 0;
+  const certainApp = {
+    channelAdapter: {
+      async sendText() {
+        certainAttempts += 1;
+        if (certainAttempts === 1) {
+          const error = new Error("window not ready");
+          error.deliveryUncertain = false;
+          throw error;
+        }
+      },
+    },
+  };
+  const prepared = {
+    provider: "weflow-uia",
+    senderId: "user-1",
+    contextToken: "ctx-1",
+    messageId: "weflow:ack-retry",
+    text: "检查项目",
+  };
+  assert.equal(
+    await CyberbossApp.prototype.acknowledgeWeFlowUiaInbound.call(certainApp, prepared),
+    true
+  );
+  assert.equal(certainAttempts, 2);
+
+  let uncertainAttempts = 0;
+  const uncertainApp = {
+    channelAdapter: {
+      async sendText() {
+        uncertainAttempts += 1;
+        const error = new Error("connection ended after dispatch");
+        error.deliveryUncertain = true;
+        throw error;
+      },
+    },
+  };
+  assert.equal(
+    await CyberbossApp.prototype.acknowledgeWeFlowUiaInbound.call(uncertainApp, prepared),
+    false
+  );
+  assert.equal(uncertainAttempts, 1);
 });
 
 test("reminder requests on both channels acknowledge once and keep the runtime turn silent", async () => {
@@ -583,6 +628,64 @@ test("dispatchPreparedTurn binds reply target to the explicit turn id when runti
   }]);
   assert.deepEqual(queuedBindings, []);
   assert.deepEqual(order, ["begin", "typing"]);
+});
+
+test("dispatchPreparedTurn reports the first runtime failure once and suppresses retry noise", async () => {
+  const failureReplies = [];
+  let releaseCount = 0;
+  const appLike = {
+    channelAdapter: {
+      async sendText(payload) {
+        failureReplies.push(payload);
+      },
+    },
+    turnGateStore: {
+      begin() {
+        return "binding-1::/workspace";
+      },
+      releaseScope() {
+        releaseCount += 1;
+      },
+    },
+    runtimeAdapter: {
+      async sendTurn() {
+        throw new Error("runtime fixture unavailable");
+      },
+      getSessionStore() {
+        return {
+          getRuntimeParamsForWorkspace() {
+            return { model: "gpt-5.4" };
+          },
+        };
+      },
+    },
+    async buildRuntimeTurn({ prepared }) {
+      return { text: prepared.text, attachments: [] };
+    },
+  };
+  const payload = {
+    bindingKey: "binding-1",
+    workspaceRoot: "/workspace",
+    prepared: {
+      workspaceId: "default",
+      accountId: "acc-1",
+      senderId: "user-1",
+      contextToken: "ctx-1",
+      provider: "weflow-uia",
+      text: "ping",
+    },
+  };
+
+  assert.equal(await CyberbossApp.prototype.dispatchPreparedTurn.call(appLike, payload), false);
+  assert.equal(failureReplies.length, 1);
+  assert.match(failureReplies[0].text, /runtime fixture unavailable/);
+
+  assert.equal(await CyberbossApp.prototype.dispatchPreparedTurn.call(appLike, {
+    ...payload,
+    suppressFailureReply: true,
+  }), false);
+  assert.equal(failureReplies.length, 1);
+  assert.equal(releaseCount, 2);
 });
 
 test("completed turns flush queued inbound work before system messages", async () => {

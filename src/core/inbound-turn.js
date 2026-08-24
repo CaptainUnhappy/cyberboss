@@ -310,6 +310,9 @@ function clonePreparedInboundMessage(prepared) {
     contentUrl: normalizeQuotedUrl(prepared.contentUrl),
     sharedContent: Boolean(prepared.sharedContent),
     explicitPrompt: Boolean(prepared.explicitPrompt),
+    acknowledgementStatus: prepared.acknowledgementStatus,
+    acknowledgementAt: prepared.acknowledgementAt,
+    sharedHandoffScopeKey: prepared.sharedHandoffScopeKey,
   };
 }
 

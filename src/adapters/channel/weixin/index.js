@@ -16,7 +16,7 @@ const SEND_MESSAGE_CHUNK_INTERVAL_MS = 350;
 const WEIXIN_MAX_DELIVERY_MESSAGES = 10;
 const PROGRESS_MESSAGE_PREFIX = "【进度】 ";
 
-function createWeixinChannelAdapter(config) {
+function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {}) {
   let selectedAccount = null;
   let contextTokenCache = null;
   const inboundFilter = createInboundFilter();
@@ -81,15 +81,24 @@ function createWeixinChannelAdapter(config) {
           return sendWeFlowUiaText(config, {
             text: deliveryChunk,
             timeoutMs: messageKind === "inbound_ack" ? 5_000 : 0,
+            messageKind,
+            messageLedger: weflowMessageLedger,
           });
         }
-        return sendText({
-          baseUrl: account.baseUrl,
-          token: account.token,
-          toUserId: userId,
+        return sendNativeWeixinTextWithLedger({
+          config,
+          messageLedger: weflowMessageLedger,
+          userId,
           text: deliveryChunk,
-          contextToken: resolvedToken,
-          clientId: `cb-${crypto.randomUUID()}`,
+          messageKind,
+          sendImpl: () => sendText({
+            baseUrl: account.baseUrl,
+            token: account.token,
+            toUserId: userId,
+            text: deliveryChunk,
+            contextToken: resolvedToken,
+            clientId: `cb-${crypto.randomUUID()}`,
+          }),
         });
       })
       .then(() => {
@@ -303,6 +312,48 @@ function chunkReplyTextForWeixin(text, minChunk = DEFAULT_MIN_WEIXIN_CHUNK) {
     MAX_WEIXIN_CHUNK,
     normalizeChunkTarget(minChunk, DEFAULT_MIN_WEIXIN_CHUNK),
   );
+}
+
+async function sendNativeWeixinTextWithLedger({
+  config,
+  messageLedger,
+  userId,
+  text,
+  messageKind = "",
+  sendImpl,
+}) {
+  const talker = String(config?.weflowInboxChat || "").trim();
+  const expectedUserId = String(config?.weflowInboxReplyUserId || "").trim();
+  const normalizedUserId = String(userId || "").trim();
+  const shouldTrack = Boolean(
+    messageLedger
+    && talker
+    && normalizedUserId
+    && (!expectedUserId || expectedUserId === normalizedUserId)
+  );
+  let planned = null;
+  if (shouldTrack) {
+    planned = await messageLedger.planOutbound({
+      talker,
+      text,
+      messageKind: messageKind ? `native_${messageKind}` : "native_reply",
+      expectedDirection: "incoming",
+    });
+    await messageLedger.markSending(planned?.id || planned?.operationId || planned);
+  }
+  try {
+    return await sendImpl();
+  } catch (error) {
+    if (planned) {
+      try {
+        await messageLedger.markFailed(planned?.id || planned?.operationId || planned, {
+          uncertain: true,
+          error,
+        });
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 function buildWeixinDeliveryChunks({ text, preserveBlock = false, minChunk = DEFAULT_MIN_WEIXIN_CHUNK, messageKind = "" } = {}) {
@@ -540,6 +591,7 @@ function sleep(ms) {
 
 module.exports = {
   createWeixinChannelAdapter,
+  sendNativeWeixinTextWithLedger,
   splitUtf8,
   normalizeWeixinReplyText,
   finalizeWeixinDeliveryChunk,

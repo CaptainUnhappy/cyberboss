@@ -2,14 +2,15 @@
 """Local HTTP bridge that sends WeChat text through Windows UI Automation.
 
 The bridge is intentionally loopback-only. After dispatching a message it
-polls WeFlow's local read API and reports success only when the outgoing row is
-visible for the expected talker.
+polls WeFlow's local read API and reports either a verified outgoing row or an
+uncertain dispatch when the read API does not catch up before the deadline.
 """
 
 from __future__ import annotations
 
 import argparse
 import ctypes
+from datetime import datetime, timezone
 import json
 import os
 import threading
@@ -150,13 +151,18 @@ class BridgeState:
             )
             temporary.replace(self.state_file)
 
-    def fetch_messages(self, talker: str, limit: int = 30) -> list[dict[str, Any]]:
+    def fetch_messages(
+        self,
+        talker: str,
+        limit: int = 30,
+        request_timeout: float = 3.0,
+    ) -> list[dict[str, Any]]:
         query = urllib.parse.urlencode({"talker": talker, "limit": limit})
         request = urllib.request.Request(
             f"{self.weflow_base_url}/api/v1/messages?{query}",
             headers={"Authorization": f"Bearer {self.weflow_token}"},
         )
-        with urllib.request.urlopen(request, timeout=3) as response:
+        with urllib.request.urlopen(request, timeout=max(0.5, request_timeout)) as response:
             payload = json.load(response)
         if isinstance(payload, list):
             return [item for item in payload if isinstance(item, dict)]
@@ -174,8 +180,14 @@ class BridgeState:
     def message_id(message: dict[str, Any]) -> str:
         for key in ("localId", "local_id", "id", "msgId", "msg_id"):
             value = message.get(key)
-            if value is not None:
-                return str(value)
+            if value is None or isinstance(value, bool):
+                continue
+            text = str(value).strip()
+            try:
+                if text and int(text) > 0:
+                    return str(int(text))
+            except (TypeError, ValueError):
+                continue
         return ""
 
     @staticmethod
@@ -186,21 +198,66 @@ class BridgeState:
         content = message.get("content", message.get("text", ""))
         return str(content or "") == text
 
+    @staticmethod
+    def message_epoch_seconds(message: dict[str, Any]) -> int:
+        value = message.get("createTime", message.get("timestamp", 0))
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            text = normalize_text(value)
+            if not text:
+                return 0
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return max(0, int(parsed.timestamp()))
+            except ValueError:
+                return 0
+        if numeric <= 0:
+            return 0
+        # WeFlow installations may expose Unix seconds or milliseconds.
+        while numeric >= 100_000_000_000:
+            numeric /= 1_000
+        return int(numeric)
+
     def dispatch_and_verify(self, contact: str, talker: str, text: str, timeout: float) -> dict[str, Any]:
         with self.send_lock:
-            before = {
-                self.message_id(message)
-                for message in self.fetch_messages(talker)
-                if self.message_matches(message, text)
-            }
+            baseline_available = True
+            try:
+                before = {
+                    self.message_id(message)
+                    for message in self.fetch_messages(
+                        talker,
+                        request_timeout=min(3.0, max(0.75, timeout / 3)),
+                    )
+                    if self.message_matches(message, text)
+                }
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+                # Dispatch still proceeds when the read API is briefly slow. A
+                # timestamp fence below prevents an older identical row from
+                # being mistaken for the new delivery.
+                baseline_available = False
+                before = set()
+            dispatched_after = int(time.time()) - 2
             self._dispatch_text(contact, text)
             deadline = time.monotonic() + max(1.0, timeout)
             last_error = ""
             while time.monotonic() < deadline:
                 try:
-                    for message in self.fetch_messages(talker):
+                    remaining = max(0.5, deadline - time.monotonic())
+                    for message in self.fetch_messages(talker, request_timeout=min(3.0, remaining)):
                         message_id = self.message_id(message)
-                        if self.message_matches(message, text) and (not message_id or message_id not in before):
+                        message_time = self.message_epoch_seconds(message)
+                        # Verification must return a stable ID for the outbound
+                        # ledger. When the baseline read failed, a valid recent
+                        # timestamp is also required so an older identical row
+                        # cannot be accepted as this delivery.
+                        is_new = bool(message_id) and message_id not in before and (
+                            baseline_available
+                            or (message_time > 0 and message_time >= dispatched_after)
+                        )
+                        if self.message_matches(message, text) and is_new:
                             return {
                                 "dispatched": True,
                                 "verified": True,
@@ -210,7 +267,12 @@ class BridgeState:
                     last_error = str(error)
                 time.sleep(0.35)
             detail = f" ({last_error})" if last_error else ""
-            raise RuntimeError(f"outgoing message was not observed in WeFlow before timeout{detail}")
+            return {
+                "dispatched": True,
+                "verified": False,
+                "uncertain": True,
+                "verificationError": f"outgoing message was not observed in WeFlow before timeout{detail}",
+            }
 
     @staticmethod
     def _dispatch_text(contact: str, text: str) -> None:
@@ -325,10 +387,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(404, {"error": "not found"})
         except (ValueError, json.JSONDecodeError) as error:
-            self.send_json(400, {"error": str(error)})
+            response = {"error": str(error)}
+            if path == "/api/send":
+                response["dispatched"] = False
+            self.send_json(400, response)
         except Exception as error:  # Keep the local bridge alive after UI/API failures.
             print(f"[weflow-uia] request failed: {error}", flush=True)
-            self.send_json(502, {"error": str(error)})
+            response = {"error": str(error)}
+            if path == "/api/send":
+                response["dispatched"] = False
+            self.send_json(502, response)
 
 
 def parse_args() -> argparse.Namespace:

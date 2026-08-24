@@ -16,6 +16,7 @@ const {
   collectStreamingBoundaries,
   findBoundaryPunctuationEnd,
   trimOuterBlankLines,
+  sendNativeWeixinTextWithLedger,
 } = require("../src/adapters/channel/weixin/index");
 
 test("normalizeWeixinReplyText trims outer blank lines but preserves internal blank lines", () => {
@@ -123,6 +124,47 @@ test("ordinary channel delivery keeps final reply text undecorated", () => {
     text: "最终回复。",
     messageKind: "",
   }), ["最终回复"]);
+});
+
+test("native bot delivery enters the shared WeFlow ledger before the API call", async () => {
+  const order = [];
+  const ledger = {
+    async planOutbound(payload) {
+      order.push(["planned", payload]);
+      return { id: "native-op-1" };
+    },
+    async markSending(id) {
+      order.push(["sending", id]);
+    },
+    async markFailed() {
+      throw new Error("successful native delivery must stay matchable as sending");
+    },
+  };
+
+  await sendNativeWeixinTextWithLedger({
+    config: {
+      weflowInboxChat: "wxid_main",
+      weflowInboxReplyUserId: "bot-user",
+    },
+    messageLedger: ledger,
+    userId: "bot-user",
+    text: "最终回复",
+    messageKind: "progress",
+    async sendImpl() {
+      order.push(["api"]);
+    },
+  });
+
+  assert.deepEqual(order, [
+    ["planned", {
+      talker: "wxid_main",
+      text: "最终回复",
+      messageKind: "native_progress",
+      expectedDirection: "incoming",
+    }],
+    ["sending", "native-op-1"],
+    ["api"],
+  ]);
 });
 
 test("chunkReplyTextForWeixin coalesces short and long natural units below the target", () => {
