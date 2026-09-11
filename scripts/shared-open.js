@@ -7,6 +7,7 @@ const readline = require("readline");
 const {
   listenUrl,
   ensureSharedAppServer,
+  resolveCodexCommand,
   resolveBoundThread,
 } = require("./shared-common");
 
@@ -17,7 +18,7 @@ async function main() {
   if (runtime === "codex") {
     await ensureSharedAppServer();
     const { threadId, workspaceRoot: resolvedWorkspaceRoot } = resolveBoundThread(workspaceRoot);
-    const child = spawn(process.env.CYBERBOSS_CODEX_COMMAND || "codex", [
+    const child = spawn(resolveCodexCommand(), [
       "resume",
       threadId,
       "--remote",

@@ -13,11 +13,22 @@ const {
 const { findModelByQuery } = require("./model-catalog");
 const { SessionStore } = require("./session-store");
 const { resolveCodexProjectToolMcpServerConfig } = require("./mcp-config");
+const { extractGeneratedImageArtifacts } = require("../../../core/generated-image-artifact");
+const {
+  MODEL_CANARY_EXECUTION_POLICY,
+  MODEL_CANARY_PROMPT,
+} = require("../../../integrations/weflow-model-canary");
 
 function createCodexRuntimeAdapter(config) {
   const sessionStore = new SessionStore({ filePath: config.sessionsFile, runtimeId: "codex" });
   let client = null;
+  let modelCanaryClient = null;
   let readyState = null;
+  let modelCanaryReady = false;
+  const eventListeners = new Set();
+  const clientEventUnsubscribers = new Map();
+  const modelCanaryThreadIds = new Set();
+  const modelCanaryApprovalRequestIds = new Set();
   const configuredModel = normalizeText(config.codexModel);
   const configuredModelProvider = normalizeText(config.codexModelProvider);
 
@@ -40,8 +51,56 @@ function createCodexRuntimeAdapter(config) {
         extraWritableRoots: [config.stateDir],
         mcpServerConfig: resolveCodexProjectToolMcpServerConfig(),
       });
+      attachClientEvents(client, false);
     }
     return client;
+  }
+
+  function ensureModelCanaryClient() {
+    if (!modelCanaryClient) {
+      // Model probes always use a separate spawned app-server. They never reuse
+      // the ordinary websocket endpoint or its MCP/plugin/tool configuration.
+      modelCanaryClient = new CodexRpcClient({
+        endpoint: "",
+        codexCommand: config.codexCommand,
+        env: process.env,
+        extraWritableRoots: [],
+        mcpServerConfig: null,
+        isolatedProfile: true,
+      });
+      attachClientEvents(modelCanaryClient, true);
+    }
+    return modelCanaryClient;
+  }
+
+  function attachClientEvents(runtimeClient, isolatedModelCanary) {
+    if (!runtimeClient || clientEventUnsubscribers.has(runtimeClient)) return;
+    const unsubscribe = runtimeClient.onMessage((message) => {
+      const event = mapCodexMessageToRuntimeEvent(message);
+      if (!event) return;
+      if (isolatedModelCanary) {
+        const threadId = normalizeText(event?.payload?.threadId);
+        if (threadId) modelCanaryThreadIds.add(threadId);
+        if (event.type === "runtime.approval.requested" && event?.payload?.requestId != null) {
+          modelCanaryApprovalRequestIds.add(String(event.payload.requestId));
+        }
+      }
+      for (const listener of eventListeners) {
+        listener(event, message);
+      }
+    });
+    clientEventUnsubscribers.set(runtimeClient, unsubscribe);
+  }
+
+  async function initializeModelCanaryRuntime() {
+    const runtimeClient = ensureModelCanaryClient();
+    if (modelCanaryReady && runtimeClient.isReady && runtimeClient.isTransportReady()) {
+      return runtimeClient;
+    }
+    await runtimeClient.connect();
+    await runtimeClient.initialize();
+    modelCanaryReady = true;
+    return runtimeClient;
   }
 
   return {
@@ -58,17 +117,16 @@ function createCodexRuntimeAdapter(config) {
     createClient() {
       return ensureClient();
     },
+    supportsExecutionPolicy(executionPolicy) {
+      return normalizeText(executionPolicy) === MODEL_CANARY_EXECUTION_POLICY;
+    },
     onEvent(listener) {
       if (typeof listener !== "function") {
         return () => {};
       }
-      const runtimeClient = ensureClient();
-      return runtimeClient.onMessage((message) => {
-        const event = mapCodexMessageToRuntimeEvent(message);
-        if (event) {
-          listener(event, message);
-        }
-      });
+      ensureClient();
+      eventListeners.add(listener);
+      return () => eventListeners.delete(listener);
     },
     getSessionStore() {
       return sessionStore;
@@ -113,22 +171,38 @@ function createCodexRuntimeAdapter(config) {
       if (client) {
         await client.close();
       }
+      if (modelCanaryClient) {
+        await modelCanaryClient.close();
+      }
+      for (const unsubscribe of clientEventUnsubscribers.values()) {
+        try { unsubscribe?.(); } catch {}
+      }
+      clientEventUnsubscribers.clear();
+      eventListeners.clear();
+      modelCanaryThreadIds.clear();
+      modelCanaryApprovalRequestIds.clear();
       readyState = null;
+      modelCanaryReady = false;
       client = null;
+      modelCanaryClient = null;
     },
     async startFreshThreadDraft() {
       return {};
     },
     async respondApproval({ requestId, decision, result = null }) {
-      const runtimeClient = ensureClient();
-      await this.initialize();
       if (requestId == null || String(requestId).trim() === "") {
         throw new Error("approval response requires a requestId");
       }
+      const isolatedRequest = modelCanaryApprovalRequestIds.has(String(requestId));
+      const runtimeClient = isolatedRequest
+        ? await initializeModelCanaryRuntime()
+        : ensureClient();
+      if (!isolatedRequest) await this.initialize();
       const responsePayload = result && typeof result === "object"
         ? result
         : { decision: decision === "accept" ? "accept" : "decline" };
       await runtimeClient.sendResponse(requestId, responsePayload);
+      if (isolatedRequest) modelCanaryApprovalRequestIds.delete(String(requestId));
       return {
         requestId,
         ...(result && typeof result === "object"
@@ -137,8 +211,11 @@ function createCodexRuntimeAdapter(config) {
       };
     },
     async cancelTurn({ threadId, turnId }) {
-      const runtimeClient = ensureClient();
-      await this.initialize();
+      const isolatedThread = modelCanaryThreadIds.has(normalizeText(threadId));
+      const runtimeClient = isolatedThread
+        ? await initializeModelCanaryRuntime()
+        : ensureClient();
+      if (!isolatedThread) await this.initialize();
       await runtimeClient.cancelTurn({ threadId, turnId });
       return { threadId, turnId };
     },
@@ -155,6 +232,16 @@ function createCodexRuntimeAdapter(config) {
       const runtimeClient = ensureClient();
       await this.initialize();
       return runtimeClient.compactThread({ threadId });
+    },
+    async listTurnGeneratedImages({ threadId, turnId = "" } = {}) {
+      const runtimeClient = ensureClient();
+      await this.initialize();
+      const response = await runtimeClient.listThreadItems({
+        threadId,
+        turnId,
+        sortDirection: "asc",
+      }).catch(() => runtimeClient.readThread({ threadId, includeTurns: true }));
+      return extractGeneratedImageArtifacts(response, { turnId });
     },
     async refreshThreadInstructions({ threadId, workspaceRoot, model = "", modelProvider = "" }) {
       const runtimeClient = ensureClient();
@@ -181,9 +268,34 @@ function createCodexRuntimeAdapter(config) {
     async sendTextTurn(args) {
       return this.sendTurn(args);
     },
-    async sendTurn({ bindingKey, workspaceRoot, text, attachments = [], metadata = {}, model = "" }) {
-      const runtimeClient = ensureClient();
-      await this.initialize();
+    async sendTurn({
+      bindingKey,
+      workspaceRoot,
+      text,
+      attachments = [],
+      metadata = {},
+      model = "",
+      executionPolicy = "",
+    }) {
+      const normalizedExecutionPolicy = normalizeText(executionPolicy);
+      const isolatedModelCanary = normalizedExecutionPolicy === MODEL_CANARY_EXECUTION_POLICY;
+      if (normalizedExecutionPolicy && !isolatedModelCanary) {
+        throw new Error(`unsupported Codex execution policy: ${normalizedExecutionPolicy}`);
+      }
+      if (isolatedModelCanary) {
+        if (metadata?.modelCanaryDenySideEffects !== true
+          || normalizeText(text) !== MODEL_CANARY_PROMPT
+          || (Array.isArray(attachments) && attachments.length > 0)) {
+          throw new Error("model canary isolated turn metadata, prompt, or attachment boundary is invalid");
+        }
+      }
+      const runtimeClient = isolatedModelCanary
+        ? await initializeModelCanaryRuntime()
+        : ensureClient();
+      if (!isolatedModelCanary) await this.initialize();
+      const rpcWorkspaceRoot = isolatedModelCanary
+        ? runtimeClient.getIsolatedWorkspaceRoot()
+        : workspaceRoot;
 
       let threadId = sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot);
       const storedParams = sessionStore.getRuntimeParamsForWorkspace(bindingKey, workspaceRoot);
@@ -200,19 +312,22 @@ function createCodexRuntimeAdapter(config) {
         model: desiredModel,
         modelProvider: desiredModelProvider,
       });
-      let outboundText = text;
+      let outboundText = isolatedModelCanary ? MODEL_CANARY_PROMPT : text;
       if (!threadId) {
         const response = await runtimeClient.startThread({
-          cwd: workspaceRoot,
+          cwd: rpcWorkspaceRoot,
           model: desiredModel,
           modelProvider: desiredModelProvider,
+          ...(isolatedModelCanary ? { dynamicTools: [], environments: [] } : {}),
         });
         threadId = extractThreadId(response);
         if (!threadId) {
           throw new Error("thread/start did not return a thread id");
         }
         sessionStore.setThreadIdForWorkspace(bindingKey, workspaceRoot, threadId, metadata);
-        outboundText = buildOpeningTurnText(config, text);
+        if (!isolatedModelCanary) {
+          outboundText = buildOpeningTurnText(config, text);
+        }
       } else {
         await runtimeClient.resumeThread({
           threadId,
@@ -221,9 +336,10 @@ function createCodexRuntimeAdapter(config) {
         }).catch(async () => {
           sessionStore.clearThreadIdForWorkspace(bindingKey, workspaceRoot);
           const recreated = await runtimeClient.startThread({
-            cwd: workspaceRoot,
+            cwd: rpcWorkspaceRoot,
             model: desiredModel,
             modelProvider: desiredModelProvider,
+            ...(isolatedModelCanary ? { dynamicTools: [], environments: [] } : {}),
           });
           threadId = extractThreadId(recreated);
           if (!threadId) {
@@ -234,7 +350,7 @@ function createCodexRuntimeAdapter(config) {
             model: desiredModel,
             modelProvider: desiredModelProvider,
           });
-          outboundText = buildOpeningTurnText(config, text);
+          outboundText = isolatedModelCanary ? MODEL_CANARY_PROMPT : buildOpeningTurnText(config, text);
         });
       }
 
@@ -244,12 +360,15 @@ function createCodexRuntimeAdapter(config) {
         attachments,
         model: desiredModel,
         modelProvider: desiredModelProvider,
-        workspaceRoot,
-        accessMode: config.codexAccessMode,
+        workspaceRoot: rpcWorkspaceRoot,
+        accessMode: isolatedModelCanary ? null : config.codexAccessMode,
+        executionPolicy: normalizedExecutionPolicy,
       });
+      if (isolatedModelCanary) modelCanaryThreadIds.add(threadId);
       return {
         threadId,
         turnId: extractTurnId(response),
+        ...(isolatedModelCanary ? { executionPolicy: MODEL_CANARY_EXECUTION_POLICY } : {}),
       };
     },
   };

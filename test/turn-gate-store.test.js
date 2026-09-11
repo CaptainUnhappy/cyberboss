@@ -11,8 +11,11 @@ test("turn gate tracks pending scopes until the turn is released", () => {
   assert.equal(scopeKey, "binding-1::/workspace");
   assert.equal(gate.isPending("binding-1", "/workspace"), true);
 
-  gate.attachThread(scopeKey, "thread-1");
-  gate.releaseThread("thread-1");
+  assert.equal(gate.attachThread(scopeKey, "thread-1"), true);
+  assert.deepEqual(gate.releaseThread("thread-1"), {
+    released: true,
+    scopeKey: "binding-1::/workspace",
+  });
 
   assert.equal(gate.isPending("binding-1", "/workspace"), false);
 });
@@ -86,6 +89,17 @@ test("handlePreparedMessage queues a normal inbound message while the scope is b
   assert.equal(queued[0].bindingKey, "binding-1");
   assert.equal(queued[0].workspaceRoot, "/workspace");
   assert.equal(queued[0].text, "prepared-user-text");
+});
+
+test("turn gate refuses a late thread attachment after its scope was already released", () => {
+  const gate = new TurnGateStore();
+  const scopeKey = gate.begin("binding-late", "/workspace");
+  assert.deepEqual(gate.releaseScope("binding-late", "/workspace"), {
+    released: true,
+    scopeKey,
+  });
+  assert.equal(gate.attachThread(scopeKey, "thread-late"), false);
+  assert.deepEqual(gate.releaseThread("thread-late"), { released: false, scopeKey: "" });
 });
 
 test("small UIA inbound queues durably before sending one processing acknowledgement", async () => {
@@ -630,6 +644,132 @@ test("dispatchPreparedTurn binds reply target to the explicit turn id when runti
   assert.deepEqual(order, ["begin", "typing"]);
 });
 
+test("dispatchPreparedTurn durably correlates WeFlow source ids through accepted turn binding", async () => {
+  const calls = [];
+  const turnBindings = [];
+  const obligationId = `reply-obligation:${"a".repeat(64)}`;
+  const appLike = {
+    channelAdapter: { async sendText() {} },
+    turnGateStore: {
+      begin() { calls.push("gate.begin"); return "binding-1::D:/workspace"; },
+      attachThread() { calls.push("gate.attach"); },
+      releaseScope() {},
+    },
+    replyObligationStore: {
+      begin(payload) {
+        calls.push("obligation.begin");
+        assert.deepEqual(payload.sourceMessageIds, ["weflow:101", "weflow:102"]);
+        assert.equal(payload.talker, "Azzy");
+        assert.equal(payload.contextToken, "ctx-1");
+        return { created: true, entry: { id: obligationId } };
+      },
+      markTurnAccepted(id, payload) {
+        calls.push("obligation.accepted");
+        assert.equal(id, obligationId);
+        assert.deepEqual(payload, { threadId: "thread-1", turnId: "turn-1" });
+      },
+      markHandoffFailure() {},
+    },
+    runtimeAdapter: {
+      async sendTurn() {
+        calls.push("runtime.send");
+        return { threadId: "thread-1", turnId: "turn-1" };
+      },
+      describe() { return { id: "codex" }; },
+      getSessionStore() {
+        return { getRuntimeParamsForWorkspace() { return { model: "gpt-5.4" }; } };
+      },
+    },
+    async buildRuntimeTurn({ prepared }) {
+      return { text: prepared.text, attachments: [] };
+    },
+    streamDelivery: {
+      bindReplyTargetForTurn(payload) { turnBindings.push(payload); },
+      queueReplyTargetForThread() { throw new Error("explicit turn id should bind directly"); },
+    },
+  };
+
+  const dispatched = await CyberbossApp.prototype.dispatchPreparedTurn.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "D:/workspace",
+    sourceMessageIds: ["weflow:101", "weflow:101"],
+    prepared: {
+      workspaceId: "default",
+      accountId: "acc-1",
+      senderId: "user-1",
+      chatId: "weflow:Azzy",
+      contextToken: "ctx-1",
+      provider: "weflow-uia",
+      sourceMessageIds: ["weflow:101", "weflow:102", "weflow:102", ""],
+      text: "检查状态",
+    },
+  });
+
+  assert.equal(dispatched, true);
+  assert.deepEqual(calls, [
+    "gate.begin",
+    "obligation.begin",
+    "runtime.send",
+    "gate.attach",
+    "obligation.accepted",
+  ]);
+  assert.equal(turnBindings.length, 1);
+  assert.equal(turnBindings[0].target.replyObligationId, obligationId);
+});
+
+test("an already accepted reply obligation suppresses runtime redispatch exactly once", async () => {
+  const obligationId = `reply-obligation:${"b".repeat(64)}`;
+  const bindings = [];
+  let releases = 0;
+  const appLike = {
+    turnGateStore: {
+      begin() { return "binding-1::D:/workspace"; },
+      releaseScope() { releases += 1; },
+    },
+    replyObligationStore: {
+      begin() {
+        return {
+          created: false,
+          entry: {
+            id: obligationId,
+            terminal: false,
+            handoffAcceptedAt: "2026-08-29T00:00:00.000Z",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            senderId: "user-1",
+            contextToken: "ctx-1",
+          },
+        };
+      },
+    },
+    runtimeAdapter: {
+      async sendTurn() { throw new Error("duplicate runtime handoff"); },
+    },
+    streamDelivery: {
+      bindReplyTargetForTurn(payload) { bindings.push(payload); },
+      queueReplyTargetForThread() {},
+    },
+  };
+
+  const dispatched = await CyberbossApp.prototype.dispatchPreparedTurn.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "D:/workspace",
+    sourceMessageIds: ["weflow:101"],
+    prepared: {
+      accountId: "acc-1",
+      senderId: "user-1",
+      contextToken: "ctx-1",
+      provider: "weflow-uia",
+      text: "检查状态",
+    },
+  });
+
+  assert.equal(dispatched, true);
+  assert.equal(releases, 1);
+  assert.equal(bindings.length, 1);
+  assert.equal(bindings[0].target.replyObligationId, obligationId);
+});
+
 test("dispatchPreparedTurn reports the first runtime failure once and suppresses retry noise", async () => {
   const failureReplies = [];
   let releaseCount = 0;
@@ -958,6 +1098,7 @@ test("flushPendingInboundMessages batches queued messages from the same scope in
   await CyberbossApp.prototype.flushPendingInboundMessages.call(appLike);
 
   assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].sourceMessageIds, ["101", "102"]);
   assert.equal(dispatched[0].prepared.contextToken, "ctx-1");
   assert.match(dispatched[0].prepared.text, /Multiple newer WeChat messages arrived/);
   assert.match(dispatched[0].prepared.text, /第一条[\s\S]*第二条/);

@@ -7,6 +7,7 @@ function buildInboundDraft(normalized, { attachments = [], attachmentFailures = 
   const originalText = normalizeText(normalized?.text);
   return {
     ...normalized,
+    sourceMessageIds: normalizeSourceMessageIds(normalized?.sourceMessageIds),
     originalText,
     text: originalText,
     quotedContexts: normalizeQuotedContexts(normalized?.quotedContexts),
@@ -30,6 +31,9 @@ function buildMergedInboundPrepared({
   const quotedContexts = mergedMessages.flatMap((message) => normalizeQuotedContexts(message.quotedContexts));
   const attachments = mergedMessages.flatMap((message) => Array.isArray(message.attachments) ? message.attachments : []);
   const attachmentFailures = mergedMessages.flatMap((message) => Array.isArray(message.attachmentFailures) ? message.attachmentFailures : []);
+  const sourceMessageIds = normalizeSourceMessageIds(
+    mergedMessages.flatMap((message) => message?.sourceMessageIds || [])
+  );
   const originalText = originalTexts.join("\n\n");
 
   return {
@@ -41,6 +45,7 @@ function buildMergedInboundPrepared({
     quotedContexts,
     attachments,
     attachmentFailures,
+    sourceMessageIds,
   };
 }
 
@@ -58,6 +63,16 @@ function assembleRuntimeTurnText({ prepared, config = {}, visionContext = {}, me
 
   if (originalText) {
     lines.push(originalText);
+  }
+
+  const hasCurrentAttachmentReference = imageAttachments.length > 0
+    || quotedContexts.length > 0
+    || attachments.some((item) => normalizeText(item?.origin).toLowerCase() === "quoted");
+  if (originalText && hasCurrentAttachmentReference) {
+    pushSectionBreak(lines);
+    lines.push("Current-turn attachment/reference boundary:");
+    lines.push("- The explicit text in this turn refers to the image, attachment, or quoted material included in this same turn.");
+    lines.push("- Prioritize explaining or analyzing this turn's attached/referenced material. Do not continue an older task unless the current text explicitly asks you to do so.");
   }
 
   if (isDirectMergedForwardText(originalText)) {
@@ -296,6 +311,7 @@ function clonePreparedInboundMessage(prepared) {
     senderId: prepared.senderId,
     chatId: prepared.chatId,
     messageId: prepared.messageId,
+    sourceMessageIds: normalizeSourceMessageIds(prepared.sourceMessageIds),
     contextToken: prepared.contextToken,
     provider: prepared.provider,
     originalText: prepared.originalText,
@@ -313,6 +329,34 @@ function clonePreparedInboundMessage(prepared) {
     acknowledgementStatus: prepared.acknowledgementStatus,
     acknowledgementAt: prepared.acknowledgementAt,
     sharedHandoffScopeKey: prepared.sharedHandoffScopeKey,
+    deliveryPolicy: normalizeText(prepared.deliveryPolicy),
+    suppressAcknowledgement: prepared.suppressAcknowledgement === true,
+    modelCanaryExecutionPolicy: normalizeText(prepared.modelCanaryExecutionPolicy),
+    modelCanaryRunId: normalizeText(prepared.modelCanaryRunId),
+    modelCanaryNonce: normalizeText(prepared.modelCanaryNonce),
+    modelCanaryObligationFingerprint: normalizeText(prepared.modelCanaryObligationFingerprint),
+    replyUserId: normalizeText(prepared.replyUserId),
+    replyWeflowContact: normalizeText(prepared.replyWeflowContact),
+    replyWeflowTalker: normalizeText(prepared.replyWeflowTalker),
+    replyWeflowExactContact: prepared.replyWeflowExactContact === true,
+    replyMessageKind: normalizeText(prepared.replyMessageKind),
+    replyIdempotencyKey: normalizeText(prepared.replyIdempotencyKey),
+    replyCanonicalText: normalizeText(prepared.replyCanonicalText),
+    replyDesktopInputLease: normalizeDesktopInputLease(prepared.replyDesktopInputLease),
+  };
+}
+
+function normalizeDesktopInputLease(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    version: Number(raw.version),
+    mode: normalizeText(raw.mode),
+    runId: normalizeText(raw.runId).toLowerCase(),
+    nonce: normalizeText(raw.nonce).toLowerCase(),
+    targetFingerprint: normalizeText(raw.targetFingerprint).toLowerCase(),
+    replyIdempotencyKey: normalizeText(raw.replyIdempotencyKey),
+    expiresAt: normalizeText(raw.expiresAt),
+    token: normalizeText(raw.token).toLowerCase(),
   };
 }
 
@@ -446,6 +490,19 @@ function collapsePromptText(value, maxLength) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeSourceMessageIds(value) {
+  const seen = new Set();
+  const normalized = [];
+  for (const item of Array.isArray(value) ? value : [value]) {
+    const id = normalizeText(item);
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      normalized.push(id);
+    }
+  }
+  return normalized;
 }
 
 function formatWechatLocalTime(receivedAt) {

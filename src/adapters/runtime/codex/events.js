@@ -90,6 +90,37 @@ function mapCodexMessageToRuntimeEvent(message) {
     };
   }
 
+  if (method === "item/started" && isToolLikeItem(params?.item)) {
+    return {
+      type: "runtime.tool.started",
+      payload: {
+        threadId,
+        turnId,
+        itemId: normalizeString(params?.item?.id),
+        toolType: normalizeString(params?.item?.type),
+      },
+    };
+  }
+
+  if (method === "item/completed" && normalizeItemType(params?.item?.type) === "imagegeneration") {
+    const status = normalizeString(params?.item?.status).toLowerCase();
+    const filePath = normalizeString(params?.item?.savedPath || params?.item?.saved_path);
+    if ((!status || status === "completed" || status === "success" || status === "succeeded") && filePath) {
+      return {
+        type: "runtime.media.completed",
+        payload: {
+          threadId,
+          turnId,
+          itemId: normalizeString(params?.item?.id),
+          kind: "image",
+          filePath,
+          mimeType: "image/png",
+          revisedPrompt: normalizeString(params?.item?.revisedPrompt || params?.item?.revised_prompt),
+        },
+      };
+    }
+  }
+
   if (isApprovalRequestMethod(method)) {
     return {
       type: "runtime.approval.requested",
@@ -323,6 +354,22 @@ function normalizeMessagePhase(value) {
   return normalized === "commentary" || normalized === "final_answer"
     ? normalized
     : "";
+}
+
+function normalizeItemType(value) {
+  return normalizeString(value).toLowerCase().replace(/[_-]/g, "");
+}
+
+function isToolLikeItem(item) {
+  const itemType = normalizeItemType(item?.type);
+  if (!itemType) return false;
+  return !new Set([
+    "agentmessage",
+    "reasoning",
+    "usermessage",
+    "plan",
+    "contextcompaction",
+  ]).has(itemType);
 }
 
 function numberOrZero(value) {

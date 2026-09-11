@@ -215,6 +215,54 @@ test("quoted attachments retain their origin and reference through persistence",
   }
 });
 
+test("explicit text with current image or quoted material establishes a current-turn semantic boundary", () => {
+  const imagePrompt = assembleRuntimeTurnText({
+    prepared: {
+      originalText: "解释这张图片是什么意思",
+      text: "解释这张图片是什么意思",
+      quotedContexts: [],
+      attachments: [{
+        kind: "image",
+        contentType: "image/png",
+        isImage: true,
+        absolutePath: "D:/inbox/current.png",
+      }],
+      attachmentFailures: [],
+    },
+  });
+  const quotedPrompt = assembleRuntimeTurnText({
+    prepared: {
+      originalText: "解释这里的内容",
+      text: "解释这里的内容",
+      quotedContexts: [{
+        kind: "image",
+        title: "当前引用图片",
+        text: "",
+        url: "",
+        attachmentRefs: ["quoted:current:0"],
+      }],
+      attachments: [],
+      attachmentFailures: [],
+    },
+  });
+  const textOnlyPrompt = assembleRuntimeTurnText({
+    prepared: {
+      originalText: "继续上一条任务",
+      text: "继续上一条任务",
+      quotedContexts: [],
+      attachments: [],
+      attachmentFailures: [],
+    },
+  });
+
+  for (const prompt of [imagePrompt, quotedPrompt]) {
+    assert.match(prompt, /Current-turn attachment\/reference boundary:/);
+    assert.match(prompt, /refers to the image, attachment, or quoted material included in this same turn/);
+    assert.match(prompt, /Do not continue an older task unless the current text explicitly asks/);
+  }
+  assert.doesNotMatch(textOnlyPrompt, /Current-turn attachment\/reference boundary:/);
+});
+
 test("merged inbound messages preserve ordered quote contexts", () => {
   const merged = buildMergedInboundPrepared({
     bindingKey: "binding-1",
@@ -481,7 +529,7 @@ test("tool image-capable runtimes keep local image paths without caption fallbac
   }
 });
 
-test("shared-content-only inbound turns enter the one-minute prompt queue", async () => {
+test("shared-content-only inbound turns enter the 15-second inactivity queue", async () => {
   const queued = [];
   let routed = 0;
   await CyberbossApp.prototype.handlePreparedMessage.call({
@@ -544,7 +592,7 @@ test("shared-content-only inbound turns enter the one-minute prompt queue", asyn
   assert.equal(routed, 0);
 });
 
-test("shared content becomes implicit quoted context when a prompt follows within 59 seconds", async () => {
+test("shared content becomes implicit quoted context when a prompt follows within 15 seconds", async () => {
   const scopeKey = "binding-1::/workspace::chat-1";
   let routed = null;
   const app = {
@@ -621,7 +669,7 @@ test("shared content becomes implicit quoted context when a prompt follows withi
       attachmentFailures: [],
       sharedContent: false,
       explicitPrompt: true,
-      receivedAt: "2026-04-30T10:01:00.000Z",
+      receivedAt: "2026-04-30T10:00:10.000Z",
     },
   });
 
@@ -699,7 +747,7 @@ test("implicit referenced content enters the ordinary pending buffer as one turn
       attachments: [],
       attachmentFailures: [],
       explicitPrompt: true,
-      receivedAt: "2026-04-30T10:00:30.000Z",
+      receivedAt: "2026-04-30T10:00:10.000Z",
     },
   });
 
@@ -752,19 +800,38 @@ test("all shared content kinds are rendered as ordered implicit references", () 
   assert.equal(prepared.attachments.length, 4);
 });
 
-test("shared content timeout clears silently and logical chats remain isolated", async () => {
+test("shared content inactivity promotes the message and logical chats remain isolated", async () => {
   const scopeKey = "binding-1::/workspace::chat-a";
+  let routed = null;
   const app = {
+    config: { pendingInboundQuietWindowMs: 10 },
+    pendingInboundByScope: new Map(),
     pendingSharedContentInboundByScope: new Map([[scopeKey, {
       bindingKey: "binding-1",
       workspaceRoot: "/workspace",
       chatId: "chat-a",
-      messages: [{ contentKind: "image" }],
+      messages: [{
+        workspaceId: "default",
+        accountId: "account-1",
+        senderId: "user-1",
+        provider: "weflow-uia",
+        chatId: "chat-a",
+        messageId: "weflow:shared-timeout",
+        contentKind: "image",
+        attachments: [{ kind: "image", absolutePath: "/tmp/shared-timeout.png" }],
+        receivedAt: new Date(Date.now() - 100).toISOString(),
+      }],
       timer: null,
-      lastContentAtMs: Date.now(),
+      lastContentAtMs: Date.now() - 100,
     }]]),
     clearPendingSharedContentInboundTimer: CyberbossApp.prototype.clearPendingSharedContentInboundTimer,
     dropPendingSharedContentInboundByScopeKey: CyberbossApp.prototype.dropPendingSharedContentInboundByScopeKey,
+    commitPendingSharedContentConsumption: CyberbossApp.prototype.commitPendingSharedContentConsumption,
+    promotePendingSharedContentInbound: CyberbossApp.prototype.promotePendingSharedContentInbound,
+    schedulePendingSharedContentInboundExpiry: CyberbossApp.prototype.schedulePendingSharedContentInboundExpiry,
+    async routePreparedInbound({ prepared }) {
+      routed = prepared;
+    },
   };
 
   assert.equal(CyberbossApp.prototype.hasPendingSharedContentInbound.call(
@@ -776,10 +843,11 @@ test("shared content timeout clears silently and logical chats remain isolated",
 
   CyberbossApp.prototype.schedulePendingSharedContentInboundExpiry.call(app, scopeKey, 0);
   await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(routed.attachments[0].absolutePath, "/tmp/shared-timeout.png");
   assert.equal(app.pendingSharedContentInboundByScope.size, 0);
 });
 
-test("a prompt after 60 seconds is routed normally without the expired implicit reference", async () => {
+test("a prompt after 15 seconds is routed normally without the expired implicit reference", async () => {
   const scopeKey = "binding-1::/workspace::chat-1";
   let routed = null;
   const preparedPrompt = {
@@ -795,7 +863,7 @@ test("a prompt after 60 seconds is routed normally without the expired implicit 
     attachments: [],
     attachmentFailures: [],
     explicitPrompt: true,
-    receivedAt: "2026-04-30T10:01:01.000Z",
+    receivedAt: "2026-04-30T10:00:16.000Z",
   };
   const app = {
     pendingSharedContentInboundByScope: new Map([[scopeKey, {
@@ -830,7 +898,7 @@ test("a prompt after 60 seconds is routed normally without the expired implicit 
   assert.equal(app.pendingSharedContentInboundByScope.size, 0);
 });
 
-test("an explicit quote takes priority and clears pending implicit content", async () => {
+test("an explicit quote joins pending shared content instead of discarding the earlier message", async () => {
   const scopeKey = "binding-1::/workspace::chat-1";
   let routed = null;
   const explicitPrompt = {
@@ -852,14 +920,19 @@ test("an explicit quote takes priority and clears pending implicit content", asy
     attachments: [],
     attachmentFailures: [],
     explicitPrompt: true,
-    receivedAt: "2026-04-30T10:00:30.000Z",
+    receivedAt: "2026-04-30T10:00:10.000Z",
   };
   const app = {
     pendingSharedContentInboundByScope: new Map([[scopeKey, {
       bindingKey: "binding-1",
       workspaceRoot: "/workspace",
       chatId: "chat-1",
-      messages: [{ contentKind: "image" }],
+      messages: [{
+        messageId: "weflow:pending-image",
+        contentKind: "image",
+        attachments: [{ kind: "image", absolutePath: "/tmp/pending-image.png" }],
+        receivedAt: "2026-04-30T10:00:00.000Z",
+      }],
       timer: null,
       lastContentAtMs: Date.parse("2026-04-30T10:00:00.000Z"),
     }]]),
@@ -872,8 +945,9 @@ test("an explicit quote takes priority and clears pending implicit content", asy
     resolveWorkspaceRoot() { return "/workspace"; },
     async prepareIncomingMessageForRuntime() { return explicitPrompt; },
     hasPendingSharedContentInbound: CyberbossApp.prototype.hasPendingSharedContentInbound,
-    dropPendingSharedContentInbound: CyberbossApp.prototype.dropPendingSharedContentInbound,
-    dropPendingSharedContentInboundByScopeKey: CyberbossApp.prototype.dropPendingSharedContentInboundByScopeKey,
+    consumePendingSharedContentInbound: CyberbossApp.prototype.consumePendingSharedContentInbound,
+    commitPendingSharedContentConsumption: CyberbossApp.prototype.commitPendingSharedContentConsumption,
+    schedulePendingSharedContentInboundExpiry() {},
     clearPendingSharedContentInboundTimer: CyberbossApp.prototype.clearPendingSharedContentInboundTimer,
     async routePreparedInbound({ prepared }) {
       routed = prepared;
@@ -883,8 +957,10 @@ test("an explicit quote takes priority and clears pending implicit content", asy
 
   await CyberbossApp.prototype.handlePreparedMessage.call(app, explicitPrompt, { allowCommands: false });
 
-  assert.equal(routed.quotedContexts.length, 1);
-  assert.equal(routed.quotedContexts[0].url, "https://example.com/explicit");
+  assert.equal(routed.quotedContexts.length, 2);
+  assert.equal(routed.quotedContexts[0].kind, "image");
+  assert.equal(routed.quotedContexts[1].url, "https://example.com/explicit");
+  assert.equal(routed.attachments[0].absolutePath, "/tmp/pending-image.png");
   assert.equal(app.pendingSharedContentInboundByScope.size, 0);
 });
 

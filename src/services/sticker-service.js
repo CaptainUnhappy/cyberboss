@@ -407,7 +407,9 @@ async function normalizeStickerGif({ inputPath, outputPath, scriptPath }) {
       "--input", path.resolve(inputPath),
       "--output", path.resolve(outputPath),
       "--size", "240",
-    ]);
+    ], {
+      windowsHide: true,
+    });
   } catch (error) {
     const stderr = normalizeText(error?.stderr);
     const stdout = normalizeText(error?.stdout);

@@ -1,10 +1,14 @@
 const { spawn } = require("child_process");
+const fs = require("fs");
 const os = require("os");
+const path = require("path");
 const WebSocket = require("ws");
 const { buildCodexMcpConfigArgs } = require("./mcp-config");
 
 const IS_WINDOWS = os.platform() === "win32";
 const DEFAULT_CODEX_COMMAND = "codex";
+const MODEL_CANARY_EXECUTION_POLICY = "model_canary_deny_side_effects";
+const ISOLATED_PROFILE_PREFIX = "cyberboss-model-canary-codex-";
 const WINDOWS_EXECUTABLE_SUFFIX_RE = /\.(cmd|exe|bat)$/i;
 const CODEX_CLIENT_INFO = {
   name: "cyberboss_agent",
@@ -13,12 +17,23 @@ const CODEX_CLIENT_INFO = {
 };
 
 class CodexRpcClient {
-  constructor({ endpoint = "", env = process.env, codexCommand = "", extraWritableRoots = [], mcpServerConfig = null }) {
+  constructor({
+    endpoint = "",
+    env = process.env,
+    codexCommand = "",
+    extraWritableRoots = [],
+    mcpServerConfig = null,
+    isolatedProfile = false,
+  }) {
     this.endpoint = endpoint;
     this.env = env;
     this.codexCommand = codexCommand || resolveDefaultCodexCommand(env);
     this.extraWritableRoots = normalizeWritableRoots(extraWritableRoots);
     this.mcpServerConfig = mcpServerConfig;
+    this.isolatedProfile = isolatedProfile === true;
+    this.isolatedProfileRoot = "";
+    this.isolatedCodexHome = "";
+    this.isolatedWorkspaceRoot = "";
     this.mode = endpoint ? "websocket" : "spawn";
     this.socket = null;
     this.child = null;
@@ -48,14 +63,18 @@ class CodexRpcClient {
 
   async connectSpawn() {
     const commandCandidates = buildCodexCommandCandidates(this.codexCommand);
+    const spawnEnv = this.isolatedProfile ? this.ensureIsolatedProfileEnvironment() : { ...this.env };
     let child = null;
     let lastError = null;
 
     for (const command of commandCandidates) {
       try {
-        const spawnSpec = buildSpawnSpec(command, this.mcpServerConfig);
+        const spawnSpec = buildSpawnSpec(command, this.mcpServerConfig, {
+          isolatedProfile: this.isolatedProfile,
+        });
         child = spawn(spawnSpec.command, spawnSpec.args, {
-          env: { ...this.env },
+          env: spawnEnv,
+          ...(this.isolatedProfile ? { cwd: this.isolatedWorkspaceRoot } : {}),
           stdio: ["pipe", "pipe", "pipe"],
           shell: false,
           windowsHide: true,
@@ -64,20 +83,28 @@ class CodexRpcClient {
       } catch (error) {
         lastError = error;
         if (error?.code !== "ENOENT" && error?.code !== "EINVAL") {
+          this.cleanupIsolatedProfile();
           throw error;
         }
       }
     }
 
     if (!child) {
+      this.cleanupIsolatedProfile();
       const attempted = commandCandidates.join(", ");
       const detail = lastError?.message ? `: ${lastError.message}` : "";
       throw new Error(`Unable to spawn Codex app-server. Tried ${attempted}${detail}.`);
     }
 
     this.child = child;
-    child.on("error", () => {
+    child.on("error", (error) => {
       this.isReady = false;
+      if (this.child === child) {
+        this.child = null;
+      }
+      this.rejectPending(error instanceof Error
+        ? error
+        : new Error("Codex app-server process failed"));
     });
     child.stdout.on("data", (chunk) => {
       this.stdoutBuffer += chunk.toString("utf8");
@@ -92,7 +119,60 @@ class CodexRpcClient {
     });
     child.on("close", () => {
       this.isReady = false;
+      if (this.child === child) {
+        this.child = null;
+      }
+      this.rejectPending(new Error("Codex app-server process closed"));
+      if (this.isolatedProfile) {
+        this.cleanupIsolatedProfile();
+      }
     });
+  }
+
+  ensureIsolatedProfileEnvironment() {
+    if (!this.isolatedProfileRoot) {
+      cleanupStaleIsolatedProfiles();
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), `${ISOLATED_PROFILE_PREFIX}${process.pid}-`));
+      const codexHome = path.join(root, "codex-home");
+      const workspaceRoot = path.join(root, "workspace");
+      try {
+        fs.mkdirSync(codexHome, { recursive: false });
+        fs.mkdirSync(workspaceRoot, { recursive: false });
+        const sourceCodexHome = normalizeNonEmptyString(this.env?.CODEX_HOME)
+          || path.join(os.homedir(), ".codex");
+        const sourceAuth = path.join(sourceCodexHome, "auth.json");
+        if (!fs.existsSync(sourceAuth)) {
+          throw new Error("isolated Codex model canary profile has no auth.json source");
+        }
+        // A same-volume hardlink keeps the original file ACL/content and avoids
+        // creating a second long-lived credential copy. If the link cannot be
+        // created, the probe fails closed instead of weakening isolation.
+        fs.linkSync(sourceAuth, path.join(codexHome, "auth.json"));
+        fs.writeFileSync(path.join(codexHome, "config.toml"), [
+          'web_search = "disabled"',
+          "",
+          "[features]",
+          "js_repl = false",
+          "",
+        ].join("\n"), "utf8");
+      } catch (error) {
+        try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
+        throw new Error(`isolated Codex model canary profile setup failed: ${error.message}`);
+      }
+      this.isolatedProfileRoot = root;
+      this.isolatedCodexHome = codexHome;
+      this.isolatedWorkspaceRoot = workspaceRoot;
+    }
+    return {
+      ...this.env,
+      CODEX_HOME: this.isolatedCodexHome,
+    };
+  }
+
+  getIsolatedWorkspaceRoot() {
+    if (!this.isolatedProfile) return "";
+    this.ensureIsolatedProfileEnvironment();
+    return this.isolatedWorkspaceRoot;
   }
 
   async connectWebSocket() {
@@ -142,7 +222,17 @@ class CodexRpcClient {
     this.isReady = true;
   }
 
-  async sendUserMessage({ threadId, text, attachments = [], model = null, modelProvider = null, effort = null, accessMode = null, workspaceRoot = "" }) {
+  async sendUserMessage({
+    threadId,
+    text,
+    attachments = [],
+    model = null,
+    modelProvider = null,
+    effort = null,
+    accessMode = null,
+    workspaceRoot = "",
+    executionPolicy = "",
+  }) {
     const input = buildTurnInputPayload({ text, attachments });
     return threadId
       ? this.sendRequest("turn/start", buildTurnStartParams({
@@ -153,13 +243,20 @@ class CodexRpcClient {
         effort,
         accessMode,
         workspaceRoot,
+        executionPolicy,
         extraWritableRoots: this.extraWritableRoots,
       }))
       : this.sendRequest("thread/start", { input });
   }
 
-  async startThread({ cwd, model = "", modelProvider = "" }) {
-    return this.sendRequest("thread/start", buildStartThreadParams({ cwd, model, modelProvider }));
+  async startThread({ cwd, model = "", modelProvider = "", dynamicTools, environments }) {
+    return this.sendRequest("thread/start", buildStartThreadParams({
+      cwd,
+      model,
+      modelProvider,
+      dynamicTools,
+      environments,
+    }));
   }
 
   async resumeThread({ threadId, model = "", modelProvider = "" }) {
@@ -195,6 +292,30 @@ class CodexRpcClient {
     }));
   }
 
+  async readThread({ threadId, includeTurns = true } = {}) {
+    const normalizedThreadId = normalizeNonEmptyString(threadId);
+    if (!normalizedThreadId) {
+      throw new Error("thread/read requires a non-empty threadId");
+    }
+    return this.sendRequest("thread/read", {
+      threadId: normalizedThreadId,
+      includeTurns: includeTurns !== false,
+    });
+  }
+
+  async listThreadItems({ threadId, turnId, sortDirection = "asc" } = {}) {
+    const normalizedThreadId = normalizeNonEmptyString(threadId);
+    const normalizedTurnId = normalizeNonEmptyString(turnId);
+    if (!normalizedThreadId || !normalizedTurnId) {
+      throw new Error("thread/items/list requires threadId and turnId");
+    }
+    return this.sendRequest("thread/items/list", {
+      threadId: normalizedThreadId,
+      turnId: normalizedTurnId,
+      sortDirection: normalizeNonEmptyString(sortDirection) || "asc",
+    });
+  }
+
   async listModels() {
     return this.sendRequest("model/list", {});
   }
@@ -220,15 +341,43 @@ class CodexRpcClient {
       }
       this.socket = null;
     }
-    if (this.child) {
+    const child = this.child;
+    this.child = null;
+    if (child) {
+      const closed = waitForChildClose(child, 1_500);
       try {
-        this.child.kill();
+        child.kill();
       } catch {
         // best effort
       }
-      this.child = null;
+      await closed;
     }
     this.isReady = false;
+    this.rejectPending(new Error("Codex RPC client closed"));
+    this.cleanupIsolatedProfile();
+  }
+
+  rejectPending(error) {
+    const failure = error instanceof Error ? error : new Error(String(error || "Codex RPC transport closed"));
+    for (const { reject } of this.pending.values()) {
+      try { reject(failure); } catch {}
+    }
+    this.pending.clear();
+  }
+
+  cleanupIsolatedProfile() {
+    const root = normalizeNonEmptyString(this.isolatedProfileRoot);
+    this.isolatedProfileRoot = "";
+    this.isolatedCodexHome = "";
+    this.isolatedWorkspaceRoot = "";
+    if (!root) return;
+    const resolvedRoot = path.resolve(root);
+    const resolvedTemp = path.resolve(os.tmpdir());
+    if (path.dirname(resolvedRoot) !== resolvedTemp
+      || !path.basename(resolvedRoot).startsWith(ISOLATED_PROFILE_PREFIX)) {
+      return;
+    }
+    try { fs.rmSync(resolvedRoot, { recursive: true, force: true }); } catch {}
   }
 
   async sendRequest(method, params) {
@@ -313,8 +462,8 @@ function buildCodexCommandCandidates(configuredCommand) {
   return [DEFAULT_CODEX_COMMAND];
 }
 
-function buildSpawnSpec(command, mcpServerConfig = null) {
-  const configArgs = buildCodexConfigArgs(mcpServerConfig);
+function buildSpawnSpec(command, mcpServerConfig = null, options = {}) {
+  const configArgs = buildCodexConfigArgs(mcpServerConfig, options);
   if (IS_WINDOWS) {
     return {
       command: "cmd.exe",
@@ -327,7 +476,15 @@ function buildSpawnSpec(command, mcpServerConfig = null) {
   };
 }
 
-function buildCodexConfigArgs(mcpServerConfig) {
+function buildCodexConfigArgs(mcpServerConfig, { isolatedProfile = false } = {}) {
+  if (isolatedProfile === true) {
+    return [
+      "-c", 'web_search="disabled"',
+      "-c", "features.js_repl=false",
+      "-c", "mcp_servers={}",
+      "-c", "plugins={}",
+    ];
+  }
   return buildCodexMcpConfigArgs(mcpServerConfig);
 }
 
@@ -335,7 +492,35 @@ function normalizeNonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 
-function buildStartThreadParams({ cwd, model, modelProvider }) {
+function cleanupStaleIsolatedProfiles() {
+  const tempRoot = path.resolve(os.tmpdir());
+  let entries;
+  try {
+    entries = fs.readdirSync(tempRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(ISOLATED_PROFILE_PREFIX)) continue;
+    const match = entry.name.match(/^cyberboss-model-canary-codex-(\d+)-/);
+    if (!match || isProcessAlive(Number(match[1]))) continue;
+    const candidate = path.resolve(tempRoot, entry.name);
+    if (path.dirname(candidate) !== tempRoot || path.basename(candidate) !== entry.name) continue;
+    try { fs.rmSync(candidate, { recursive: true, force: true }); } catch {}
+  }
+}
+
+function isProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function buildStartThreadParams({ cwd, model, modelProvider, dynamicTools, environments }) {
   const params = {};
   const normalizedCwd = normalizeNonEmptyString(cwd);
   const normalizedModel = normalizeNonEmptyString(model);
@@ -348,6 +533,12 @@ function buildStartThreadParams({ cwd, model, modelProvider }) {
   }
   if (normalizedModelProvider) {
     params.modelProvider = normalizedModelProvider;
+  }
+  if (Array.isArray(dynamicTools)) {
+    params.dynamicTools = dynamicTools;
+  }
+  if (Array.isArray(environments)) {
+    params.environments = environments;
   }
   return params;
 }
@@ -382,14 +573,30 @@ function buildTurnInputPayload({ text, attachments = [] }) {
   return input;
 }
 
-function buildTurnStartParams({ threadId, input, model, modelProvider, effort, accessMode, workspaceRoot, extraWritableRoots = [] }) {
+function buildTurnStartParams({
+  threadId,
+  input,
+  model,
+  modelProvider,
+  effort,
+  accessMode,
+  workspaceRoot,
+  executionPolicy = "",
+  extraWritableRoots = [],
+}) {
   const params = { threadId, input };
   const normalizedWorkspaceRoot = normalizeNonEmptyString(workspaceRoot);
   const normalizedModel = normalizeNonEmptyString(model);
   const normalizedModelProvider = normalizeNonEmptyString(modelProvider);
   const normalizedEffort = normalizeNonEmptyString(effort);
-  const normalizedAccessMode = normalizeAccessMode(accessMode);
-  const executionPolicies = buildExecutionPolicies(normalizedAccessMode, workspaceRoot, extraWritableRoots);
+  const isolatedModelCanary = normalizeNonEmptyString(executionPolicy) === MODEL_CANARY_EXECUTION_POLICY;
+  const normalizedAccessMode = isolatedModelCanary ? "" : normalizeAccessMode(accessMode);
+  const executionPolicies = isolatedModelCanary
+    ? {
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+    }
+    : buildExecutionPolicies(normalizedAccessMode, workspaceRoot, extraWritableRoots);
   if (normalizedWorkspaceRoot) {
     params.cwd = normalizedWorkspaceRoot;
   }
@@ -407,6 +614,9 @@ function buildTurnStartParams({ threadId, input, model, modelProvider, effort, a
   }
   params.approvalPolicy = executionPolicies.approvalPolicy;
   params.sandboxPolicy = executionPolicies.sandboxPolicy;
+  if (isolatedModelCanary) {
+    params.environments = [];
+  }
   return params;
 }
 
@@ -486,4 +696,31 @@ function waitForSocketOpen(socket) {
   });
 }
 
-module.exports = { CodexRpcClient };
+function waitForChildClose(child, timeoutMs) {
+  if (!child || child.exitCode != null || child.signalCode != null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off?.("close", finish);
+      child.off?.("error", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, Math.max(0, Number(timeoutMs) || 0));
+    child.once?.("close", finish);
+    child.once?.("error", finish);
+  });
+}
+
+module.exports = {
+  CodexRpcClient,
+  MODEL_CANARY_EXECUTION_POLICY,
+  buildCodexConfigArgs,
+  buildStartThreadParams,
+  buildTurnStartParams,
+  cleanupStaleIsolatedProfiles,
+};

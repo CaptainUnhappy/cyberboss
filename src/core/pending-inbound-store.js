@@ -2,10 +2,11 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
-const STORE_VERSION = 5;
+const STORE_VERSION = 6;
 const DEFAULT_MAX_MESSAGES = 2_000;
 const DEFAULT_COMPLETED_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const DEFAULT_MAX_COMPLETED = 4_000;
+const DEFAULT_QUIET_WINDOW_MS = 15_000;
 const DISPATCH_RETRY_BASE_MS = 15_000;
 const DISPATCH_RETRY_MAX_MS = 15 * 60_000;
 const ACKNOWLEDGEMENT_STATUSES = new Set(["", "sending", "sent", "failed"]);
@@ -16,6 +17,7 @@ class PendingInboundStore {
     maxMessages = DEFAULT_MAX_MESSAGES,
     completedRetentionMs = DEFAULT_COMPLETED_RETENTION_MS,
     maxCompleted = DEFAULT_MAX_COMPLETED,
+    quietWindowMs = DEFAULT_QUIET_WINDOW_MS,
     now = () => Date.now(),
   } = {}) {
     if (typeof filePath !== "string" || !filePath.trim()) {
@@ -25,6 +27,7 @@ class PendingInboundStore {
     this.maxMessages = normalizePositiveInteger(maxMessages, DEFAULT_MAX_MESSAGES);
     this.completedRetentionMs = normalizePositiveInteger(completedRetentionMs, DEFAULT_COMPLETED_RETENTION_MS);
     this.maxCompleted = normalizePositiveInteger(maxCompleted, DEFAULT_MAX_COMPLETED);
+    this.quietWindowMs = normalizeWindowMs(quietWindowMs, DEFAULT_QUIET_WINDOW_MS);
     this.now = typeof now === "function" ? now : () => Date.now();
     this.state = emptyState();
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
@@ -115,8 +118,9 @@ class PendingInboundStore {
 
   enqueue({ bindingKey, workspaceRoot, message } = {}) {
     this.load();
+    const nowMs = this.currentTimeMs();
     const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
-    const normalizedMessage = normalizeMessage(message, { scopeKey, nowMs: this.currentTimeMs() });
+    const normalizedMessage = normalizeMessage(message, { scopeKey, nowMs });
     if (!scopeKey || !normalizedMessage) {
       throw new Error("invalid pending inbound message");
     }
@@ -130,6 +134,12 @@ class PendingInboundStore {
         dispatchAttemptCount: 0,
         nextDispatchAt: "",
         lastDispatchError: "",
+        lastActivityAt: "",
+        quietUntil: "",
+        generation: 0,
+        acknowledgementStatus: "",
+        acknowledgementAt: "",
+        acknowledgementPendingId: "",
       };
       this.state.scopes.push(scope);
     }
@@ -148,6 +158,10 @@ class PendingInboundStore {
     }
     scope.messages.push(normalizedMessage);
     scope.messages.sort(compareMessages);
+    applyQuietWindow(scope, {
+      activityAtMs: resolveActivityAtMs(normalizedMessage.receivedAt, nowMs),
+      quietWindowMs: this.quietWindowMs,
+    });
     this.state.scopes.sort(compareScopes);
     this.save();
     return { added: true, scopeKey, message: cloneMessage(normalizedMessage), draft: cloneScope(scope) };
@@ -192,6 +206,105 @@ class PendingInboundStore {
     this.state.sharedScopes.sort(compareScopes);
     this.save();
     return { added: true, scopeKey, message: cloneMessage(normalizedMessage), draft: cloneScope(scope) };
+  }
+
+  promoteSharedContent(scopeKey, { message, consumedIds = [] } = {}) {
+    this.load();
+    const nowMs = this.currentTimeMs();
+    const normalizedSharedScopeKey = normalizeText(scopeKey);
+    const sharedIndex = this.state.sharedScopes.findIndex(
+      (item) => item.scopeKey === normalizedSharedScopeKey
+    );
+    if (sharedIndex < 0) {
+      return {
+        added: false,
+        completed: false,
+        scopeKey: "",
+        message: null,
+        draft: null,
+        sharedDraft: null,
+      };
+    }
+    const sharedScope = this.state.sharedScopes[sharedIndex];
+    const ordinaryScopeKey = buildScopeKey(sharedScope.bindingKey, sharedScope.workspaceRoot);
+    const normalizedMessage = normalizeMessage(message, { scopeKey: ordinaryScopeKey, nowMs });
+    if (!ordinaryScopeKey || !normalizedMessage) {
+      throw new Error("invalid promoted shared-content message");
+    }
+    const consumed = new Set(
+      (Array.isArray(consumedIds) ? consumedIds : [consumedIds]).map(normalizeText).filter(Boolean)
+    );
+    const actuallyConsumed = sharedScope.messages.filter((item) => consumed.has(item.pendingId));
+    if (!actuallyConsumed.length) {
+      return {
+        added: false,
+        completed: false,
+        scopeKey: ordinaryScopeKey,
+        message: cloneMessage(normalizedMessage),
+        draft: null,
+        sharedDraft: cloneScope(sharedScope),
+      };
+    }
+
+    let ordinaryScope = this.state.scopes.find((item) => item.scopeKey === ordinaryScopeKey);
+    const existing = ordinaryScope?.messages.find(
+      (item) => item.pendingId === normalizedMessage.pendingId
+    ) || null;
+    const completed = this.state.completed.some((item) => (
+      item.scopeKey === ordinaryScopeKey && item.pendingId === normalizedMessage.pendingId
+    ));
+    let added = false;
+    if (!existing && !completed) {
+      const countAfterRemoval = countMessages(this.state.scopes)
+        + countMessages(this.state.sharedScopes)
+        - actuallyConsumed.length;
+      if (countAfterRemoval >= this.maxMessages) {
+        throw new Error(`pending inbound queue limit reached (${this.maxMessages})`);
+      }
+      if (!ordinaryScope) {
+        ordinaryScope = {
+          scopeKey: ordinaryScopeKey,
+          bindingKey: sharedScope.bindingKey,
+          workspaceRoot: sharedScope.workspaceRoot,
+          messages: [],
+          dispatchAttemptCount: 0,
+          nextDispatchAt: "",
+          lastDispatchError: "",
+          lastActivityAt: "",
+          quietUntil: "",
+          generation: 0,
+          acknowledgementStatus: "",
+          acknowledgementAt: "",
+          acknowledgementPendingId: "",
+        };
+        this.state.scopes.push(ordinaryScope);
+      }
+      ordinaryScope.messages.push(normalizedMessage);
+      ordinaryScope.messages.sort(compareMessages);
+      applyQuietWindow(ordinaryScope, {
+        activityAtMs: resolveActivityAtMs(normalizedMessage.receivedAt, nowMs),
+        quietWindowMs: this.quietWindowMs,
+      });
+      added = true;
+    }
+
+    sharedScope.messages = sharedScope.messages.filter((item) => !consumed.has(item.pendingId));
+    let sharedDraft = null;
+    if (!sharedScope.messages.length) {
+      this.state.sharedScopes.splice(sharedIndex, 1);
+    } else {
+      sharedDraft = cloneScope(sharedScope);
+    }
+    this.state.scopes.sort(compareScopes);
+    this.save();
+    return {
+      added,
+      completed,
+      scopeKey: ordinaryScopeKey,
+      message: cloneMessage(existing || normalizedMessage),
+      draft: ordinaryScope ? cloneScope(ordinaryScope) : null,
+      sharedDraft,
+    };
   }
 
   removeSharedScope(scopeKey) {
@@ -268,26 +381,136 @@ class PendingInboundStore {
 
   claimAcknowledgement(scopeKey, pendingId) {
     this.load();
-    const message = this.findMessage(scopeKey, pendingId);
-    if (!message || message.acknowledgementStatus) {
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const scope = this.state.scopes.find((item) => item.scopeKey === normalizedScopeKey);
+    const normalizedPendingId = normalizeText(pendingId);
+    const message = scope?.messages.find((item) => item.pendingId === normalizedPendingId);
+    if (!scope || !message || scope.acknowledgementStatus) {
       return false;
     }
+    scope.acknowledgementStatus = "sending";
+    scope.acknowledgementAt = new Date(this.currentTimeMs()).toISOString();
+    scope.acknowledgementPendingId = message.pendingId;
     message.acknowledgementStatus = "sending";
-    message.acknowledgementAt = new Date(this.currentTimeMs()).toISOString();
+    message.acknowledgementAt = scope.acknowledgementAt;
     this.save();
     return true;
   }
 
   completeAcknowledgement(scopeKey, pendingId, { success = false } = {}) {
     this.load();
-    const message = this.findMessage(scopeKey, pendingId);
-    if (!message) {
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const scope = this.state.scopes.find((item) => item.scopeKey === normalizedScopeKey);
+    const normalizedPendingId = normalizeText(pendingId);
+    const message = scope?.messages.find((item) => item.pendingId === normalizedPendingId);
+    if (!scope || !message || (scope.acknowledgementPendingId && scope.acknowledgementPendingId !== normalizedPendingId)) {
       return null;
     }
-    message.acknowledgementStatus = success ? "sent" : "failed";
-    message.acknowledgementAt = new Date(this.currentTimeMs()).toISOString();
+    scope.acknowledgementStatus = success ? "sent" : "failed";
+    scope.acknowledgementAt = new Date(this.currentTimeMs()).toISOString();
+    scope.acknowledgementPendingId = message.pendingId;
+    message.acknowledgementStatus = scope.acknowledgementStatus;
+    message.acknowledgementAt = scope.acknowledgementAt;
     this.save();
     return cloneMessage(message);
+  }
+
+  recordActivity(scopeKey, {
+    receivedAt = "",
+    activityAtMs = 0,
+    matchingMessageIds = [],
+  } = {}) {
+    this.load();
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const index = this.state.scopes.findIndex((item) => item.scopeKey === normalizedScopeKey);
+    if (index < 0) {
+      return { found: false, removedPendingIds: [], draft: null };
+    }
+
+    const scope = this.state.scopes[index];
+    const matchingIds = new Set(
+      (Array.isArray(matchingMessageIds) ? matchingMessageIds : [matchingMessageIds])
+        .map(normalizeText)
+        .filter(Boolean)
+    );
+    const removedPendingIds = [];
+    if (matchingIds.size) {
+      scope.messages = scope.messages.filter((message) => {
+        const ids = [
+          normalizeText(message.pendingId),
+          normalizeText(message.messageId),
+          ...normalizeSourceMessageIds(message.sourceMessageIds),
+        ];
+        const matches = ids.some((id) => id && matchingIds.has(id));
+        if (matches) removedPendingIds.push(message.pendingId);
+        return !matches;
+      });
+    }
+
+    if (!scope.messages.length) {
+      this.state.scopes.splice(index, 1);
+      this.save();
+      return { found: true, removedPendingIds, draft: null };
+    }
+
+    const nowMs = this.currentTimeMs();
+    const explicitActivityAtMs = normalizeTimeMs(activityAtMs);
+    applyQuietWindow(scope, {
+      activityAtMs: explicitActivityAtMs
+        ? Math.min(nowMs, explicitActivityAtMs)
+        : resolveActivityAtMs(receivedAt, nowMs),
+      quietWindowMs: this.quietWindowMs,
+    });
+    this.save();
+    return { found: true, removedPendingIds, draft: cloneScope(scope) };
+  }
+
+  recordSharedActivity(scopeKey, {
+    receivedAt = "",
+    activityAtMs = 0,
+    matchingMessageIds = [],
+  } = {}) {
+    this.load();
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const index = this.state.sharedScopes.findIndex((item) => item.scopeKey === normalizedScopeKey);
+    if (index < 0) {
+      return { found: false, removedPendingIds: [], draft: null };
+    }
+
+    const scope = this.state.sharedScopes[index];
+    const matchingIds = new Set(
+      (Array.isArray(matchingMessageIds) ? matchingMessageIds : [matchingMessageIds])
+        .map(normalizeText)
+        .filter(Boolean)
+    );
+    const removedPendingIds = [];
+    if (matchingIds.size) {
+      scope.messages = scope.messages.filter((message) => {
+        const ids = [
+          normalizeText(message.pendingId),
+          normalizeText(message.messageId),
+          ...normalizeSourceMessageIds(message.sourceMessageIds),
+        ];
+        const matches = ids.some((id) => id && matchingIds.has(id));
+        if (matches) removedPendingIds.push(message.pendingId);
+        return !matches;
+      });
+    }
+
+    if (!scope.messages.length) {
+      this.state.sharedScopes.splice(index, 1);
+      this.save();
+      return { found: true, removedPendingIds, draft: null };
+    }
+
+    const nowMs = this.currentTimeMs();
+    const explicitActivityAtMs = normalizeTimeMs(activityAtMs);
+    const resolvedActivityAtMs = explicitActivityAtMs
+      ? Math.min(nowMs, explicitActivityAtMs)
+      : resolveActivityAtMs(receivedAt, nowMs);
+    scope.lastContentAtMs = Math.max(normalizeTimeMs(scope.lastContentAtMs), resolvedActivityAtMs);
+    this.save();
+    return { found: true, removedPendingIds, draft: cloneScope(scope) };
   }
 
   commitDispatch(scopeKey, consumedIds, { remainingMessages = [] } = {}) {
@@ -423,7 +646,38 @@ function normalizeScope(raw) {
     dispatchAttemptCount: normalizeNonNegativeInteger(raw.dispatchAttemptCount),
     nextDispatchAt: normalizeIsoTime(raw.nextDispatchAt),
     lastDispatchError: stringValue(raw.lastDispatchError).slice(0, 500),
+    lastActivityAt: normalizeIsoTime(raw.lastActivityAt),
+    quietUntil: normalizeIsoTime(raw.quietUntil),
+    generation: normalizeNonNegativeInteger(raw.generation),
+    acknowledgementStatus: normalizeAcknowledgementStatus(raw.acknowledgementStatus, messages),
+    acknowledgementAt: normalizeIsoTime(raw.acknowledgementAt),
+    acknowledgementPendingId: normalizeText(raw.acknowledgementPendingId),
   } : null;
+}
+
+function normalizeAcknowledgementStatus(value, messages) {
+  const normalized = normalizeText(value);
+  if (ACKNOWLEDGEMENT_STATUSES.has(normalized) && normalized) {
+    return normalized;
+  }
+  const acknowledged = messages.find((message) => message.acknowledgementStatus);
+  return acknowledged?.acknowledgementStatus || "";
+}
+
+function applyQuietWindow(scope, { activityAtMs, quietWindowMs }) {
+  const previousActivityAtMs = Date.parse(normalizeIsoTime(scope.lastActivityAt));
+  const effectiveActivityAtMs = Math.max(
+    Number.isFinite(previousActivityAtMs) ? previousActivityAtMs : 0,
+    normalizeTimeMs(activityAtMs)
+  );
+  scope.lastActivityAt = new Date(effectiveActivityAtMs).toISOString();
+  scope.quietUntil = new Date(effectiveActivityAtMs + quietWindowMs).toISOString();
+  scope.generation = normalizeNonNegativeInteger(scope.generation) + 1;
+}
+
+function resolveActivityAtMs(receivedAt, nowMs) {
+  const parsed = Date.parse(normalizeText(receivedAt));
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(nowMs, parsed) : nowMs;
 }
 
 function normalizeSharedScope(raw) {
@@ -497,6 +751,7 @@ function normalizeMessage(raw, { scopeKey = "", nowMs = Date.now() } = {}) {
     senderId,
     chatId: normalizeText(raw.chatId),
     messageId,
+    sourceMessageIds: normalizeSourceMessageIds(raw.sourceMessageIds),
     contextToken: normalizeText(raw.contextToken),
     provider,
     deliveryPolicy: normalizeText(raw.deliveryPolicy),
@@ -515,6 +770,33 @@ function normalizeMessage(raw, { scopeKey = "", nowMs = Date.now() } = {}) {
     sharedHandoffScopeKey: normalizeText(raw.sharedHandoffScopeKey),
     acknowledgementStatus: ACKNOWLEDGEMENT_STATUSES.has(acknowledgementStatus) ? acknowledgementStatus : "",
     acknowledgementAt: normalizeIsoTime(raw.acknowledgementAt),
+    suppressAcknowledgement: raw.suppressAcknowledgement === true,
+    modelCanaryExecutionPolicy: normalizeText(raw.modelCanaryExecutionPolicy),
+    modelCanaryRunId: normalizeText(raw.modelCanaryRunId),
+    modelCanaryNonce: normalizeText(raw.modelCanaryNonce),
+    modelCanaryObligationFingerprint: normalizeText(raw.modelCanaryObligationFingerprint),
+    replyUserId: normalizeText(raw.replyUserId),
+    replyWeflowContact: normalizeText(raw.replyWeflowContact),
+    replyWeflowTalker: normalizeText(raw.replyWeflowTalker),
+    replyWeflowExactContact: raw.replyWeflowExactContact === true,
+    replyMessageKind: normalizeText(raw.replyMessageKind),
+    replyIdempotencyKey: normalizeText(raw.replyIdempotencyKey),
+    replyCanonicalText: normalizeText(raw.replyCanonicalText),
+    replyDesktopInputLease: normalizeDesktopInputLease(raw.replyDesktopInputLease),
+  };
+}
+
+function normalizeDesktopInputLease(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    version: Number(raw.version),
+    mode: normalizeText(raw.mode),
+    runId: normalizeText(raw.runId).toLowerCase(),
+    nonce: normalizeText(raw.nonce).toLowerCase(),
+    targetFingerprint: normalizeText(raw.targetFingerprint).toLowerCase(),
+    replyIdempotencyKey: normalizeText(raw.replyIdempotencyKey),
+    expiresAt: normalizeText(raw.expiresAt),
+    token: normalizeText(raw.token).toLowerCase(),
   };
 }
 
@@ -614,6 +896,11 @@ function normalizeNonNegativeInteger(value) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
+function normalizeWindowMs(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function normalizeTimeMs(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.trunc(number) : 0;
@@ -621,6 +908,19 @@ function normalizeTimeMs(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeSourceMessageIds(value) {
+  const seen = new Set();
+  const normalized = [];
+  for (const item of Array.isArray(value) ? value : [value]) {
+    const id = normalizeText(item);
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      normalized.push(id);
+    }
+  }
+  return normalized;
 }
 
 function stringValue(value) {
@@ -652,5 +952,6 @@ function atomicWriteJson(filePath, value) {
 module.exports = {
   DEFAULT_COMPLETED_RETENTION_MS,
   DEFAULT_MAX_MESSAGES,
+  DEFAULT_QUIET_WINDOW_MS,
   PendingInboundStore,
 };

@@ -1,14 +1,41 @@
+const crypto = require("crypto");
 const { sanitizeProtocolLeakText } = require("../adapters/runtime/codex/protocol-leak-monitor");
+const { buildReplyDeliveryIdempotencyKey } = require("./reply-obligation-store");
+const { MODEL_CANARY_DELIVERY_POLICY } = require("../integrations/weflow-model-canary");
 
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
+const MAX_MEDIA_DELIVERY_ATTEMPTS = 2;
 
 class StreamDelivery {
-  constructor({ channelAdapter, sessionStore, runtimeId = "", onDeferredSystemReply, systemReplyRetryScheduleMs, sameTokenRetryDelayMs }) {
+  constructor({
+    channelAdapter,
+    sessionStore,
+    runtimeId = "",
+    onDeferredSystemReply,
+    onReplyDeliveryStarted,
+    onReplyDeliveryVerified,
+    onReplyDeliveryDeferred,
+    onReplyDeliveryFailed,
+    onReplyTurnCompleted,
+    onReplyTurnFailed,
+    onReplyExplicitSilent,
+    onModelCanaryEvent,
+    systemReplyRetryScheduleMs,
+    sameTokenRetryDelayMs,
+  }) {
     this.channelAdapter = channelAdapter;
     this.sessionStore = sessionStore;
     this.runtimeId = normalizeRuntimeId(runtimeId);
     this.systemReplyPolicy = createSystemReplyPolicy(this.runtimeId);
     this.onDeferredSystemReply = typeof onDeferredSystemReply === "function" ? onDeferredSystemReply : null;
+    this.onReplyDeliveryStarted = normalizeCallback(onReplyDeliveryStarted);
+    this.onReplyDeliveryVerified = normalizeCallback(onReplyDeliveryVerified);
+    this.onReplyDeliveryDeferred = normalizeCallback(onReplyDeliveryDeferred);
+    this.onReplyDeliveryFailed = normalizeCallback(onReplyDeliveryFailed);
+    this.onReplyTurnCompleted = normalizeCallback(onReplyTurnCompleted);
+    this.onReplyTurnFailed = normalizeCallback(onReplyTurnFailed);
+    this.onReplyExplicitSilent = normalizeCallback(onReplyExplicitSilent);
+    this.onModelCanaryEvent = normalizeCallback(onModelCanaryEvent);
     this.systemReplyRetryScheduleMs = Array.isArray(systemReplyRetryScheduleMs) && systemReplyRetryScheduleMs.length
       ? systemReplyRetryScheduleMs.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
       : [1_500, 2_500, 4_000, 6_000];
@@ -75,28 +102,28 @@ class StreamDelivery {
     if (!normalizedThreadId) {
       return null;
     }
+    const linked = this.sessionStore.findBindingForThreadId(normalizedThreadId);
 
     const runKey = buildRunKey(normalizedThreadId, normalizedTurnId);
     const state = this.stateByRunKey.get(runKey);
     if (state?.replyTarget) {
-      return normalizeReplyTarget(state.replyTarget);
+      return constrainReplyTargetForBinding(state.replyTarget, linked);
     }
 
     const exactTurnTarget = this.replyTargetByTurnKey.get(runKey);
     if (exactTurnTarget) {
-      return normalizeReplyTarget(exactTurnTarget);
+      return constrainReplyTargetForBinding(exactTurnTarget, linked);
     }
 
     const queuedTargets = this.replyTargetQueueByThreadId.get(normalizedThreadId);
     if (Array.isArray(queuedTargets) && queuedTargets.length > 0) {
-      return normalizeReplyTarget(queuedTargets[0]);
+      return constrainReplyTargetForBinding(queuedTargets[0], linked);
     }
 
-    const linked = this.sessionStore.findBindingForThreadId(normalizedThreadId);
     if (!linked?.bindingKey) {
       return null;
     }
-    return normalizeReplyTarget(this.replyTargetByBindingKey.get(linked.bindingKey));
+    return constrainReplyTargetForBinding(this.replyTargetByBindingKey.get(linked.bindingKey), linked);
   }
 
   async handleRuntimeEvent(event) {
@@ -119,6 +146,7 @@ class StreamDelivery {
           itemId: normalizeText(event.payload.itemId) || `item-${state.itemOrder.length + 1}`,
           text: normalizeLineEndings(event.payload.text),
           completed: false,
+          phase: normalizeMessagePhase(event.payload.phase),
         });
         return;
       }
@@ -130,20 +158,61 @@ class StreamDelivery {
           completed: true,
           phase: normalizeMessagePhase(event.payload.phase),
         });
-        await this.flush(state, { force: false });
+        if (!isModelCanaryReplyTarget(state.replyTarget)) {
+          await this.flush(state, { force: false });
+        }
+        return;
+      }
+      case "runtime.media.completed": {
+        const state = this.ensureRunState(threadId, turnId);
+        this.upsertMediaItem(state, {
+          itemId: normalizeText(event.payload.itemId) || `media-${state.itemOrder.length + 1}`,
+          kind: normalizeText(event.payload.kind) || "file",
+          filePath: normalizeText(event.payload.filePath),
+          mimeType: normalizeText(event.payload.mimeType),
+          sha256: normalizeText(event.payload.sha256),
+          idempotencyKey: normalizeText(event.payload.idempotencyKey),
+        });
+        if (!isModelCanaryReplyTarget(state.replyTarget)) {
+          await this.flush(state, { force: false });
+        }
         return;
       }
       case "runtime.turn.completed": {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
         this.captureTurnCompletionText(state, event.payload.text);
-        await this.flush(state, { force: true });
+        if (isModelCanaryReplyTarget(state.replyTarget)) {
+          await this.flushModelCanary(state);
+        } else {
+          await this.flush(state, { force: true });
+          await this.invokeReplyLifecycle(this.onReplyTurnCompleted, state, {
+            hadFinalReply: state.finalReplyCandidateObserved,
+            completedAt: normalizeText(event?.payload?.completedAt),
+          });
+        }
         this.disposeRunState(state.runKey);
         return;
       }
-      case "runtime.turn.failed":
-        this.disposeRunState(buildRunKey(threadId, turnId));
+      case "runtime.turn.failed": {
+        const runKey = buildRunKey(threadId, turnId);
+        const state = this.stateByRunKey.get(runKey) || {
+          runKey,
+          threadId,
+          turnId,
+          replyTarget: this.resolveReplyTargetForRun({ threadId, turnId }),
+        };
+        if (isModelCanaryReplyTarget(state.replyTarget)) {
+          await this.invokeModelCanaryEvent(state, { type: "turn_failed" });
+        } else {
+          await this.invokeReplyLifecycle(this.onReplyTurnFailed, state, {
+            error: event?.payload?.error || event?.payload?.text || "runtime turn failed",
+            failedAt: normalizeText(event?.payload?.failedAt),
+          });
+        }
+        this.disposeRunState(runKey);
         return;
+      }
       default:
         return;
     }
@@ -170,6 +239,7 @@ class StreamDelivery {
       flushPromise: null,
       sequence: this.runSequence += 1,
       threadReplyTargetAttached: false,
+      finalReplyCandidateObserved: false,
     };
     this.stateByRunKey.set(runKey, created);
     this.attachReplyTarget(created);
@@ -194,6 +264,10 @@ class StreamDelivery {
       return;
     }
     state.bindingKey = linked.bindingKey;
+    if (isModelCanaryBinding(linked) && !isModelCanaryReplyTarget(state.replyTarget)) {
+      state.replyTarget = null;
+      return;
+    }
     if (!state.replyTarget) {
       const target = this.replyTargetByBindingKey.get(linked.bindingKey);
       state.replyTarget = target;
@@ -226,6 +300,7 @@ class StreamDelivery {
     if (!state.items.has(itemId)) {
       state.itemOrder.push(itemId);
       state.items.set(itemId, {
+        kind: "text",
         currentText: "",
         completedText: "",
         completed: false,
@@ -248,6 +323,28 @@ class StreamDelivery {
     current.currentText = appendStreamingText(current.currentText, text);
   }
 
+  upsertMediaItem(state, { itemId, kind, filePath, mimeType = "", sha256 = "", idempotencyKey = "" }) {
+    if (!itemId || !filePath) {
+      return;
+    }
+    if (!state.items.has(itemId)) {
+      state.itemOrder.push(itemId);
+    }
+    const existing = state.items.get(itemId);
+    state.items.set(itemId, {
+      kind: "media",
+      mediaKind: kind,
+      filePath,
+      mimeType,
+      sha256,
+      idempotencyKey,
+      completed: true,
+      deliveryAttempts: Number.isFinite(Number(existing?.deliveryAttempts))
+        ? Number(existing.deliveryAttempts)
+        : 0,
+    });
+  }
+
   setItemText(state, itemId, text, completed) {
     if (!text) {
       return;
@@ -255,6 +352,7 @@ class StreamDelivery {
     if (!state.items.has(itemId)) {
       state.itemOrder.push(itemId);
       state.items.set(itemId, {
+        kind: "text",
         currentText: "",
         completedText: "",
         completed: false,
@@ -290,6 +388,13 @@ class StreamDelivery {
       return;
     }
 
+    // Model probes have a separate terminal-only delivery path. Never let a
+    // delta, commentary item, generated file, or raw model answer reach the
+    // ordinary reply formatter.
+    if (isModelCanaryReplyTarget(state.replyTarget)) {
+      return;
+    }
+
     if (state.replyTarget.deliveryPolicy === "silent") {
       this.restoreDeferredReplyPrefix(state);
       this.markAllItemsSent(state);
@@ -308,24 +413,101 @@ class StreamDelivery {
     }
 
     state.sendChain = state.sendChain.then(async () => {
+      let shouldSendMediaFailureNotice = false;
       for (let index = 0; index < pendingDeliveries.length; index += 1) {
         const delivery = pendingDeliveries[index];
-        await this.sendReplyDelivery(state, delivery, {
-          prependDeferredPrefix: index === 0 && Boolean(state.deferredReplyPrefix),
-        });
+        const prependDeferredPrefix = Boolean(state.deferredReplyPrefix) && delivery.kind !== "media";
+        try {
+          await this.sendReplyDelivery(state, delivery, {
+            prependDeferredPrefix,
+          });
+        } catch (error) {
+          if (delivery.kind !== "media") {
+            throw error;
+          }
+          const mediaItem = state.items.get(delivery.itemId);
+          if (mediaItem) {
+            mediaItem.deliveryAttempts = (Number(mediaItem.deliveryAttempts) || 0) + 1;
+          }
+          const attempts = Number(mediaItem?.deliveryAttempts) || 1;
+          console.error(
+            `[cyberboss] generated image send attempt failed thread=${state.threadId} item=${delivery.itemId} attempt=${attempts}: ${error.message}`
+          );
+          if (attempts >= MAX_MEDIA_DELIVERY_ATTEMPTS) {
+            state.sentItemIds.add(delivery.itemId);
+            shouldSendMediaFailureNotice = true;
+          }
+          continue;
+        }
         state.sentItemIds.add(delivery.itemId);
-        if (index === 0 && state.deferredReplyPrefix) {
+        if (prependDeferredPrefix) {
           state.deferredReplyPrefix = "";
         }
       }
+      if (shouldSendMediaFailureNotice) {
+        await this.sendMediaFailureNotice(state);
+      }
     }).catch((error) => {
-      const failedDelivery = pendingDeliveries[0];
-      const failedText = buildDeliveryPreviewText(failedDelivery);
-      void this.deferSystemReply(state, buildEffectiveReplyText(state.deferredReplyPrefix, failedText), error, "plain_reply");
       console.error(`[cyberboss] failed to deliver reply thread=${state.threadId}: ${error.message}`);
     });
 
     await state.sendChain;
+  }
+
+  async flushModelCanary(state) {
+    if (!state?.replyTarget || !isModelCanaryReplyTarget(state.replyTarget)) {
+      return;
+    }
+    const assistantFinal = resolveModelCanaryFinalText(state);
+    if (!assistantFinal) {
+      await this.invokeModelCanaryEvent(state, { type: "turn_completed_without_final" });
+      this.markAllItemsSent(state);
+      return;
+    }
+
+    const completed = await this.invokeModelCanaryEvent(state, {
+      type: "model_completed",
+      assistantFinalSha256: crypto.createHash("sha256").update(assistantFinal, "utf8").digest("hex"),
+      assistantFinalLength: [...assistantFinal].length,
+      assistantFinalBytes: Buffer.byteLength(assistantFinal, "utf8"),
+    });
+    if (completed?.accepted !== true) {
+      this.markAllItemsSent(state);
+      return;
+    }
+    const claim = await this.invokeModelCanaryEvent(state, { type: "claim_reply_dispatch" });
+    if (claim?.claimed !== true) {
+      this.markAllItemsSent(state);
+      return;
+    }
+
+    const target = state.replyTarget;
+    const payload = {
+      userId: target.userId,
+      text: target.canonicalText,
+      contextToken: target.contextToken,
+      preserveBlock: true,
+      provider: "weflow-uia",
+      messageKind: target.messageKind,
+      idempotencyKey: target.idempotencyKey,
+      weflowContact: target.weflowContact,
+      weflowTalker: target.weflowTalker,
+      weflowExactContact: true,
+      desktopInputLease: target.desktopInputLease,
+    };
+    try {
+      const sendResult = await this.channelAdapter.sendText(payload);
+      await this.invokeModelCanaryEvent(state, {
+        type: "reply_dispatched",
+        sendResult,
+      });
+    } catch (error) {
+      await this.invokeModelCanaryEvent(state, {
+        type: "reply_delivery_failed",
+        error,
+      });
+    }
+    this.markAllItemsSent(state);
   }
 
   async flushSystemReply(state, { force }) {
@@ -364,8 +546,15 @@ class StreamDelivery {
     if (!delivery || !state.replyTarget) {
       return;
     }
+    const isProgress = delivery.messageKind === "progress";
 
     if (delivery.kind === "silent") {
+      if (!isProgress) {
+        state.finalReplyCandidateObserved = true;
+        await this.invokeReplyLifecycle(this.onReplyExplicitSilent, state, {
+          itemId: delivery.itemId,
+        });
+      }
       return;
     }
 
@@ -373,12 +562,85 @@ class StreamDelivery {
       console.error(
         `[cyberboss] invalid structured action item thread=${state.threadId} reason=${delivery.reason} preview=${JSON.stringify((delivery.sourceText || "").slice(0, 160))}`
       );
+      if (!isProgress) {
+        state.finalReplyCandidateObserved = true;
+        await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
+          error: new Error(`invalid structured action: ${delivery.reason || "unknown reason"}`),
+          deliveryUncertain: false,
+        });
+      }
+      return;
+    }
+
+    if (delivery.kind === "media") {
+      const obligationId = normalizeText(state.replyTarget.replyObligationId);
+      const idempotencyKey = obligationId
+        ? buildReplyDeliveryIdempotencyKey(obligationId, delivery.itemId)
+        : delivery.idempotencyKey;
+      const payload = {
+        userId: state.replyTarget.userId,
+        filePath: delivery.filePath,
+        contextToken: state.replyTarget.contextToken,
+        messageKind: "generated_image",
+        idempotencyKey,
+        sha256: delivery.sha256,
+      };
+      if (state.replyTarget.provider) {
+        payload.provider = state.replyTarget.provider;
+      }
+      if (!obligationId) {
+        await this.channelAdapter.sendFile(payload);
+        return;
+      }
+
+      state.finalReplyCandidateObserved = true;
+      try {
+        await this.invokeReplyLifecycle(this.onReplyDeliveryStarted, state, {
+          itemId: delivery.itemId,
+          text: "",
+          messageKind: "generated_image",
+          idempotencyKey,
+          sha256: delivery.sha256,
+        }, { propagate: true });
+      } catch (error) {
+        error.deliveryUncertain = false;
+        await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
+          error,
+          deliveryUncertain: false,
+        });
+        return;
+      }
+
+      try {
+        const result = await this.channelAdapter.sendFile(payload);
+        const localId = normalizePositiveIntegerText(result?.localId);
+        if (result?.verified === true && localId) {
+          await this.invokeReplyLifecycle(this.onReplyDeliveryVerified, state, {
+            localId,
+            verifiedAt: normalizeText(result?.verifiedAt),
+          });
+        } else {
+          await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
+            error: new Error("WeFlow UIA media send did not return a verified local id"),
+            deliveryUncertain: result?.uncertain !== false,
+          });
+        }
+      } catch (error) {
+        await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
+          error,
+          deliveryUncertain: error?.deliveryUncertain,
+        });
+      }
       return;
     }
 
     const baseText = delivery.kind === "action" ? delivery.message : delivery.text;
     if (!baseText) {
       return;
+    }
+
+    if (!isProgress) {
+      state.finalReplyCandidateObserved = true;
     }
 
     const payload = {
@@ -395,7 +657,79 @@ class StreamDelivery {
     if (prependDeferredPrefix) {
       payload.preserveBlock = true;
     }
-    await this.sendTextWithRetry(state, payload, { kind: "plain_reply" });
+    const obligationId = isProgress ? "" : normalizeText(state.replyTarget.replyObligationId);
+    const idempotencyKey = obligationId
+      ? buildReplyDeliveryIdempotencyKey(obligationId, delivery.itemId)
+      : "";
+    if (idempotencyKey) {
+      payload.idempotencyKey = idempotencyKey;
+    }
+    if (obligationId) {
+      try {
+        await this.invokeReplyLifecycle(this.onReplyDeliveryStarted, state, {
+          itemId: delivery.itemId,
+          text: payload.text,
+          messageKind: delivery.messageKind || "plain_reply",
+          idempotencyKey,
+        }, { propagate: true });
+      } catch (error) {
+        error.deliveryUncertain = false;
+        const deferred = await this.deferSystemReply(state, payload.text, error, "plain_reply");
+        if (deferred) {
+          await this.invokeReplyLifecycle(this.onReplyDeliveryDeferred, state, { error });
+          return;
+        }
+        await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
+          error,
+          deliveryUncertain: false,
+        });
+        return;
+      }
+    }
+
+    try {
+      const outcome = await this.sendTextWithRetry(state, payload, { kind: "plain_reply" });
+      if (!obligationId) {
+        return;
+      }
+      if (outcome.status === "deferred") {
+        await this.invokeReplyLifecycle(this.onReplyDeliveryDeferred, state, {
+          error: outcome.error,
+        });
+        return;
+      }
+      const localId = normalizePositiveIntegerText(outcome.result?.localId);
+      if (outcome.status === "sent" && outcome.result?.verified === true && localId) {
+        try {
+          await this.invokeReplyLifecycle(this.onReplyDeliveryVerified, state, {
+            localId,
+            verifiedAt: normalizeText(outcome.result?.verifiedAt),
+          }, { propagate: true });
+        } catch (error) {
+          // The outbound call already returned a verified local id. A failed
+          // lifecycle write is therefore uncertain from the stream's point of
+          // view and must never cause a duplicate retry/defer.
+          error.deliveryUncertain = true;
+          throw error;
+        }
+        return;
+      }
+      const resultWasCertainlyNotDispatched = outcome.result?.uncertain === false
+        && outcome.result?.verified !== true;
+      await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
+        error: new Error("WeFlow UIA send did not return a verified local id"),
+        deliveryUncertain: !resultWasCertainlyNotDispatched,
+      });
+    } catch (error) {
+      if (obligationId) {
+        await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
+          error,
+          deliveryUncertain: error?.deliveryUncertain,
+        });
+        return;
+      }
+      throw error;
+    }
   }
 
   async sendSystemReply(state, text) {
@@ -415,8 +749,8 @@ class StreamDelivery {
     const initialTarget = state.replyTarget;
     let latestError = null;
     try {
-      await this.channelAdapter.sendText(payload);
-      return;
+      const result = await this.channelAdapter.sendText(payload);
+      return { status: "sent", result };
     } catch (error) {
       latestError = error;
       const retryTarget = this.resolveRetriableReplyTarget(initialTarget, error);
@@ -426,9 +760,9 @@ class StreamDelivery {
         );
         try {
           const retryPayload = this.buildRetryPayload(payload, retryTarget);
-          await this.channelAdapter.sendText(retryPayload);
+          const result = await this.channelAdapter.sendText(retryPayload);
           this.rememberSuccessfulReplyTarget(state, retryTarget);
-          return;
+          return { status: "sent", result };
         } catch (retryError) {
           latestError = retryError;
         }
@@ -443,9 +777,9 @@ class StreamDelivery {
       try {
         const retryPayload = this.buildRetryPayload(payload, contextlessTarget);
         retryPayload.omitContextToken = true;
-        await this.channelAdapter.sendText(retryPayload);
+        const result = await this.channelAdapter.sendText(retryPayload);
         this.rememberSuccessfulReplyTarget(state, contextlessTarget);
-        return;
+        return { status: "sent", result };
       } catch (retryError) {
         latestError = retryError;
       }
@@ -455,14 +789,30 @@ class StreamDelivery {
       console.warn(
         `[cyberboss] dropped stale progress reply thread=${state.threadId} user=${initialTarget?.userId || ""}`
       );
-      return;
+      return { status: "dropped_progress", error: latestError };
     }
 
     const deferred = await this.deferSystemReply(state, payload.text, latestError, kind);
     if (deferred) {
-      return;
+      return { status: "deferred", error: latestError };
     }
     throw latestError;
+  }
+
+  async sendMediaFailureNotice(state) {
+    const target = state.replyTarget;
+    if (!target?.userId) {
+      return;
+    }
+    const payload = {
+      userId: target.userId,
+      text: "❌ 图片已经生成，但发送到微信失败；原图已保留，可稍后补发。",
+      contextToken: target.contextToken,
+    };
+    if (target.provider === "weflow-uia") {
+      payload.provider = "weflow-uia";
+    }
+    await this.channelAdapter.sendText(payload);
   }
 
   buildRetryPayload(payload, target) {
@@ -480,6 +830,9 @@ class StreamDelivery {
     if (payload.messageKind) {
       retryPayload.messageKind = payload.messageKind;
     }
+    if (payload.idempotencyKey) {
+      retryPayload.idempotencyKey = payload.idempotencyKey;
+    }
     return retryPayload;
   }
 
@@ -494,10 +847,12 @@ class StreamDelivery {
     if (typeof this.onDeferredSystemReply !== "function") {
       return false;
     }
-    if (!isSystemReplyContextFailure(error)) {
+    const target = state?.replyTarget || {};
+    const isCertainWeFlowUiaFailure = target.provider === "weflow-uia"
+      && error?.deliveryUncertain === false;
+    if (!isSystemReplyContextFailure(error) && !isCertainWeFlowUiaFailure) {
       return false;
     }
-    const target = state?.replyTarget || {};
     if (!target.userId || !text) {
       return false;
     }
@@ -516,6 +871,48 @@ class StreamDelivery {
     } catch (deferError) {
       console.error(`[cyberboss] failed to defer system reply thread=${state.threadId}: ${deferError.message}`);
       return false;
+    }
+  }
+
+  async invokeReplyLifecycle(callback, state, payload = {}, { propagate = false } = {}) {
+    const obligationId = normalizeText(state?.replyTarget?.replyObligationId);
+    if (!obligationId || typeof callback !== "function") {
+      return false;
+    }
+    try {
+      await callback({
+        replyObligationId: obligationId,
+        threadId: normalizeText(state?.threadId),
+        turnId: normalizeText(state?.turnId),
+        ...payload,
+      });
+      return true;
+    } catch (error) {
+      if (propagate) throw error;
+      console.error(
+        `[cyberboss] reply obligation lifecycle write failed id=${obligationId}: ${error.message}`
+      );
+      return false;
+    }
+  }
+
+  async invokeModelCanaryEvent(state, payload = {}) {
+    if (!isModelCanaryReplyTarget(state?.replyTarget)
+      || typeof this.onModelCanaryEvent !== "function") {
+      return { accepted: false, reason: "model_canary_callback_missing" };
+    }
+    try {
+      return await this.onModelCanaryEvent({
+        ...payload,
+        target: normalizeReplyTarget(state.replyTarget),
+        threadId: normalizeText(state.threadId),
+        turnId: normalizeText(state.turnId),
+      });
+    } catch (error) {
+      console.error(
+        `[cyberboss] model canary lifecycle failed runId=${state.replyTarget.modelCanaryRunId || "(unknown)"}: ${error.message}`
+      );
+      return { accepted: false, reason: "model_canary_lifecycle_failed" };
     }
   }
 
@@ -539,6 +936,7 @@ class StreamDelivery {
       contextToken: refreshedContextToken,
       provider: currentTarget.provider,
       deliveryPolicy: currentTarget.deliveryPolicy,
+      replyObligationId: currentTarget.replyObligationId,
     });
   }
 
@@ -551,6 +949,7 @@ class StreamDelivery {
       contextToken: "",
       provider: currentTarget.provider,
       deliveryPolicy: currentTarget.deliveryPolicy,
+      replyObligationId: currentTarget.replyObligationId,
     });
   }
 
@@ -656,6 +1055,20 @@ function collectPendingReplyDeliveries(state, { force }) {
     }
     const item = state.items.get(itemId);
     if (!item) {
+      continue;
+    }
+    if (item.kind === "media") {
+      if (item.completed && item.filePath) {
+        pending.push({
+          itemId,
+          kind: "media",
+          mediaKind: item.mediaKind,
+          filePath: item.filePath,
+          mimeType: item.mimeType,
+          sha256: item.sha256,
+          idempotencyKey: item.idempotencyKey,
+        });
+      }
       continue;
     }
     const sourceText = resolvePlainReplySourceText(item, force);
@@ -765,6 +1178,21 @@ function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function normalizeCallback(value) {
+  return typeof value === "function" ? value : null;
+}
+
+function normalizePositiveIntegerText(value) {
+  const text = typeof value === "string" || typeof value === "number"
+    ? String(value).trim()
+    : "";
+  try {
+    return /^\d+$/.test(text) && BigInt(text) > 0n ? BigInt(text).toString() : "";
+  } catch {
+    return "";
+  }
+}
+
 function normalizeReplyTarget(target) {
   if (!target?.userId) {
     return null;
@@ -778,7 +1206,81 @@ function normalizeReplyTarget(target) {
   if (deliveryPolicy) {
     normalized.deliveryPolicy = deliveryPolicy;
   }
+  const replyObligationId = normalizeText(target.replyObligationId);
+  if (replyObligationId) {
+    normalized.replyObligationId = replyObligationId;
+  }
+  for (const key of [
+    "modelCanaryRunId",
+    "modelCanaryNonce",
+    "modelCanaryObligationFingerprint",
+    "modelCanaryExecutionPolicy",
+    "weflowContact",
+    "weflowTalker",
+    "messageKind",
+    "idempotencyKey",
+    "canonicalText",
+  ]) {
+    const value = normalizeText(target[key]);
+    if (value) normalized[key] = value;
+  }
+  if (target.weflowExactContact === true) normalized.weflowExactContact = true;
+  const desktopInputLease = normalizeDesktopInputLease(target.desktopInputLease);
+  if (desktopInputLease) normalized.desktopInputLease = desktopInputLease;
+  const requireDesktopIdleSeconds = normalizePositiveInteger(target.requireDesktopIdleSeconds);
+  if (requireDesktopIdleSeconds) normalized.requireDesktopIdleSeconds = requireDesktopIdleSeconds;
   return normalized;
+}
+
+function normalizeDesktopInputLease(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    version: Number(raw.version),
+    mode: normalizeText(raw.mode),
+    runId: normalizeText(raw.runId).toLowerCase(),
+    nonce: normalizeText(raw.nonce).toLowerCase(),
+    targetFingerprint: normalizeText(raw.targetFingerprint).toLowerCase(),
+    replyIdempotencyKey: normalizeText(raw.replyIdempotencyKey),
+    expiresAt: normalizeText(raw.expiresAt),
+    token: normalizeText(raw.token).toLowerCase(),
+  };
+}
+
+function constrainReplyTargetForBinding(target, linked) {
+  const normalized = normalizeReplyTarget(target);
+  if (isModelCanaryBinding(linked) && !isModelCanaryReplyTarget(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function isModelCanaryBinding(linked) {
+  return normalizeText(linked?.senderId).startsWith("cyberboss-model-canary:");
+}
+
+function isModelCanaryReplyTarget(target) {
+  return target?.deliveryPolicy === MODEL_CANARY_DELIVERY_POLICY;
+}
+
+function normalizePositiveInteger(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : 0;
+}
+
+function resolveModelCanaryFinalText(state) {
+  const items = (Array.isArray(state?.itemOrder) ? state.itemOrder : [])
+    .map((itemId) => state.items?.get?.(itemId))
+    .filter((item) => item?.kind !== "media" && item?.completed === true);
+  const explicitFinal = items
+    .filter((item) => normalizeMessagePhase(item.phase) === "final_answer")
+    .map((item) => trimOuterBlankLines(item.completedText || item.currentText))
+    .filter(Boolean);
+  if (explicitFinal.length) return explicitFinal.join("\n\n");
+  return items
+    .filter((item) => normalizeMessagePhase(item.phase) !== "commentary")
+    .map((item) => trimOuterBlankLines(item.completedText || item.currentText))
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function normalizeLineEndings(value) {

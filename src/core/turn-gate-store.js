@@ -16,30 +16,39 @@ class TurnGateStore {
   attachThread(scopeKey, threadId) {
     const normalizedScopeKey = normalizeText(scopeKey);
     const normalizedThreadId = normalizeText(threadId);
-    if (!normalizedScopeKey || !normalizedThreadId) {
-      return;
+    if (!normalizedScopeKey || !normalizedThreadId || !this.pendingScopeKeys.has(normalizedScopeKey)) {
+      return false;
     }
     this.scopeByThreadId.set(normalizedThreadId, normalizedScopeKey);
+    return true;
   }
 
   releaseScope(bindingKey, workspaceRoot) {
     const scopeKey = buildTurnScopeKey(bindingKey, workspaceRoot);
     if (!scopeKey) {
-      return;
+      return { released: false, scopeKey: "" };
     }
-    this.pendingScopeKeys.delete(scopeKey);
+    const released = this.pendingScopeKeys.delete(scopeKey);
+    for (const [threadId, mappedScopeKey] of this.scopeByThreadId.entries()) {
+      if (mappedScopeKey === scopeKey) {
+        this.scopeByThreadId.delete(threadId);
+      }
+    }
+    return { released, scopeKey };
   }
 
   releaseThread(threadId) {
     const normalizedThreadId = normalizeText(threadId);
     if (!normalizedThreadId) {
-      return;
+      return { released: false, scopeKey: "" };
     }
     const scopeKey = this.scopeByThreadId.get(normalizedThreadId) || "";
+    let released = false;
     if (scopeKey) {
-      this.pendingScopeKeys.delete(scopeKey);
+      released = this.pendingScopeKeys.delete(scopeKey);
       this.scopeByThreadId.delete(normalizedThreadId);
     }
+    return { released, scopeKey };
   }
 
   isPending(bindingKey, workspaceRoot) {

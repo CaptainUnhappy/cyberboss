@@ -68,6 +68,35 @@ test("codex agent message completion exposes commentary and final phases", () =>
   assert.equal(finalAnswer.payload.phase, "final_answer");
 });
 
+test("Codex tool items map to cancellable runtime events without affecting passive items", () => {
+  const tool = mapCodexMessageToRuntimeEvent({
+    method: "item/started",
+    params: {
+      threadId: "thread-probe",
+      turnId: "turn-probe",
+      item: { id: "tool-1", type: "commandExecution" },
+    },
+  });
+  const passive = mapCodexMessageToRuntimeEvent({
+    method: "item/started",
+    params: {
+      threadId: "thread-probe",
+      turnId: "turn-probe",
+      item: { id: "reasoning-1", type: "reasoning" },
+    },
+  });
+  assert.deepEqual(tool, {
+    type: "runtime.tool.started",
+    payload: {
+      threadId: "thread-probe",
+      turnId: "turn-probe",
+      itemId: "tool-1",
+      toolType: "commandExecution",
+    },
+  });
+  assert.equal(passive, null);
+});
+
 test("codex MCP elicitation approvals map to runtime approval events", () => {
   const event = mapCodexMessageToRuntimeEvent({
     id: "req-mcp-1",

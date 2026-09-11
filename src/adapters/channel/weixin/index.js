@@ -8,7 +8,7 @@ const { createInboundFilter } = require("./message-utils");
 const { sendWeixinMediaFile } = require("./media-send");
 const { loadSyncBuffer, saveSyncBuffer } = require("./sync-buffer-store");
 const { loadWeixinConfig, saveWeixinConfig, DEFAULT_MIN_WEIXIN_CHUNK } = require("./config-store");
-const { sendWeFlowUiaText } = require("../../../integrations/weflow-outbound");
+const { sendWeFlowUiaImage, sendWeFlowUiaText } = require("../../../integrations/weflow-outbound");
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_WEIXIN_CHUNK = 4000;
@@ -61,12 +61,26 @@ function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {})
     return ensureContextTokenCache()[normalizedUserId] || "";
   }
 
-  function sendTextChunks({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "", messageKind = "" }) {
+  async function sendTextChunks({
+    userId,
+    text,
+    contextToken = "",
+    preserveBlock = false,
+    omitContextToken = false,
+    provider = "",
+    messageKind = "",
+    idempotencyKey = "",
+    weflowContact = "",
+    weflowTalker = "",
+    weflowExactContact = false,
+    requireDesktopIdleSeconds = 0,
+    desktopInputLease = null,
+  }) {
     const account = ensureAccount();
     const resolvedToken = omitContextToken ? "" : resolveContextToken(userId, contextToken);
     const content = String(text || "");
     if (!content.trim()) {
-      return Promise.resolve();
+      return undefined;
     }
     const sendChunks = buildWeixinDeliveryChunks({
       text: content,
@@ -74,18 +88,27 @@ function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {})
       minChunk: minWeixinChunk,
       messageKind,
     });
-    return sendChunks.reduce((promise, chunk, index) => promise
-      .then(() => {
-        const deliveryChunk = chunk || "Completed.";
-        if (provider === "weflow-uia") {
-          return sendWeFlowUiaText(config, {
-            text: deliveryChunk,
-            timeoutMs: messageKind === "inbound_ack" ? 5_000 : 0,
-            messageKind,
-            messageLedger: weflowMessageLedger,
-          });
-        }
-        return sendNativeWeixinTextWithLedger({
+    let lastResult;
+    for (let index = 0; index < sendChunks.length; index += 1) {
+      const deliveryChunk = sendChunks[index] || "Completed.";
+      const chunkIdempotencyKey = idempotencyKey
+        ? (sendChunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk:${index + 1}`)
+        : "";
+      if (provider === "weflow-uia") {
+        lastResult = await sendWeFlowUiaText(config, {
+          text: deliveryChunk,
+          timeoutMs: messageKind === "inbound_ack" ? 5_000 : 0,
+          messageKind,
+          idempotencyKey: chunkIdempotencyKey,
+          messageLedger: weflowMessageLedger,
+          contact: weflowContact,
+          talker: weflowTalker,
+          exactContact: weflowExactContact,
+          requireDesktopIdleSeconds,
+          desktopInputLease,
+        });
+      } else {
+        lastResult = await sendNativeWeixinTextWithLedger({
           config,
           messageLedger: weflowMessageLedger,
           userId,
@@ -100,13 +123,12 @@ function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {})
             clientId: `cb-${crypto.randomUUID()}`,
           }),
         });
-      })
-      .then(() => {
-        if (index < sendChunks.length - 1) {
-          return sleep(SEND_MESSAGE_CHUNK_INTERVAL_MS);
-        }
-        return null;
-      }), Promise.resolve());
+      }
+      if (index < sendChunks.length - 1) {
+        await sleep(SEND_MESSAGE_CHUNK_INTERVAL_MS);
+      }
+    }
+    return lastResult;
   }
 
   return {
@@ -178,8 +200,36 @@ function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {})
       const account = ensureAccount();
       return inboundFilter.normalize(message, config, account.accountId);
     },
-    async sendText({ userId, text, contextToken = "", preserveBlock = false, omitContextToken = false, provider = "", messageKind = "" }) {
-      await sendTextChunks({ userId, text, contextToken, preserveBlock, omitContextToken, provider, messageKind });
+    async sendText({
+      userId,
+      text,
+      contextToken = "",
+      preserveBlock = false,
+      omitContextToken = false,
+      provider = "",
+      messageKind = "",
+      idempotencyKey = "",
+      weflowContact = "",
+      weflowTalker = "",
+      weflowExactContact = false,
+      requireDesktopIdleSeconds = 0,
+      desktopInputLease = null,
+    }) {
+      return sendTextChunks({
+        userId,
+        text,
+        contextToken,
+        preserveBlock,
+        omitContextToken,
+        provider,
+        messageKind,
+        idempotencyKey,
+        weflowContact,
+        weflowTalker,
+        weflowExactContact,
+        requireDesktopIdleSeconds,
+        desktopInputLease,
+      });
     },
     async sendTyping({ userId, status = 1, contextToken = "" }) {
       const account = ensureAccount();
@@ -209,7 +259,25 @@ function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {})
         },
       });
     },
-    async sendFile({ userId, filePath, contextToken = "" }) {
+    async sendFile({
+      userId,
+      filePath,
+      contextToken = "",
+      provider = "",
+      messageKind = "",
+      idempotencyKey = "",
+      sha256 = "",
+    }) {
+      if (provider === "weflow-uia") {
+        return sendWeFlowUiaImage(config, {
+          filePath,
+          sha256,
+          idempotencyKey,
+          messageKind,
+          contentKind: "image",
+          messageLedger: weflowMessageLedger,
+        });
+      }
       const account = ensureAccount();
       const resolvedToken = resolveContextToken(userId, contextToken);
       return sendWeixinMediaFile({

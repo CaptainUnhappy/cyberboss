@@ -8,15 +8,28 @@ const DEFERRED_PLAIN_REPLY_HEADER = "===== 上轮对话遗留内容 =====";
 const DEFERRED_SYSTEM_REPLY_HEADER = "===== 期间模型主动联系 =====";
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
 
-function createHarness({ sendText, getKnownContextTokens, runtimeId = "" } = {}) {
+function createHarness({
+  sendText,
+  sendFile,
+  getKnownContextTokens,
+  runtimeId = "",
+  ...streamOptions
+} = {}) {
   const sent = [];
   const channelAdapter = {
     async sendText(payload) {
       if (typeof sendText === "function") {
-        await sendText(payload, sent);
-        return;
+        return sendText(payload, sent);
       }
       sent.push(payload);
+      return undefined;
+    },
+    async sendFile(payload) {
+      if (typeof sendFile === "function") {
+        return sendFile(payload, sent);
+      }
+      sent.push(payload);
+      return undefined;
     },
     getKnownContextTokens() {
       if (typeof getKnownContextTokens === "function") {
@@ -33,7 +46,12 @@ function createHarness({ sendText, getKnownContextTokens, runtimeId = "" } = {})
     },
   };
 
-  const streamDelivery = new StreamDelivery({ channelAdapter, sessionStore, runtimeId });
+  const streamDelivery = new StreamDelivery({
+    channelAdapter,
+    sessionStore,
+    runtimeId,
+    ...streamOptions,
+  });
   return { sent, streamDelivery, bindingByThreadId };
 }
 
@@ -648,6 +666,73 @@ test("WeFlow UIA reply target is forwarded as the exclusive outbound provider", 
   }]);
 });
 
+test("certain WeFlow UIA pre-dispatch failure durably defers one plain reply", async () => {
+  const attempts = [];
+  const deferred = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText(payload) {
+      attempts.push(payload);
+      const error = new Error("WeFlow UIA exact target was not confirmed");
+      error.code = "TARGET_NOT_CONFIRMED";
+      error.deliveryUncertain = false;
+      throw error;
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  streamDelivery.queueReplyTargetForThread("thread-weflow-certain-failure", {
+    userId: "user-weflow-certain-failure",
+    contextToken: "ctx-weflow-certain-failure",
+    provider: "weflow-uia",
+  });
+
+  await assert.doesNotReject(() => runCompletedTurnWithResultOnly(streamDelivery, {
+    threadId: "thread-weflow-certain-failure",
+    turnId: "turn-weflow-certain-failure",
+    text: "最终回复需要可靠补发",
+  }));
+
+  assert.deepEqual(sent, []);
+  assert.equal(attempts.length, 1);
+  assert.equal(deferred.length, 1);
+  assert.equal(deferred[0].threadId, "thread-weflow-certain-failure");
+  assert.equal(deferred[0].userId, "user-weflow-certain-failure");
+  assert.equal(deferred[0].text, "最终回复需要可靠补发");
+  assert.equal(deferred[0].kind, "plain_reply");
+});
+
+test("uncertain WeFlow UIA failure is not deferred", async () => {
+  const attempts = [];
+  const deferred = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText(payload) {
+      attempts.push(payload);
+      const error = new Error("WeFlow UIA dispatch result is uncertain");
+      error.deliveryUncertain = true;
+      throw error;
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  streamDelivery.queueReplyTargetForThread("thread-weflow-uncertain-failure", {
+    userId: "user-weflow-uncertain-failure",
+    contextToken: "ctx-weflow-uncertain-failure",
+    provider: "weflow-uia",
+  });
+
+  await runCompletedTurnWithResultOnly(streamDelivery, {
+    threadId: "thread-weflow-uncertain-failure",
+    turnId: "turn-weflow-uncertain-failure",
+    text: "不要重复投递",
+  });
+
+  assert.deepEqual(sent, []);
+  assert.equal(attempts.length, 1);
+  assert.deepEqual(deferred, []);
+});
+
 test("system send_message retries explicitly without context after a stale-token failure", async () => {
   const attempts = [];
   const { sent, streamDelivery } = createHarness({
@@ -740,6 +825,7 @@ test("system send_message is deferred after retry exhaustion", async () => {
   assert.equal(deferred[0].threadId, "thread-6");
   assert.equal(deferred[0].userId, "user-6");
   assert.equal(deferred[0].text, "等等我");
+  assert.equal(deferred[0].kind, "system_reply");
 });
 
 test("plain reply prepends deferred prefix to the next reply", async () => {
@@ -805,4 +891,183 @@ test("plain reply with deferred prefix is sent as soon as the first item is fina
     contextToken: "ctx-8",
     preserveBlock: true,
   });
+});
+
+test("reply obligation ignores commentary and verifies exactly one final WeFlow text", async () => {
+  const obligationId = `reply-obligation:${"a".repeat(64)}`;
+  const lifecycle = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText(payload, successful) {
+      successful.push(payload);
+      return { verified: true, localId: payload.messageKind === "progress" ? "41" : "42" };
+    },
+    async onReplyDeliveryStarted(payload) { lifecycle.push(["started", payload]); },
+    async onReplyDeliveryVerified(payload) { lifecycle.push(["verified", payload]); },
+    async onReplyTurnCompleted(payload) { lifecycle.push(["completed", payload]); },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-obligation-text", {
+    userId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weflow-uia",
+    replyObligationId: obligationId,
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-obligation-text", turnId: "turn-obligation-text" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-obligation-text",
+      turnId: "turn-obligation-text",
+      itemId: "progress-1",
+      text: "正在检查",
+      phase: "commentary",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-obligation-text",
+      turnId: "turn-obligation-text",
+      itemId: "final-1",
+      text: "检查完成",
+      phase: "final_answer",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: { threadId: "thread-obligation-text", turnId: "turn-obligation-text" },
+  });
+
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].messageKind, "progress");
+  assert.equal(sent[0].idempotencyKey, undefined);
+  assert.match(sent[1].idempotencyKey, /^reply-obligation:[a-f0-9]{64}:delivery:[a-f0-9]{16}$/);
+  assert.deepEqual(lifecycle.map(([kind]) => kind), ["started", "verified", "completed"]);
+  assert.equal(lifecycle[0][1].messageKind, "plain_reply");
+  assert.equal(lifecycle[1][1].localId, "42");
+  assert.equal(lifecycle[2][1].hadFinalReply, true);
+});
+
+test("commentary-only turn remains an observable no-final obligation", async () => {
+  const completed = [];
+  const started = [];
+  const { streamDelivery } = createHarness({
+    async sendText() { return { verified: true, localId: "51" }; },
+    async onReplyDeliveryStarted(payload) { started.push(payload); },
+    async onReplyTurnCompleted(payload) { completed.push(payload); },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-obligation-progress", {
+    userId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weflow-uia",
+    replyObligationId: `reply-obligation:${"b".repeat(64)}`,
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-obligation-progress", turnId: "turn-obligation-progress" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.reply.completed",
+    payload: {
+      threadId: "thread-obligation-progress",
+      turnId: "turn-obligation-progress",
+      itemId: "progress-only",
+      text: "还在处理中",
+      phase: "commentary",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: { threadId: "thread-obligation-progress", turnId: "turn-obligation-progress" },
+  });
+
+  assert.deepEqual(started, []);
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].hadFinalReply, false);
+});
+
+test("uncertain tracked WeFlow final is terminally observed and never deferred", async () => {
+  const failures = [];
+  const deferredLifecycle = [];
+  const durableDeferred = [];
+  const { streamDelivery } = createHarness({
+    async sendText() {
+      const error = new Error("dispatch outcome unknown");
+      error.deliveryUncertain = true;
+      throw error;
+    },
+    async onDeferredSystemReply(payload) { durableDeferred.push(payload); },
+    async onReplyDeliveryFailed(payload) { failures.push(payload); },
+    async onReplyDeliveryDeferred(payload) { deferredLifecycle.push(payload); },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-obligation-uncertain", {
+    userId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weflow-uia",
+    replyObligationId: `reply-obligation:${"c".repeat(64)}`,
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-obligation-uncertain",
+    turnId: "turn-obligation-uncertain",
+    itemId: "final-uncertain",
+    text: "最终回复",
+  });
+
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].deliveryUncertain, true);
+  assert.deepEqual(deferredLifecycle, []);
+  assert.deepEqual(durableDeferred, []);
+});
+
+test("media-only WeFlow reply verifies the obligation with a stable delivery key", async () => {
+  const lifecycle = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendFile(payload, successful) {
+      successful.push(payload);
+      return { verified: true, localId: "61" };
+    },
+    async onReplyDeliveryStarted(payload) { lifecycle.push(["started", payload]); },
+    async onReplyDeliveryVerified(payload) { lifecycle.push(["verified", payload]); },
+    async onReplyTurnCompleted(payload) { lifecycle.push(["completed", payload]); },
+  });
+  streamDelivery.queueReplyTargetForThread("thread-obligation-media", {
+    userId: "user-1",
+    contextToken: "ctx-1",
+    provider: "weflow-uia",
+    replyObligationId: `reply-obligation:${"d".repeat(64)}`,
+  });
+
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.started",
+    payload: { threadId: "thread-obligation-media", turnId: "turn-obligation-media" },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.media.completed",
+    payload: {
+      threadId: "thread-obligation-media",
+      turnId: "turn-obligation-media",
+      itemId: "media-1",
+      kind: "image",
+      filePath: "D:/fixture/image.png",
+      sha256: "e".repeat(64),
+      idempotencyKey: "unstable-runtime-key",
+    },
+  });
+  await streamDelivery.handleRuntimeEvent({
+    type: "runtime.turn.completed",
+    payload: { threadId: "thread-obligation-media", turnId: "turn-obligation-media" },
+  });
+
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].idempotencyKey, /^reply-obligation:[a-f0-9]{64}:delivery:[a-f0-9]{16}$/);
+  assert.deepEqual(lifecycle.map(([kind]) => kind), ["started", "verified", "completed"]);
+  assert.equal(lifecycle[0][1].messageKind, "generated_image");
+  assert.equal(lifecycle[0][1].sha256, "e".repeat(64));
+  assert.equal(lifecycle[1][1].localId, "61");
+  assert.equal(lifecycle[2][1].hadFinalReply, true);
 });

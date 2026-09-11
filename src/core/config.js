@@ -5,6 +5,10 @@ function readConfig() {
   const argv = process.argv.slice(2);
   const mode = argv[0] || "";
   const stateDir = process.env.CYBERBOSS_STATE_DIR || path.join(os.homedir(), ".cyberboss");
+  const weflowInboxChat = readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT");
+  const weflowCanaryChat = readTextEnv("CYBERBOSS_WEFLOW_CANARY_CHAT");
+  const weflowCanaryDisplayName = readTextEnv("CYBERBOSS_WEFLOW_CANARY_DISPLAY_NAME");
+  assertWeFlowCanaryTalkerIsolation({ weflowInboxChat, weflowCanaryChat });
 
   return {
     mode,
@@ -28,6 +32,8 @@ function readConfig() {
     reminderQueueFile: path.join(stateDir, "reminder-queue.json"),
     systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
     pendingInboundQueueFile: path.join(stateDir, "pending-inbound.json"),
+    pendingInboundQuietWindowMs: readNonNegativeIntEnv("CYBERBOSS_PENDING_INBOUND_QUIET_WINDOW_MS") ?? 15_000,
+    pipelineActivityFile: path.join(stateDir, "cyberboss-pipeline-activity.json"),
     deferredSystemReplyQueueFile: path.join(stateDir, "deferred-system-replies.json"),
     checkinConfigFile: path.join(stateDir, "checkin-config.json"),
     timelineScreenshotQueueFile: path.join(stateDir, "timeline-screenshot-queue.json"),
@@ -57,11 +63,20 @@ function readConfig() {
     weflowBridgeBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BRIDGE_BASE_URL") || "http://127.0.0.1:8766",
     weflowBridgeTimeoutMs: readIntEnv("CYBERBOSS_WEFLOW_BRIDGE_TIMEOUT_MS") || 30_000,
     weflowToken: readTextEnv("CYBERBOSS_WEFLOW_TOKEN"),
-    weflowInboxChat: readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT"),
+    weflowInboxChat,
     weflowInboxDisplayName: readTextEnv("CYBERBOSS_WEFLOW_INBOX_DISPLAY_NAME") || "yourself",
     weflowInboxReplyUserId: readTextEnv("CYBERBOSS_WEFLOW_REPLY_USER_ID"),
     weflowInboxCursorFile: path.join(stateDir, "weflow-inbox-cursor.json"),
+    weflowCanaryChat,
+    weflowCanaryDisplayName,
+    // Model E2E probes are intentionally opt-in and are never scheduled by the
+    // ordinary transport heartbeat. An explicit caller must enable this gate
+    // before creating and sending a model probe manifest.
+    weflowModelCanaryEnabled: readBoolEnv("CYBERBOSS_ENABLE_WEFLOW_MODEL_CANARY"),
+    weflowCanaryInboxCursorFile: path.join(stateDir, "weflow-canary-inbox-cursor.json"),
+    weflowCanaryMessageLimit: readIntEnv("CYBERBOSS_WEFLOW_CANARY_MESSAGE_LIMIT") || 200,
     weflowMessageLedgerFile: path.join(stateDir, "weflow-message-ledger.json"),
+    generatedImageOutboundDir: path.join(stateDir, "generated-images-outbound"),
     weflowReconnectDelayMs: readIntEnv("CYBERBOSS_WEFLOW_RECONNECT_DELAY_MS") || 1_000,
     weflowOutgoingPollIntervalMs: readIntEnv("CYBERBOSS_WEFLOW_OUTGOING_POLL_INTERVAL_MS") || 2_000,
     weflowOutgoingReplayWindowMs: readIntEnv("CYBERBOSS_WEFLOW_OUTGOING_REPLAY_WINDOW_MS") || 10 * 60_000,
@@ -72,9 +87,17 @@ function readConfig() {
     startWithWeflowInbox: mode === "start"
       && readBoolEnv("CYBERBOSS_ENABLE_WEFLOW_INBOX")
       && Boolean(readTextEnv("CYBERBOSS_WEFLOW_TOKEN"))
-      && Boolean(readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT")),
+      && Boolean(weflowInboxChat),
+    startWithWeflowCanaryInbox: mode === "start"
+      && readBoolEnv("CYBERBOSS_ENABLE_WEFLOW_INBOX")
+      && Boolean(readTextEnv("CYBERBOSS_WEFLOW_TOKEN"))
+      && Boolean(weflowCanaryChat)
+      && Boolean(weflowCanaryDisplayName),
+    // Guarded restarts are announced by the watchdog's durable, ledger-backed
+    // notification queue. Keep the older best-effort startup send opt-in so it
+    // cannot race that queue or create an unverified duplicate.
     startWithRestartNotification: mode === "start"
-      && readOptionalBoolEnv("CYBERBOSS_ENABLE_RESTART_NOTIFICATION") !== false,
+      && readBoolEnv("CYBERBOSS_ENABLE_RESTART_NOTIFICATION"),
     restartNotificationText: readTextEnv("CYBERBOSS_RESTART_NOTIFICATION_TEXT")
       || "✅ Cyberboss 已重启，服务已恢复。",
     restartNotificationUserId: readTextEnv("CYBERBOSS_RESTART_NOTIFICATION_USER_ID"),
@@ -243,6 +266,11 @@ function resolveLocationServerEnabled({ mode, enabled }) {
   return false;
 }
 
+function readNonNegativeIntEnv(name) {
+  const value = readIntEnv(name);
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
 function resolveCheckinEnabled({ mode, argv, enabled }) {
   if (mode !== "start") {
     return false;
@@ -253,4 +281,18 @@ function resolveCheckinEnabled({ mode, argv, enabled }) {
   return enabled === true || hasArgFlag(argv, "--checkin");
 }
 
-module.exports = { readConfig, resolveCheckinEnabled };
+function assertWeFlowCanaryTalkerIsolation({ weflowInboxChat, weflowCanaryChat } = {}) {
+  const primaryTalker = typeof weflowInboxChat === "string" ? weflowInboxChat.trim() : "";
+  const canaryTalker = typeof weflowCanaryChat === "string" ? weflowCanaryChat.trim() : "";
+  if (!primaryTalker || !canaryTalker || primaryTalker !== canaryTalker) {
+    return true;
+  }
+  const error = new Error(
+    "CYBERBOSS_WEFLOW_CANARY_CHAT must differ from CYBERBOSS_WEFLOW_INBOX_CHAT; dedicated canary routing is disabled",
+  );
+  error.code = "CANARY_TALKER_CONFLICT";
+  error.repairable = false;
+  throw error;
+}
+
+module.exports = { assertWeFlowCanaryTalkerIsolation, readConfig, resolveCheckinEnabled };

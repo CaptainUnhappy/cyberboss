@@ -30,6 +30,9 @@ const bridgePidFile = path.join(logDir, "shared-wechat.pid");
 const appServerLogFile = path.join(logDir, "shared-app-server.log");
 const weflowUiaBridgePidFile = path.join(logDir, "weflow-uia-bridge.pid");
 const weflowUiaBridgeLogFile = path.join(logDir, "weflow-uia-bridge.log");
+const hiddenConsoleLauncherScript = path.join(__dirname, "shared-hidden-console-launch.vbs");
+const hiddenConsoleHostScript = path.join(__dirname, "shared-hidden-console-host.js");
+const hiddenConsoleLaunchTimeoutMs = 10_000;
 const accountsDir = path.join(stateDir, "accounts");
 const sessionFile = process.env.CYBERBOSS_SESSIONS_FILE || path.join(stateDir, "sessions.json");
 const sharedCodexEnabledPlugins = new Set([
@@ -69,6 +72,81 @@ function readCodexConfigText() {
     return fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
   } catch {
     return "";
+  }
+}
+
+function resolveCodexCommand({
+  env = process.env,
+  platform = process.platform,
+  fsImpl = fs,
+} = {}) {
+  const configured = normalizeText(env.CYBERBOSS_CODEX_COMMAND);
+  if (configured) {
+    return configured;
+  }
+
+  const cliPath = normalizeText(env.CODEX_CLI_PATH);
+  if (cliPath && fileExists(fsImpl, cliPath)) {
+    return cliPath;
+  }
+
+  if (platform === "win32") {
+    const localAppData = normalizeText(env.LOCALAPPDATA);
+    if (localAppData) {
+      const desktopBinRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+      const desktopCommand = findNewestCodexDesktopCommand(fsImpl, desktopBinRoot);
+      if (desktopCommand) {
+        return desktopCommand;
+      }
+
+      const installedCommand = path.join(
+        localAppData,
+        "Programs",
+        "OpenAI",
+        "Codex",
+        "bin",
+        "codex.exe"
+      );
+      if (fileExists(fsImpl, installedCommand)) {
+        return installedCommand;
+      }
+    }
+  }
+
+  return "codex";
+}
+
+function findNewestCodexDesktopCommand(fsImpl, desktopBinRoot) {
+  let entries = [];
+  try {
+    entries = fsImpl.readdirSync(desktopBinRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const directory = path.join(desktopBinRoot, entry.name);
+        const command = path.join(directory, "codex.exe");
+        let mtimeMs = 0;
+        try {
+          mtimeMs = Number(fsImpl.statSync(directory).mtimeMs) || 0;
+        } catch {
+          // Keep probing the executable below.
+        }
+        return { command, mtimeMs };
+      });
+  } catch {
+    return "";
+  }
+
+  return entries
+    .filter((entry) => fileExists(fsImpl, entry.command))
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .map((entry) => entry.command)[0] || "";
+}
+
+function fileExists(fsImpl, filePath) {
+  try {
+    return fsImpl.statSync(filePath).isFile();
+  } catch {
+    return false;
   }
 }
 
@@ -183,6 +261,126 @@ function spawnDetachedCommand(command, args, { logFile, cwd = rootDir, env = {} 
   return child.pid;
 }
 
+function buildHiddenConsoleLauncherSpec(
+  requestPath,
+  resultPath,
+  {
+    platform = process.platform,
+    nodePath = process.execPath,
+    systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows",
+  } = {}
+) {
+  if (platform !== "win32") {
+    throw new Error("the hidden inherited-console launcher is Windows-only");
+  }
+  return {
+    command: path.win32.join(systemRoot, "System32", "wscript.exe"),
+    args: [
+      "//B",
+      "//NoLogo",
+      hiddenConsoleLauncherScript,
+      nodePath,
+      hiddenConsoleHostScript,
+      requestPath,
+      resultPath,
+    ],
+  };
+}
+
+async function spawnCommandWithHiddenInheritedConsole(
+  command,
+  args,
+  { logFile, cwd = rootDir, env = {}, timeoutMs = hiddenConsoleLaunchTimeoutMs } = {}
+) {
+  if (process.platform !== "win32") {
+    throw new Error("the hidden inherited-console launcher is Windows-only");
+  }
+
+  ensureLogDir();
+  const launchDir = fs.mkdtempSync(path.join(logDir, "shared-app-server-launch-"));
+  const requestPath = path.join(launchDir, "request.json");
+  const resultPath = path.join(launchDir, "result.json");
+  fs.writeFileSync(
+    requestPath,
+    `${JSON.stringify({
+      version: 1,
+      command,
+      args,
+      cwd,
+      env,
+      logFile,
+    }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const launcherSpec = buildHiddenConsoleLauncherSpec(requestPath, resultPath);
+  let launcher;
+  try {
+    launcher = spawn(launcherSpec.command, launcherSpec.args, {
+      cwd,
+      env: process.env,
+      detached: true,
+      stdio: "ignore",
+      shell: false,
+      windowsHide: true,
+    });
+    await waitForChildSpawn(launcher);
+    launcher.unref();
+  } catch (error) {
+    fs.rmSync(launchDir, { force: true, recursive: true });
+    throw new Error(`failed to start hidden console launcher: ${error.message || String(error)}`);
+  }
+
+  const result = await waitForHiddenConsoleLaunchResult(resultPath, timeoutMs);
+  if (!result) {
+    throw new Error(
+      `hidden console host did not report an app-server PID within ${timeoutMs}ms; inspect ${launchDir}`
+    );
+  }
+  if (result.version !== 1 || result.ok !== true) {
+    fs.rmSync(launchDir, { force: true, recursive: true });
+    throw new Error(`hidden console host failed: ${normalizeText(result.error) || "unknown error"}`);
+  }
+
+  const pid = Number(result.pid);
+  if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) {
+    fs.rmSync(launchDir, { force: true, recursive: true });
+    throw new Error(`hidden console host returned a dead or invalid app-server PID: ${result.pid}`);
+  }
+  fs.rmSync(launchDir, { force: true, recursive: true });
+  return pid;
+}
+
+function waitForChildSpawn(child) {
+  return new Promise((resolve, reject) => {
+    const onSpawn = () => {
+      child.removeListener("error", onError);
+      resolve();
+    };
+    const onError = (error) => {
+      child.removeListener("spawn", onSpawn);
+      reject(error);
+    };
+    child.once("spawn", onSpawn);
+    child.once("error", onError);
+  });
+}
+
+async function waitForHiddenConsoleLaunchResult(resultPath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      return JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) {
+        throw error;
+      }
+    }
+    await sleep(25);
+  }
+  return null;
+}
+
 async function ensureSharedAppServer() {
   if (process.env.CYBERBOSS_RUNTIME && process.env.CYBERBOSS_RUNTIME !== "codex") {
     return { pid: 0, status: "skipped" };
@@ -210,15 +408,21 @@ async function ensureSharedAppServer() {
         : "");
   }
 
-  const command = process.env.CYBERBOSS_CODEX_COMMAND || "codex";
+  const command = resolveCodexCommand();
   const isolationArgs = buildSharedCodexIsolationArgs();
   const mcpConfigArgs = buildCodexMcpConfigArgs(resolveCodexProjectToolMcpServerConfig({
     cyberbossHome: process.env.CYBERBOSS_HOME || rootDir,
   }));
-  const pid = spawnDetachedCommand(command, [...isolationArgs, ...mcpConfigArgs, "app-server", "--listen", listenUrl], {
-    logFile: appServerLogFile,
-    env,
-  });
+  const appServerArgs = [...isolationArgs, ...mcpConfigArgs, "app-server", "--listen", listenUrl];
+  const pid = process.platform === "win32"
+    ? await spawnCommandWithHiddenInheritedConsole(command, appServerArgs, {
+      logFile: appServerLogFile,
+      env,
+    })
+    : spawnDetachedCommand(command, appServerArgs, {
+      logFile: appServerLogFile,
+      env,
+    });
   writePidFile(appServerPidFile, pid);
 
   const ready = await waitForReadyz();
@@ -392,6 +596,8 @@ module.exports = {
   writePidFile,
   removePidFileIfMatches,
   buildSharedCodexIsolationArgs,
+  buildHiddenConsoleLauncherSpec,
+  resolveCodexCommand,
   ensureSharedAppServer,
   ensureWeFlowUiaBridge,
   ensureBridgeNotRunning,

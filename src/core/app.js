@@ -14,7 +14,14 @@ const {
   persistLocalWechatAttachments,
 } = require("../integrations/wechat-cli-inbox");
 const { WeFlowInboxSource } = require("../integrations/weflow-inbox");
+const { WeFlowCanaryInboxSource } = require("../integrations/weflow-canary-inbox");
 const { WeFlowMessageLedgerStore } = require("../integrations/weflow-message-ledger-store");
+const { WeFlowHeartbeatCanary } = require("../integrations/weflow-heartbeat-canary");
+const {
+  MODEL_CANARY_DELIVERY_POLICY,
+  MODEL_CANARY_EXECUTION_POLICY,
+  WeFlowModelCanary,
+} = require("../integrations/weflow-model-canary");
 const {
   executeWeFlowControlCommand,
   formatWeFlowControlConfirmation,
@@ -28,7 +35,6 @@ const {
   buildImplicitReferencedPrepared,
   buildMergedInboundPrepared,
   clonePreparedInboundMessage,
-  isImplicitReferencePromptPreparedMessage,
   isSharedContentOnlyPreparedMessage,
   shouldBatchImageOnlyInbound,
   takeImageOnlyBatchMessages,
@@ -51,6 +57,10 @@ const { SystemMessageDispatcher } = require("./system-message-dispatcher");
 const { TimelineScreenshotQueueStore } = require("./timeline-screenshot-queue-store");
 const { TurnGateStore } = require("./turn-gate-store");
 const { PendingInboundStore } = require("./pending-inbound-store");
+const { materializeGeneratedImageArtifact } = require("./generated-image-artifact");
+const { PipelineActivityStore } = require("./pipeline-activity-store");
+const { ReplyObligationStore } = require("./reply-obligation-store");
+const { assertWeFlowCanaryTalkerIsolation } = require("./config");
 const { ReminderQueueStore } = require("../adapters/channel/weixin/reminder-queue-store");
 const {
   matchesCommandPrefix,
@@ -75,8 +85,8 @@ const MAX_PENDING_INBOUND_BATCH_TEXT_CHARS = 24_000;
 const MAX_PENDING_INBOUND_BATCH_ATTACHMENTS = 10;
 const PENDING_INBOUND_COMMIT_RETRY_BASE_MS = 15_000;
 const PENDING_INBOUND_COMMIT_RETRY_MAX_MS = 5 * 60_000;
-const SHARED_CONTENT_FOLLOWUP_WINDOW_MS = 60_000;
-const SHARED_CONTENT_RECOVERY_GRACE_MS = 60_000;
+const WEFLOW_STARTUP_REVOKE_RECONCILE_TIMEOUT_MS = 2_000;
+const WEFLOW_PENDING_REVOKE_GATE_POLL_MS = 100;
 const WEFLOW_UIA_INBOUND_ACK_TEXT = "处理中";
 const REMINDER_INBOUND_ACK_TEXT = "已记录";
 const SILENT_DELIVERY_POLICY = "silent";
@@ -94,8 +104,21 @@ class CyberbossApp {
     this.weflowMessageLedger = new WeFlowMessageLedgerStore({
       filePath: config.weflowMessageLedgerFile || path.join(config.stateDir, "weflow-message-ledger.json"),
     });
+    this.replyObligationStore = new ReplyObligationStore({
+      filePath: config.replyObligationFile || path.join(config.stateDir, "reply-obligations.json"),
+      noReplyTimeoutMs: config.replyObligationTimeoutMs,
+    });
     this.channelAdapter = createWeixinChannelAdapter(config, {
       weflowMessageLedger: this.weflowMessageLedger,
+    });
+    this.weflowHeartbeatCanary = new WeFlowHeartbeatCanary({
+      config,
+      channelAdapter: this.channelAdapter,
+      messageLedger: this.weflowMessageLedger,
+    });
+    this.weflowModelCanary = new WeFlowModelCanary({
+      config,
+      onTrigger: (payload) => this.handleWeFlowModelCanaryTrigger(payload),
     });
     this.timelineIntegration = createTimelineIntegration(config);
     const projectTooling = createProjectTooling(config, {
@@ -115,29 +138,74 @@ class CyberbossApp {
     this.turnGateStore = new TurnGateStore();
     this.pendingInboundStore = new PendingInboundStore({
       filePath: config.pendingInboundQueueFile || path.join(config.stateDir, "pending-inbound.json"),
+      quietWindowMs: config.pendingInboundQuietWindowMs,
     });
     this.pendingInboundByScope = this.pendingInboundStore.snapshotMap();
     this.pendingInboundFlushScopeKeys = new Set();
+    this.pendingInboundFlushTimers = new Map();
     this.pendingInboundPostDispatchCommits = new Map();
     this.pendingSharedContentInboundByScope = this.pendingInboundStore.snapshotSharedMap();
     this.turnBoundaryScopeKeys = new Set();
     this.systemMessageDispatcher = null;
     this.wechatCliInboxSource = null;
     this.weflowInboxSource = null;
+    this.weflowCanaryInboxSource = null;
     this.voiceTranscriptionService = new VoiceTranscriptionService({ config });
     this.streamDelivery = new StreamDelivery({
       channelAdapter: this.channelAdapter,
       sessionStore: this.runtimeAdapter.getSessionStore(),
       runtimeId: this.runtimeAdapter.describe().id,
       onDeferredSystemReply: (payload) => this.deferSystemReply(payload),
+      onReplyDeliveryStarted: (payload) => this.replyObligationStore.markFinalDeliveryStarted(
+        payload.replyObligationId,
+        payload
+      ),
+      onReplyDeliveryVerified: (payload) => this.replyObligationStore.markVerified(
+        payload.replyObligationId,
+        payload
+      ),
+      onReplyDeliveryDeferred: (payload) => this.replyObligationStore.markDeferred(
+        payload.replyObligationId,
+        payload
+      ),
+      onReplyDeliveryFailed: (payload) => this.replyObligationStore.markDeliveryFailure(
+        payload.replyObligationId,
+        payload
+      ),
+      onReplyTurnCompleted: (payload) => this.replyObligationStore.markTurnCompleted(
+        payload.replyObligationId,
+        payload
+      ),
+      onReplyTurnFailed: (payload) => this.replyObligationStore.markRuntimeFailed(
+        payload.replyObligationId,
+        payload
+      ),
+      onReplyExplicitSilent: (payload) => this.replyObligationStore.markExplicitSilent(
+        payload.replyObligationId
+      ),
+      onModelCanaryEvent: (payload) => this.weflowModelCanary.handleDeliveryEvent(payload),
     });
     this.pendingOperationByRunKey = new Map();
+    this.pipelineActivity = new PipelineActivityStore({
+      filePath: config.pipelineActivityFile || path.join(config.stateDir, "cyberboss-pipeline-activity.json"),
+      snapshotProvider: () => this.buildPipelineActivitySnapshot(),
+    });
     this.runtimeEventChain = Promise.resolve();
     this.runtimeAdapter.onEvent((event) => {
       this.threadStateStore.applyRuntimeEvent(event);
       this.runtimeEventChain = this.runtimeEventChain
         .catch(() => {})
-        .then(() => this.handleRuntimeEvent(event))
+        .then(async () => {
+          try {
+            await this.handleRuntimeEvent(event);
+          } finally {
+            if (event?.type === "runtime.turn.completed" || event?.type === "runtime.turn.failed") {
+              this.pipelineActivity.markTurnCompleted();
+            } else if (event?.type === "runtime.turn.started") {
+              this.pipelineActivity.refresh();
+            }
+          }
+        })
         .catch((error) => {
           const message = error instanceof Error ? error.stack || error.message : String(error);
           console.error(`[cyberboss] runtime event handling failed type=${event?.type || "(unknown)"} ${message}`);
@@ -174,12 +242,10 @@ class CyberbossApp {
     const runtimeState = await this.runtimeAdapter.initialize();
     const knownContextTokens = Object.keys(this.channelAdapter.getKnownContextTokens()).length;
     const syncBuffer = this.channelAdapter.loadSyncBuffer();
+    this.restoreReplyObligationTargets();
     await this.restoreBoundThreadSubscriptions();
-    this.restorePendingSharedContentInboundTimers();
-    // Recover durable busy-turn handoffs before any inbox or proactive poller
-    // can add work. dispatchPreparedTurn establishes TurnGate ownership
-    // synchronously before the first recovered turn reaches the runtime.
-    await this.flushPendingInboundMessages();
+    await this.recoverPendingInboundAtStartup();
+    this.pipelineActivity.start();
 
     console.log("[cyberboss] bootstrap ok");
     console.log(`[cyberboss] channel=${this.channelAdapter.describe().id}`);
@@ -206,7 +272,7 @@ class CyberbossApp {
     void this.warmVoiceTranscription().catch((error) => {
       console.warn(`[cyberboss] voice transcription warmup failed: ${formatErrorMessage(error)}`);
     });
-    await this.ensureWeFlowInboxStarted();
+    await this.ensureWeFlowCanaryInboxStarted();
     if (this.config.startWithRestartNotification) {
       void this.sendRestartNotification().catch((error) => {
         console.warn(`[cyberboss] restart notification failed: ${formatErrorMessage(error)}`);
@@ -214,9 +280,12 @@ class CyberbossApp {
     }
 
     const shutdown = createShutdownController(async () => {
+      this.pipelineActivity.stop();
+      this.clearPendingInboundFlushTimers();
       this.clearPendingSharedContentInboundTimers();
       await this.closeWechatCliInbox();
       await this.closeWeFlowInbox();
+      await this.closeWeFlowCanaryInbox();
       await this.closeVoiceTranscription();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -226,6 +295,7 @@ class CyberbossApp {
       let consecutiveFailures = 0;
       while (!shutdown.stopped) {
         try {
+          this.sweepReplyObligations();
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -245,6 +315,7 @@ class CyberbossApp {
             }
             await this.handleIncomingMessage(message);
           }
+          this.sweepReplyObligations();
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -267,9 +338,12 @@ class CyberbossApp {
       }
     } finally {
       shutdown.dispose();
+      this.pipelineActivity.stop();
+      this.clearPendingInboundFlushTimers();
       this.clearPendingSharedContentInboundTimers();
       await this.closeWechatCliInbox();
       await this.closeWeFlowInbox();
+      await this.closeWeFlowCanaryInbox();
       await this.closeVoiceTranscription();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -331,6 +405,7 @@ class CyberbossApp {
       // and remain pending until the binding becomes available.
       isReady: () => true,
       onMessage: (message, snapshot) => this.handleWeFlowInboxMessage(message, snapshot),
+      onActivity: (activity, snapshot) => this.handleWeFlowBatchActivity(activity, snapshot),
     });
     await this.weflowInboxSource.start();
     console.log(
@@ -339,9 +414,299 @@ class CyberbossApp {
     return this.weflowInboxSource;
   }
 
+  async recoverPendingInboundAtStartup() {
+    // A revoke and the message it cancels are persisted in different durable
+    // queues. Start the WeFlow source first and give its revoke queue a bounded
+    // reconciliation pass before an already-expired core batch is eligible to
+    // dispatch. Any revoke still in retry/cooldown remains an explicit gate on
+    // the primary WeFlow scope; startup itself is never held indefinitely.
+    await this.ensureWeFlowInboxStarted();
+    await this.reconcilePendingWeFlowRevokesBeforeRecovery();
+    this.restorePendingSharedContentInboundTimers();
+    this.restorePendingInboundFlushTimers();
+    await this.flushPendingInboundMessages();
+  }
+
+  async reconcilePendingWeFlowRevokesBeforeRecovery({
+    timeoutMs = WEFLOW_STARTUP_REVOKE_RECONCILE_TIMEOUT_MS,
+  } = {}) {
+    const source = this.weflowInboxSource;
+    if (!source || !listPendingWeFlowRevokes(source, this.config).length
+      || typeof source.drainPendingEvents !== "function") {
+      return { status: "not_needed", remaining: 0 };
+    }
+
+    let timeoutHandle = null;
+    const boundedTimeoutMs = Math.max(0, Number(timeoutMs) || 0);
+    const drain = Promise.resolve()
+      .then(() => source.drainPendingEvents())
+      .then(
+        (result) => ({ status: "drained", result }),
+        (error) => ({ status: "failed", error })
+      );
+    const outcome = boundedTimeoutMs
+      ? await Promise.race([
+        drain,
+        new Promise((resolve) => {
+          timeoutHandle = setTimeout(() => resolve({ status: "timeout" }), boundedTimeoutMs);
+        }),
+      ])
+      : await drain;
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+
+    // Persisted per-item retryNotBefore values do not make start() wait. Make
+    // sure the source owns a future retry while the app-level scope gate keeps
+    // the corresponding core batch from overtaking it.
+    if (source.running !== false && source.pendingEvents?.size) {
+      source.schedulePendingDrain?.();
+    }
+    const remaining = listPendingWeFlowRevokes(source, this.config).length;
+    if (outcome.status === "failed") {
+      console.warn(
+        `[cyberboss] startup WeFlow revoke reconciliation deferred: ${formatErrorMessage(outcome.error)}`
+      );
+    } else if (outcome.status === "timeout" && remaining) {
+      console.warn(`[cyberboss] startup WeFlow revoke reconciliation timed out; gated=${remaining}`);
+    }
+    return { ...outcome, remaining };
+  }
+
+  resolvePrimaryWeFlowPendingScopeKey() {
+    const target = this.resolveWeFlowInboxReplyTarget?.();
+    const sessionStore = this.runtimeAdapter?.getSessionStore?.();
+    if (!target?.userId || !this.activeAccountId || typeof sessionStore?.buildBindingKey !== "function") {
+      return "";
+    }
+    try {
+      const bindingKey = sessionStore.buildBindingKey({
+        workspaceId: this.config?.workspaceId,
+        accountId: this.activeAccountId,
+        senderId: target.userId,
+      });
+      return buildScopeKey(bindingKey, this.resolveWorkspaceRoot(bindingKey));
+    } catch {
+      return "";
+    }
+  }
+
+  resolvePendingWeFlowRevokeGate(scopeKey) {
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const primaryScopeKey = this.resolvePrimaryWeFlowPendingScopeKey?.();
+    if (!normalizedScopeKey || !primaryScopeKey || normalizedScopeKey !== primaryScopeKey) {
+      return null;
+    }
+    const source = this.weflowInboxSource;
+    const revokes = listPendingWeFlowRevokes(source, this.config);
+    if (!revokes.length) {
+      return null;
+    }
+
+    const nowMs = Date.now();
+    const earliestItemRetryAtMs = revokes.reduce((earliest, item) => {
+      const retryAtMs = Date.parse(normalizeText(item?.retryNotBefore));
+      return Math.min(earliest, Number.isFinite(retryAtMs) ? retryAtMs : nowMs);
+    }, Number.POSITIVE_INFINITY);
+    const globalRetryAtMs = Number(source?.pendingRetryNotBeforeMs);
+    return {
+      blocked: true,
+      count: revokes.length,
+      retryAtMs: Math.max(
+        nowMs + WEFLOW_PENDING_REVOKE_GATE_POLL_MS,
+        Number.isFinite(earliestItemRetryAtMs) ? earliestItemRetryAtMs : 0,
+        Number.isFinite(globalRetryAtMs) ? globalRetryAtMs : 0
+      ),
+    };
+  }
+
   async closeWeFlowInbox() {
     const source = this.weflowInboxSource;
     this.weflowInboxSource = null;
+    if (source) {
+      await source.stop();
+    }
+  }
+
+  async handleWeFlowBatchActivity(activity, snapshot = {}) {
+    if (normalizeText(activity?.kind).toLowerCase() !== "revoke") {
+      return true;
+    }
+    const rawRevokedMessageId = String(activity?.revokedMessageId ?? "").trim();
+    const revokedPendingId = normalizeWeFlowPendingId(rawRevokedMessageId);
+    if (!revokedPendingId) {
+      return true;
+    }
+    const receivedAt = resolveInboundActivityTime(activity);
+    this.markPipelineUserInbound?.(receivedAt);
+
+    const target = this.resolveWeFlowInboxReplyTarget();
+    if (!target || !this.activeAccountId) {
+      return true;
+    }
+    const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: this.config.workspaceId,
+      accountId: this.activeAccountId,
+      senderId: target.userId,
+    });
+    const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
+    const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
+    const chatUsername = normalizeWeFlowTalker(
+      normalizeText(snapshot?.chatUsername) || normalizeText(this.config.weflowInboxChat)
+    );
+    const sharedScopeKey = chatUsername
+      ? buildSharedContentScopeKey(bindingKey, workspaceRoot, `weflow:${chatUsername}`)
+      : "";
+    const hasPendingBatch = Boolean(scopeKey && this.pendingInboundByScope?.has(scopeKey));
+    const hasPendingSharedContent = Boolean(
+      sharedScopeKey && this.pendingSharedContentInboundByScope?.has(sharedScopeKey)
+    );
+    if (!hasPendingBatch && !hasPendingSharedContent) {
+      return true;
+    }
+
+    let updatedDraft = null;
+    let removedPendingIds = [];
+    if (hasPendingBatch && this.pendingInboundStore) {
+      const result = this.pendingInboundStore.recordActivity(scopeKey, {
+        receivedAt,
+        matchingMessageIds: [rawRevokedMessageId, revokedPendingId],
+      });
+      updatedDraft = result.draft;
+      removedPendingIds = result.removedPendingIds;
+    } else if (hasPendingBatch) {
+      const current = this.pendingInboundByScope.get(scopeKey);
+      const retained = (Array.isArray(current?.messages) ? current.messages : []).filter((message) => {
+        const matches = [
+          normalizeText(message?.pendingId),
+          normalizeText(message?.messageId),
+          ...normalizeSourceMessageIds(message?.sourceMessageIds),
+        ].some((id) => id === rawRevokedMessageId || id === revokedPendingId);
+        if (matches) removedPendingIds.push(resolvePendingInboundId(message));
+        return !matches;
+      });
+      if (retained.length) {
+        const nowMs = Date.now();
+        const parsedActivityAtMs = Date.parse(receivedAt);
+        const activityAtMs = Number.isFinite(parsedActivityAtMs) && parsedActivityAtMs > 0
+          ? Math.min(nowMs, parsedActivityAtMs)
+          : nowMs;
+        const previousActivityAtMs = Date.parse(normalizeText(current.lastActivityAt));
+        const lastActivityAtMs = Math.max(
+          Number.isFinite(previousActivityAtMs) ? previousActivityAtMs : 0,
+          activityAtMs
+        );
+        updatedDraft = {
+          ...current,
+          messages: retained,
+          lastActivityAt: new Date(lastActivityAtMs).toISOString(),
+          quietUntil: new Date(lastActivityAtMs + resolvePendingInboundQuietWindowMs(this)).toISOString(),
+          generation: Math.max(0, Number(current.generation) || 0) + 1,
+        };
+      }
+    }
+
+    if (hasPendingBatch) {
+      if (updatedDraft) {
+        this.pendingInboundByScope.set(scopeKey, updatedDraft);
+        this.schedulePendingInboundFlush(scopeKey);
+      } else {
+        this.pendingInboundByScope.delete(scopeKey);
+        this.clearPendingInboundFlushTimer(scopeKey);
+      }
+    }
+
+    let removedSharedPendingIds = [];
+    if (hasPendingSharedContent) {
+      let updatedSharedDraft = null;
+      let sharedActivityApplied = false;
+      if (this.pendingInboundStore
+        && typeof this.pendingInboundStore.recordSharedActivity === "function") {
+        const result = this.pendingInboundStore.recordSharedActivity(sharedScopeKey, {
+          receivedAt,
+          matchingMessageIds: [rawRevokedMessageId, revokedPendingId],
+        });
+        updatedSharedDraft = result.draft;
+        removedSharedPendingIds = result.removedPendingIds;
+        sharedActivityApplied = result.found;
+      } else {
+        const current = this.pendingSharedContentInboundByScope.get(sharedScopeKey);
+        const retained = (Array.isArray(current?.messages) ? current.messages : []).filter((message) => {
+          const matches = [
+            normalizeText(message?.pendingId),
+            normalizeText(message?.messageId),
+            ...normalizeSourceMessageIds(message?.sourceMessageIds),
+          ].some((id) => id === rawRevokedMessageId || id === revokedPendingId);
+          if (matches) removedSharedPendingIds.push(resolvePendingInboundId(message));
+          return !matches;
+        });
+        sharedActivityApplied = Boolean(current);
+        if (retained.length) {
+          const nowMs = Date.now();
+          const parsedActivityAtMs = Date.parse(receivedAt);
+          const activityAtMs = Number.isFinite(parsedActivityAtMs) && parsedActivityAtMs > 0
+            ? Math.min(nowMs, parsedActivityAtMs)
+            : nowMs;
+          updatedSharedDraft = {
+            ...current,
+            messages: retained,
+            lastContentAtMs: Math.max(Number(current?.lastContentAtMs) || 0, activityAtMs),
+          };
+        }
+      }
+
+      if (sharedActivityApplied) {
+        const clearSharedTimer = typeof this.clearPendingSharedContentInboundTimer === "function"
+          ? this.clearPendingSharedContentInboundTimer
+          : CyberbossApp.prototype.clearPendingSharedContentInboundTimer;
+        clearSharedTimer.call(this, sharedScopeKey);
+        if (updatedSharedDraft) {
+          this.pendingSharedContentInboundByScope.set(sharedScopeKey, {
+            ...updatedSharedDraft,
+            timer: null,
+          });
+          const scheduleSharedExpiry = typeof this.schedulePendingSharedContentInboundExpiry === "function"
+            ? this.schedulePendingSharedContentInboundExpiry
+            : CyberbossApp.prototype.schedulePendingSharedContentInboundExpiry;
+          scheduleSharedExpiry.call(this, sharedScopeKey);
+        } else {
+          this.pendingSharedContentInboundByScope.delete(sharedScopeKey);
+        }
+      }
+    }
+    this.pipelineActivity?.refresh();
+    console.log(
+      `[cyberboss] WeFlow revoke extended pending batch scope=${scopeKey}`
+      + ` revoked=${revokedPendingId} removed=${removedPendingIds.length}`
+      + ` sharedRemoved=${removedSharedPendingIds.length}`
+      + ` chat=${chatUsername}`
+    );
+    return true;
+  }
+
+  async ensureWeFlowCanaryInboxStarted() {
+    if (!this.config.startWithWeflowCanaryInbox) {
+      return this.weflowCanaryInboxSource;
+    }
+    assertWeFlowCanaryTalkerIsolation(this.config);
+    if (this.weflowCanaryInboxSource) {
+      return this.weflowCanaryInboxSource;
+    }
+    this.weflowCanaryInboxSource = new WeFlowCanaryInboxSource({
+      config: this.config,
+      onMessage: (message, snapshot) => this.handleWeFlowCanaryInboxMessage(message, snapshot),
+    });
+    await this.weflowCanaryInboxSource.start();
+    console.log(
+      `[cyberboss] WeFlow canary inbox enabled chat=${this.config.weflowCanaryChat}`
+      + ` contact=${this.config.weflowCanaryDisplayName}`
+    );
+    return this.weflowCanaryInboxSource;
+  }
+
+  async closeWeFlowCanaryInbox() {
+    const source = this.weflowCanaryInboxSource;
+    this.weflowCanaryInboxSource = null;
     if (source) {
       await source.stop();
     }
@@ -361,6 +726,29 @@ class CyberbossApp {
 
   async closeVoiceTranscription() {
     await this.voiceTranscriptionService?.close?.();
+  }
+
+  buildPipelineActivitySnapshot() {
+    const threadStates = this.threadStateStore?.snapshot?.() || [];
+    const activeTurnCount = threadStates.filter((state) => (
+      state?.status === "running" || state?.status === "waiting_approval"
+    )).length;
+    const turnGateCount = Number(this.turnGateStore?.pendingScopeKeys?.size) || 0;
+    const activeDeliveryCount = Number(this.streamDelivery?.stateByRunKey?.size) || 0;
+    const pendingInboundCount = countPendingInboundMessages(this.pendingInboundByScope)
+      + countPendingInboundMessages(this.pendingSharedContentInboundByScope)
+      + (Number(this.pendingInboundPostDispatchCommits?.size) || 0);
+    return {
+      activeTurnCount,
+      turnGateCount,
+      activeDeliveryCount,
+      pendingInboundCount,
+    };
+  }
+
+  markPipelineUserInbound(receivedAt = "") {
+    const timestamp = Date.parse(normalizeIsoTime(receivedAt));
+    this.pipelineActivity?.markUserInbound(Number.isFinite(timestamp) ? timestamp : Date.now());
   }
 
   resolveWechatCliInboxReplyTarget() {
@@ -461,6 +849,7 @@ class CyberbossApp {
     if (!target) {
       return false;
     }
+    this.markPipelineUserInbound?.(message?.receivedAt);
     const persisted = await persistLocalWechatAttachments({
       attachments: message.attachments,
       stateDir: this.config.stateDir,
@@ -511,12 +900,34 @@ class CyberbossApp {
         localId: message.localId,
         messageId: message.id,
         text: message.text,
+        contentKind: message.contentKind || message.kind,
         direction: message.direction,
         observedAt: message.receivedAt,
       });
     } catch (error) {
       console.warn(`[cyberboss] WeFlow message waiting for ledger classification: ${formatErrorMessage(error)}`);
       return false;
+    }
+    let canary;
+    try {
+      canary = await this.weflowHeartbeatCanary?.handleObservedMessage({
+        message,
+        classification,
+        talker: chatUsername,
+      });
+    } catch (error) {
+      console.warn(`[cyberboss] WeFlow heartbeat canary waiting for retry: ${formatErrorMessage(error)}`);
+      return false;
+    }
+    if (canary?.handled) {
+      if (canary.accepted === false) {
+        return false;
+      }
+      console.log(
+        `[cyberboss] WeFlow heartbeat canary consumed status=${canary.status || "handled"}`
+        + ` localId=${message?.localId || "(unknown)"}`
+      );
+      return true;
     }
     if (classification?.origin === "cyberboss" || classification?.classification === "cyberboss") {
       console.log(
@@ -526,6 +937,7 @@ class CyberbossApp {
       );
       return true;
     }
+    this.markPipelineUserInbound?.(message?.receivedAt);
     if (message?.direction === "outgoing") {
       effectiveMessage = { ...message, origin: "self_manual" };
     }
@@ -570,6 +982,7 @@ class CyberbossApp {
       senderId: target.userId,
       chatId: `weflow:${chatUsername}`,
       messageId: `weflow:${enrichedMessage.id}`,
+      sourceMessageIds: normalizeSourceMessageIds(enrichedMessage.sourceMessageIds),
       contextToken: target.contextToken,
       text: buildWeFlowInboxTurnText(enrichedMessage, snapshot, this.config),
       quotedContexts: Array.isArray(enrichedMessage.quotedContexts) ? enrichedMessage.quotedContexts : [],
@@ -586,6 +999,94 @@ class CyberbossApp {
         || (enrichedMessage.timestamp ? new Date(enrichedMessage.timestamp * 1000).toISOString() : new Date().toISOString()),
     };
     await this.handlePreparedMessage(normalized, { allowCommands: false });
+    return true;
+  }
+
+  async handleWeFlowModelCanaryTrigger({ prepared } = {}) {
+    if (!this.config.weflowModelCanaryEnabled || !prepared) {
+      return { accepted: false };
+    }
+    if (normalizeText(prepared.modelCanaryExecutionPolicy) !== MODEL_CANARY_EXECUTION_POLICY
+      || typeof this.runtimeAdapter.supportsExecutionPolicy !== "function"
+      || this.runtimeAdapter.supportsExecutionPolicy(MODEL_CANARY_EXECUTION_POLICY) !== true) {
+      throw new Error("model canary side-effect containment policy is unavailable");
+    }
+    const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
+      workspaceId: prepared.workspaceId,
+      accountId: prepared.accountId,
+      senderId: prepared.senderId,
+    });
+    const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
+    await this.handlePreparedMessage(prepared, {
+      allowCommands: false,
+      internalModelCanary: true,
+    });
+    return { accepted: true, bindingKey, workspaceRoot };
+  }
+
+  async handleWeFlowCanaryInboxMessage(message, snapshot = {}) {
+    const chatUsername = normalizeCommandArgument(snapshot.chatUsername);
+    if (!chatUsername || chatUsername !== normalizeCommandArgument(this.config.weflowCanaryChat)) {
+      console.warn("[cyberboss] WeFlow canary marker ignored from an unexpected talker");
+      return true;
+    }
+    let classification;
+    try {
+      classification = await this.weflowMessageLedger?.classifyObservedOutgoing({
+        talker: chatUsername,
+        localId: message.localId,
+        messageId: message.id,
+        text: message.text,
+        contentKind: message.contentKind || message.kind,
+        direction: message.direction,
+        observedAt: message.receivedAt,
+      });
+    } catch (error) {
+      console.warn(`[cyberboss] WeFlow canary waiting for ledger classification: ${formatErrorMessage(error)}`);
+      return false;
+    }
+    let canary;
+    try {
+      canary = await this.weflowModelCanary?.handleObservedMessage({
+        message,
+        classification,
+        talker: chatUsername,
+      });
+    } catch (error) {
+      console.warn(`[cyberboss] WeFlow model canary waiting for retry: ${formatErrorMessage(error)}`);
+      return false;
+    }
+    if (canary?.handled) {
+      if (canary.accepted === false) return false;
+      console.log(
+        `[cyberboss] WeFlow dedicated model canary consumed status=${canary.status || "handled"}`
+        + ` localId=${message?.localId || "(unknown)"}`
+      );
+      return true;
+    }
+    try {
+      canary = await this.weflowHeartbeatCanary?.handleObservedMessage({
+        message,
+        classification,
+        talker: chatUsername,
+      });
+    } catch (error) {
+      console.warn(`[cyberboss] WeFlow heartbeat canary waiting for retry: ${formatErrorMessage(error)}`);
+      return false;
+    }
+    if (!canary?.handled) {
+      // The lightweight source only forwards the reserved prefix. Any future
+      // parser mismatch is consumed here and never reaches the user/model path.
+      console.warn("[cyberboss] unrecognized WeFlow canary marker consumed without model routing");
+      return true;
+    }
+    if (canary.accepted === false) {
+      return false;
+    }
+    console.log(
+      `[cyberboss] WeFlow dedicated heartbeat canary consumed status=${canary.status || "handled"}`
+      + ` localId=${message?.localId || "(unknown)"}`
+    );
     return true;
   }
 
@@ -689,6 +1190,7 @@ class CyberbossApp {
       console.log(`[cyberboss] native control confirmation consumed: ${normalized.text}`);
       return;
     }
+    this.markPipelineUserInbound?.(normalized.receivedAt);
     if (isWeFlowControlCommand(normalized.text)) {
       await this.handleWeFlowControlCommand(normalized);
       return;
@@ -758,23 +1260,23 @@ class CyberbossApp {
     );
   }
 
-  async handlePreparedMessage(normalized, { allowCommands }) {
+  async handlePreparedMessage(normalized, { allowCommands, internalModelCanary = false }) {
+    if (!internalModelCanary) {
+      normalized = stripModelCanaryPreparedFields(normalized);
+    }
     const bindingKey = this.runtimeAdapter.getSessionStore().buildBindingKey({
       workspaceId: normalized.workspaceId,
       accountId: normalized.accountId,
       senderId: normalized.senderId,
     });
-    const deliveryPolicy = isReminderCreationRequestText(normalized.text)
-      ? SILENT_DELIVERY_POLICY
-      : "";
-    const initialReplyTarget = {
-      userId: normalized.senderId,
-      contextToken: normalized.contextToken,
-      provider: normalized.provider,
-    };
-    if (deliveryPolicy) {
-      initialReplyTarget.deliveryPolicy = deliveryPolicy;
-    }
+    const deliveryPolicy = internalModelCanary
+      && normalized.deliveryPolicy === MODEL_CANARY_DELIVERY_POLICY
+      ? MODEL_CANARY_DELIVERY_POLICY
+      : (isReminderCreationRequestText(normalized.text) ? SILENT_DELIVERY_POLICY : "");
+    const initialReplyTarget = buildReplyTargetFromPrepared({
+      ...normalized,
+      deliveryPolicy,
+    });
     this.streamDelivery.setReplyTarget(bindingKey, initialReplyTarget);
 
     const command = parseChannelCommand(normalized.text);
@@ -788,9 +1290,7 @@ class CyberbossApp {
     if (!prepared) {
       return;
     }
-    if (deliveryPolicy) {
-      prepared.deliveryPolicy = deliveryPolicy;
-    }
+    if (deliveryPolicy) prepared.deliveryPolicy = deliveryPolicy;
     if (typeof this.isCompletedPendingInbound === "function"
       && this.isCompletedPendingInbound(bindingKey, workspaceRoot, prepared.messageId)) {
       return;
@@ -806,22 +1306,13 @@ class CyberbossApp {
     const hasPendingSharedContent = typeof this.hasPendingSharedContentInbound === "function"
       && this.hasPendingSharedContentInbound(bindingKey, workspaceRoot, prepared.chatId);
     if (hasPendingSharedContent) {
-      if (isImplicitReferencePromptPreparedMessage(prepared)) {
-        const merged = await this.consumePendingSharedContentInbound({
-          bindingKey,
-          workspaceRoot,
-          trailingPrepared: prepared,
-        });
-        if (merged) {
-          return;
-        }
-      } else {
-        this.dropPendingSharedContentInbound({
-          bindingKey,
-          workspaceRoot,
-          chatId: prepared.chatId,
-          reason: "superseded",
-        });
+      const merged = await this.consumePendingSharedContentInbound({
+        bindingKey,
+        workspaceRoot,
+        trailingPrepared: prepared,
+      });
+      if (merged) {
+        return;
       }
     }
 
@@ -848,6 +1339,7 @@ class CyberbossApp {
       timer: null,
       lastContentAtMs: 0,
     };
+    let updatedDraft;
     if (this.pendingInboundStore) {
       const stored = this.pendingInboundStore.enqueueSharedContent({
         bindingKey,
@@ -856,15 +1348,17 @@ class CyberbossApp {
         message: clonePreparedInboundMessage(prepared),
         lastContentAtMs: resolvePreparedMessageTimeMs(prepared) || Date.now(),
       });
-      this.pendingSharedContentInboundByScope.set(scopeKey, { ...stored.draft, timer: current.timer || null });
+      updatedDraft = { ...stored.draft, timer: current.timer || null };
+      this.pendingSharedContentInboundByScope.set(scopeKey, updatedDraft);
     } else {
       current.messages.push(clonePreparedInboundMessage(prepared));
       current.lastContentAtMs = resolvePreparedMessageTimeMs(prepared) || Date.now();
+      updatedDraft = current;
       this.pendingSharedContentInboundByScope.set(scopeKey, current);
     }
     this.schedulePendingSharedContentInboundExpiry(scopeKey);
     console.log(
-      `[cyberboss] shared content waiting for prompt scope=${scopeKey} count=${current.messages.length}`
+      `[cyberboss] shared content waiting for prompt scope=${scopeKey} count=${updatedDraft.messages.length}`
     );
   }
 
@@ -877,22 +1371,22 @@ class CyberbossApp {
       clearTimeout(draft.timer);
     }
     const remainingMs = delayMs == null
-      ? Math.max(
-        SHARED_CONTENT_RECOVERY_GRACE_MS,
-        draft.lastContentAtMs + SHARED_CONTENT_FOLLOWUP_WINDOW_MS - Date.now()
-      )
+      ? Math.max(0, draft.lastContentAtMs + resolvePendingInboundQuietWindowMs(this) - Date.now())
       : Math.max(0, Number(delayMs) || 0);
-    draft.timer = setTimeout(() => {
+    draft.timer = setTimeout(async () => {
       const weflowBackfillActive = this.weflowInboxSource?.state?.outgoingPollCursor?.backfillActive === true;
       if (this.weflowInboxSource?.pendingEvents?.size || weflowBackfillActive) {
         this.schedulePendingSharedContentInboundExpiry(scopeKey, RETRY_DELAY_MS);
         return;
       }
       try {
-        this.dropPendingSharedContentInboundByScopeKey(scopeKey, "timeout");
+        const promoteSharedContent = typeof this.promotePendingSharedContentInbound === "function"
+          ? this.promotePendingSharedContentInbound
+          : CyberbossApp.prototype.promotePendingSharedContentInbound;
+        await promoteSharedContent.call(this, scopeKey);
       } catch (error) {
         console.error(
-          `[cyberboss] shared content expiry persistence failed scope=${scopeKey} error=${formatErrorMessage(error)}`
+          `[cyberboss] shared content promotion failed scope=${scopeKey} error=${formatErrorMessage(error)}`
         );
         this.schedulePendingSharedContentInboundExpiry(scopeKey, RETRY_DELAY_MS);
       }
@@ -919,11 +1413,90 @@ class CyberbossApp {
 
   restorePendingSharedContentInboundTimers() {
     for (const [scopeKey] of this.pendingSharedContentInboundByScope.entries()) {
-      // Give durable inbox replay time to deliver a historical prompt. The
-      // event timestamps are still checked in consumePendingSharedContentInbound,
-      // so this grace cannot attach stale content to a genuinely late prompt.
+      // Resume the persisted source-time deadline; restart must not grant a new
+      // full quiet window to content that was already silent before shutdown.
       this.schedulePendingSharedContentInboundExpiry(scopeKey);
     }
+  }
+
+  async promotePendingSharedContentInbound(scopeKey) {
+    const draft = scopeKey ? this.pendingSharedContentInboundByScope.get(scopeKey) || null : null;
+    if (!draft?.bindingKey || !draft?.workspaceRoot) {
+      return false;
+    }
+    const quietUntilMs = Number(draft.lastContentAtMs || 0) + resolvePendingInboundQuietWindowMs(this);
+    if (quietUntilMs > Date.now()) {
+      this.schedulePendingSharedContentInboundExpiry(scopeKey);
+      return false;
+    }
+
+    this.clearPendingSharedContentInboundTimer(scopeKey);
+    const queued = Array.isArray(draft.messages)
+      ? draft.messages
+        .filter((message) => message && typeof message === "object")
+        .slice()
+        .sort(comparePendingInboundMessages)
+      : [];
+    if (!queued.length) {
+      this.dropPendingSharedContentInboundByScopeKey(scopeKey, "empty");
+      return false;
+    }
+
+    const promoted = buildMergedInboundPrepared({
+      bindingKey: draft.bindingKey,
+      workspaceRoot: draft.workspaceRoot,
+      messages: queued,
+    });
+    promoted.messageId = buildSharedContentBatchMessageId(
+      { messageId: "weflow:shared-standalone" },
+      queued
+    );
+    promoted.sourceMessageIds = normalizeSourceMessageIds(queued.flatMap((message) => [
+      message?.messageId,
+      ...(Array.isArray(message?.sourceMessageIds) ? message.sourceMessageIds : []),
+    ]));
+
+    let movedAtomically = false;
+    if (this.pendingInboundStore
+      && typeof this.pendingInboundStore.promoteSharedContent === "function") {
+      const moved = this.pendingInboundStore.promoteSharedContent(scopeKey, {
+        message: promoted,
+        consumedIds: queued.map(resolvePendingInboundId).filter(Boolean),
+      });
+      movedAtomically = true;
+      if (moved.draft) {
+        this.pendingInboundByScope.set(moved.scopeKey, moved.draft);
+      }
+      if (moved.sharedDraft) {
+        this.pendingSharedContentInboundByScope.set(scopeKey, {
+          ...moved.sharedDraft,
+          timer: null,
+        });
+        this.schedulePendingSharedContentInboundExpiry(scopeKey);
+      } else {
+        this.pendingSharedContentInboundByScope.delete(scopeKey);
+      }
+    }
+
+    await this.routePreparedInbound({
+      bindingKey: draft.bindingKey,
+      workspaceRoot: draft.workspaceRoot,
+      prepared: promoted,
+    });
+    if (!movedAtomically) {
+      const commitPendingSharedContent = typeof this.commitPendingSharedContentConsumption === "function"
+        ? this.commitPendingSharedContentConsumption
+        : CyberbossApp.prototype.commitPendingSharedContentConsumption;
+      commitPendingSharedContent.call(
+        this,
+        scopeKey,
+        queued.map(resolvePendingInboundId).filter(Boolean)
+      );
+    }
+    console.log(
+      `[cyberboss] shared content promoted after quiet window scope=${scopeKey} count=${queued.length}`
+    );
+    return true;
   }
 
   dropPendingSharedContentInbound({ bindingKey = "", workspaceRoot = "", chatId = "", reason = "cleared" } = {}) {
@@ -1008,7 +1581,7 @@ class CyberbossApp {
     this.clearPendingSharedContentInboundTimer(scopeKey);
     const promptAtMs = resolvePreparedMessageTimeMs(trailingPrepared) || Date.now();
     const elapsedMs = promptAtMs - Number(draft.lastContentAtMs || 0);
-    if (elapsedMs < 0 || elapsedMs > SHARED_CONTENT_FOLLOWUP_WINDOW_MS) {
+    if (elapsedMs < 0 || elapsedMs > resolvePendingInboundQuietWindowMs(this)) {
       const dropPendingSharedContent = typeof this.dropPendingSharedContentInboundByScopeKey === "function"
         ? this.dropPendingSharedContentInboundByScopeKey
         : CyberbossApp.prototype.dropPendingSharedContentInboundByScopeKey;
@@ -1047,6 +1620,10 @@ class CyberbossApp {
         prompt: trailingPrepared,
       });
       preparedWithReference.messageId = buildSharedContentBatchMessageId(trailingPrepared, batchMessages);
+      // This key lets the durable store temporarily exceed its capacity while
+      // the same shared items are being replaced transactionally. It is
+      // metadata only: it must not split otherwise contiguous quiet-window
+      // input into separate model turns.
       preparedWithReference.sharedHandoffScopeKey = scopeKey;
       if (batchIndex > 0 || promptAcknowledged) {
         // The first durable batch owns the single user-facing processing ack.
@@ -1107,8 +1684,126 @@ class CyberbossApp {
     return threadState?.status === "running" || hasRpcId(threadState?.pendingApproval?.requestId);
   }
 
-  async dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared, suppressFailureReply = false }) {
+  restoreReplyObligationTargets() {
+    if (!this.replyObligationStore || !this.streamDelivery) {
+      return 0;
+    }
+    this.replyObligationStore.reconcileWithLedger(this.weflowMessageLedger);
+    this.replyObligationStore.expireOverdue();
+    let restored = 0;
+    for (const entry of this.replyObligationStore.listOpen()) {
+      if (!entry.threadId || !entry.senderId) continue;
+      const target = {
+        userId: entry.senderId,
+        contextToken: entry.contextToken,
+        provider: "weflow-uia",
+        replyObligationId: entry.id,
+      };
+      if (entry.turnId) {
+        this.streamDelivery.bindReplyTargetForTurn({
+          threadId: entry.threadId,
+          turnId: entry.turnId,
+          target,
+        });
+      } else {
+        this.streamDelivery.queueReplyTargetForThread(entry.threadId, target);
+      }
+      restored += 1;
+    }
+    if (restored > 0) {
+      console.log(`[cyberboss] restored reply obligations count=${restored}`);
+    }
+    return restored;
+  }
+
+  sweepReplyObligations() {
+    if (!this.replyObligationStore) {
+      return { reconciled: 0, expired: 0 };
+    }
+    const reconciled = this.replyObligationStore.reconcileWithLedger(this.weflowMessageLedger);
+    const expired = this.replyObligationStore.expireOverdue();
+    if (expired > 0) {
+      console.error(`[cyberboss] reply obligations reached no-reply timeout count=${expired}`);
+    }
+    return { reconciled, expired };
+  }
+
+  async dispatchPreparedTurn({
+    bindingKey,
+    workspaceRoot,
+    prepared,
+    sourceMessageIds = [],
+    suppressFailureReply = false,
+  }) {
     const pendingScopeKey = this.turnGateStore.begin(bindingKey, workspaceRoot);
+    this.pipelineActivity?.refresh();
+    let replyObligation = null;
+    const obligationSourceIds = normalizeSourceMessageIds([
+      ...(Array.isArray(sourceMessageIds) ? sourceMessageIds : [sourceMessageIds]),
+      ...(Array.isArray(prepared?.sourceMessageIds) ? prepared.sourceMessageIds : [prepared?.sourceMessageIds]),
+    ]);
+    if (!obligationSourceIds.length && normalizeText(prepared?.messageId)) {
+      obligationSourceIds.push(normalizeText(prepared.messageId));
+    }
+    if (
+      this.replyObligationStore
+      && prepared.provider === "weflow-uia"
+      && prepared.deliveryPolicy !== SILENT_DELIVERY_POLICY
+      && prepared.deliveryPolicy !== MODEL_CANARY_DELIVERY_POLICY
+      && obligationSourceIds.length
+    ) {
+      try {
+        replyObligation = this.replyObligationStore.begin({
+          sourceMessageIds: obligationSourceIds,
+          provider: prepared.provider,
+          talker: normalizeWeFlowTalker(prepared.chatId),
+          accountId: prepared.accountId,
+          senderId: prepared.senderId,
+          contextToken: prepared.contextToken,
+          bindingKey,
+          workspaceRoot,
+        });
+      } catch (error) {
+        this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
+        this.pipelineActivity?.refresh();
+        console.error(`[cyberboss] reply obligation handoff persistence failed: ${formatErrorMessage(error)}`);
+        return false;
+      }
+      const existing = replyObligation.entry;
+      if (!replyObligation.created && existing.terminal) {
+        this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
+        this.pipelineActivity?.refresh();
+        console.warn(
+          `[cyberboss] duplicate reply obligation suppressed id=${existing.id} outcome=${existing.terminalOutcome}`
+        );
+        return true;
+      }
+      if (
+        !replyObligation.created
+        && existing.handoffAcceptedAt
+        && existing.threadId
+      ) {
+        const target = {
+          userId: existing.senderId,
+          contextToken: existing.contextToken,
+          provider: "weflow-uia",
+          replyObligationId: existing.id,
+        };
+        if (existing.turnId) {
+          this.streamDelivery.bindReplyTargetForTurn({
+            threadId: existing.threadId,
+            turnId: existing.turnId,
+            target,
+          });
+        } else {
+          this.streamDelivery.queueReplyTargetForThread(existing.threadId, target);
+        }
+        this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
+        this.pipelineActivity?.refresh();
+        console.warn(`[cyberboss] duplicate runtime handoff suppressed replyObligation=${existing.id}`);
+        return true;
+      }
+    }
     if (prepared.provider !== "weflow-uia") {
       await this.channelAdapter.sendTyping({
         userId: prepared.senderId,
@@ -1129,10 +1824,13 @@ class CyberbossApp {
         text: runtimeTurn.text,
         attachments: runtimeTurn.attachments,
         model,
+        executionPolicy: normalizeText(prepared.modelCanaryExecutionPolicy),
         metadata: {
           workspaceId: prepared.workspaceId,
           accountId: prepared.accountId,
           senderId: prepared.senderId,
+          modelCanaryDenySideEffects:
+            normalizeText(prepared.modelCanaryExecutionPolicy) === MODEL_CANARY_EXECUTION_POLICY,
         },
       });
       this.runtimeContextStore?.setActiveContext?.({
@@ -1144,13 +1842,28 @@ class CyberbossApp {
         senderId: prepared.senderId,
       });
       this.turnGateStore.attachThread(pendingScopeKey, turn.threadId);
-      const replyTarget = {
-        userId: prepared.senderId,
-        contextToken: prepared.contextToken,
-        provider: prepared.provider,
-      };
-      if (prepared.deliveryPolicy) {
-        replyTarget.deliveryPolicy = prepared.deliveryPolicy;
+      const replyTarget = buildReplyTargetFromPrepared(prepared);
+      if (prepared.deliveryPolicy === MODEL_CANARY_DELIVERY_POLICY) {
+        const handoffReceipt = await this.weflowModelCanary.handleDeliveryEvent({
+          type: "runtime_handoff_accepted",
+          target: replyTarget,
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+          bindingKey,
+          workspaceRoot,
+        }).catch(() => ({ accepted: false }));
+        if (handoffReceipt?.accepted !== true) {
+          console.error(
+            `[cyberboss] model canary runtime handoff receipt failed runId=${prepared.modelCanaryRunId || "(unknown)"}`
+          );
+        }
+      }
+      if (replyObligation?.entry?.id) {
+        replyTarget.replyObligationId = replyObligation.entry.id;
+        this.replyObligationStore.markTurnAccepted(replyObligation.entry.id, {
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+        });
       }
       if (turn.turnId) {
         this.streamDelivery.bindReplyTargetForTurn({
@@ -1163,10 +1876,21 @@ class CyberbossApp {
       }
       return true;
     } catch (error) {
+      if (replyObligation?.entry?.id) {
+        try {
+          this.replyObligationStore.markHandoffFailure(replyObligation.entry.id, error);
+        } catch (obligationError) {
+          console.error(
+            `[cyberboss] failed to record runtime handoff failure obligation=${replyObligation.entry.id}: `
+            + formatErrorMessage(obligationError)
+          );
+        }
+      }
       this.turnGateStore.releaseScope(bindingKey, workspaceRoot);
+      this.pipelineActivity?.refresh();
       const messageText = error instanceof Error ? error.message : String(error || "unknown error");
-      if (prepared.deliveryPolicy === SILENT_DELIVERY_POLICY) {
-        console.error(`[cyberboss] background reminder turn failed: ${messageText}`);
+      if (isSilentRuntimeDeliveryPolicy(prepared.deliveryPolicy)) {
+        console.error(`[cyberboss] background/probe turn failed without user delivery: ${messageText}`);
         return false;
       }
       if (suppressFailureReply) {
@@ -1184,6 +1908,13 @@ class CyberbossApp {
   }
 
   async buildRuntimeTurn({ prepared, model = "" }) {
+    if (prepared?.deliveryPolicy === MODEL_CANARY_DELIVERY_POLICY) {
+      return {
+        text: String(prepared.text || "").trim(),
+        attachments: [],
+        memoryContext: { entries: [], items: [] },
+      };
+    }
     const memoryContext = typeof this.resolveRelevantMemory === "function"
       ? this.resolveRelevantMemory(prepared)
       : { entries: [], items: [] };
@@ -1344,6 +2075,85 @@ class CyberbossApp {
     return dispatch;
   }
 
+  restorePendingInboundFlushTimers() {
+    for (const scopeKey of this.pendingInboundByScope.keys()) {
+      this.schedulePendingInboundFlush(scopeKey);
+    }
+  }
+
+  schedulePendingInboundFlush(scopeKey) {
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const draft = this.pendingInboundByScope.get(normalizedScopeKey);
+    if (!normalizedScopeKey || !draft) {
+      this.clearPendingInboundFlushTimer(normalizedScopeKey);
+      return false;
+    }
+    const quietUntilMs = Date.parse(normalizeText(draft.quietUntil));
+    const nextDispatchAtMs = Date.parse(normalizeText(draft.nextDispatchAt));
+    const revokeGate = typeof this.resolvePendingWeFlowRevokeGate === "function"
+      ? this.resolvePendingWeFlowRevokeGate(normalizedScopeKey)
+      : null;
+    const deadlineMs = Math.max(
+      Number.isFinite(quietUntilMs) ? quietUntilMs : 0,
+      Number.isFinite(nextDispatchAtMs) ? nextDispatchAtMs : 0,
+      Number.isFinite(revokeGate?.retryAtMs) ? revokeGate.retryAtMs : 0
+    );
+    this.clearPendingInboundFlushTimer(normalizedScopeKey);
+    if (!deadlineMs || deadlineMs <= Date.now()) {
+      return false;
+    }
+
+    const generation = Math.max(0, Number(draft.generation) || 0);
+    const delayMs = Math.min(0x7fffffff, Math.max(1, deadlineMs - Date.now()));
+    const timer = setTimeout(() => {
+      const scheduled = this.pendingInboundFlushTimers?.get(normalizedScopeKey);
+      if (!scheduled || scheduled.timer !== timer) {
+        return;
+      }
+      this.pendingInboundFlushTimers.delete(normalizedScopeKey);
+      const latest = this.pendingInboundByScope.get(normalizedScopeKey);
+      if (!latest) {
+        return;
+      }
+      if (Math.max(0, Number(latest.generation) || 0) !== generation) {
+        this.schedulePendingInboundFlush(normalizedScopeKey);
+        return;
+      }
+      void this.flushPendingInboundMessages({
+        bindingKey: latest.bindingKey,
+        workspaceRoot: latest.workspaceRoot,
+      }).then(() => {
+        this.schedulePendingInboundFlush(normalizedScopeKey);
+      }).catch((error) => {
+        console.error(
+          `[cyberboss] pending inbound quiet-window flush failed scope=${normalizedScopeKey} `
+          + `error=${formatErrorMessage(error)}`
+        );
+        this.schedulePendingInboundFlush(normalizedScopeKey);
+      });
+    }, delayMs);
+    timer.unref?.();
+    this.pendingInboundFlushTimers.set(normalizedScopeKey, { deadlineMs, generation, timer });
+    return true;
+  }
+
+  clearPendingInboundFlushTimer(scopeKey) {
+    const normalizedScopeKey = normalizeText(scopeKey);
+    const scheduled = this.pendingInboundFlushTimers?.get(normalizedScopeKey);
+    if (!scheduled) {
+      return false;
+    }
+    clearTimeout(scheduled.timer || scheduled);
+    this.pendingInboundFlushTimers.delete(normalizedScopeKey);
+    return true;
+  }
+
+  clearPendingInboundFlushTimers() {
+    for (const scopeKey of [...(this.pendingInboundFlushTimers?.keys?.() || [])]) {
+      this.clearPendingInboundFlushTimer(scopeKey);
+    }
+  }
+
   bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared }) {
     const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
     if (!scopeKey || !prepared) {
@@ -1356,7 +2166,10 @@ class CyberbossApp {
     if (this.pendingInboundStore) {
       const result = this.pendingInboundStore.enqueue({ bindingKey, workspaceRoot, message });
       this.pendingInboundByScope.set(scopeKey, result.draft);
-      if (result.added) {
+      if (typeof this.schedulePendingInboundFlush === "function") {
+        this.schedulePendingInboundFlush(scopeKey);
+      }
+      if (result.added && prepared.suppressAcknowledgement !== true) {
         void this.channelAdapter.sendTyping({
           userId: prepared.senderId,
           status: 1,
@@ -1369,6 +2182,9 @@ class CyberbossApp {
       bindingKey,
       workspaceRoot,
       messages: [],
+      lastActivityAt: "",
+      quietUntil: "",
+      generation: 0,
     };
     const existing = current.messages.find((item) => (
       normalizeText(item?.messageId) && normalizeText(item.messageId) === normalizeText(message.messageId)
@@ -1377,12 +2193,32 @@ class CyberbossApp {
       return { added: false, scopeKey, message: existing, draft: current };
     }
     current.messages.push(message);
+    const nowMs = Date.now();
+    const receivedAtMs = Date.parse(normalizeText(message.receivedAt));
+    const activityAtMs = Number.isFinite(receivedAtMs) && receivedAtMs > 0
+      ? Math.min(nowMs, receivedAtMs)
+      : nowMs;
+    const previousActivityAtMs = Date.parse(normalizeText(current.lastActivityAt));
+    const lastActivityAtMs = Math.max(
+      Number.isFinite(previousActivityAtMs) ? previousActivityAtMs : 0,
+      activityAtMs
+    );
+    current.lastActivityAt = new Date(lastActivityAtMs).toISOString();
+    current.quietUntil = new Date(
+      lastActivityAtMs + resolvePendingInboundQuietWindowMs(this)
+    ).toISOString();
+    current.generation = Math.max(0, Number(current.generation) || 0) + 1;
     this.pendingInboundByScope.set(scopeKey, current);
-    void this.channelAdapter.sendTyping({
-      userId: prepared.senderId,
-      status: 1,
-      contextToken: prepared.contextToken,
-    }).catch(() => {});
+    if (typeof this.schedulePendingInboundFlush === "function") {
+      this.schedulePendingInboundFlush(scopeKey);
+    }
+    if (prepared.suppressAcknowledgement !== true) {
+      void this.channelAdapter.sendTyping({
+        userId: prepared.senderId,
+        status: 1,
+        contextToken: prepared.contextToken,
+      }).catch(() => {});
+    }
     return { added: true, scopeKey, message, draft: current };
   }
 
@@ -1450,8 +2286,14 @@ class CyberbossApp {
       const stored = this.pendingInboundStore.commitDispatch(scopeKey, consumedIds, { remainingMessages });
       if (stored) {
         this.pendingInboundByScope.set(scopeKey, stored);
+        if (typeof this.schedulePendingInboundFlush === "function") {
+          this.schedulePendingInboundFlush(scopeKey);
+        }
       } else {
         this.pendingInboundByScope.delete(scopeKey);
+        if (typeof this.clearPendingInboundFlushTimer === "function") {
+          this.clearPendingInboundFlushTimer(scopeKey);
+        }
       }
       return stored;
     }
@@ -1472,15 +2314,24 @@ class CyberbossApp {
     if (retained.length) {
       const next = { ...latest, messages: retained };
       this.pendingInboundByScope.set(scopeKey, next);
+      if (typeof this.schedulePendingInboundFlush === "function") {
+        this.schedulePendingInboundFlush(scopeKey);
+      }
       return next;
     }
     this.pendingInboundByScope.delete(scopeKey);
+    if (typeof this.clearPendingInboundFlushTimer === "function") {
+      this.clearPendingInboundFlushTimer(scopeKey);
+    }
     return null;
   }
 
   removePendingInboundScope(scopeKey) {
     if (this.pendingInboundStore) {
       this.pendingInboundStore.removeScope(scopeKey);
+    }
+    if (typeof this.clearPendingInboundFlushTimer === "function") {
+      this.clearPendingInboundFlushTimer(scopeKey);
     }
     return this.pendingInboundByScope.delete(scopeKey);
   }
@@ -1538,6 +2389,22 @@ class CyberbossApp {
           }
           continue;
         }
+        const revokeGate = typeof this.resolvePendingWeFlowRevokeGate === "function"
+          ? this.resolvePendingWeFlowRevokeGate(scopeKey)
+          : null;
+        if (revokeGate?.blocked) {
+          if (typeof this.schedulePendingInboundFlush === "function") {
+            this.schedulePendingInboundFlush(scopeKey);
+          }
+          continue;
+        }
+        const quietUntilMs = Date.parse(normalizeText(activeDraft.quietUntil));
+        if (Number.isFinite(quietUntilMs) && quietUntilMs > Date.now()) {
+          if (typeof this.schedulePendingInboundFlush === "function") {
+            this.schedulePendingInboundFlush(scopeKey);
+          }
+          continue;
+        }
         if (typeof this.acknowledgeBufferedInboundOnce === "function") {
           for (const message of Array.isArray(activeDraft.messages) ? activeDraft.messages : []) {
             if (!message?.acknowledgementStatus && shouldAcknowledgeInbound(message)) {
@@ -1549,8 +2416,18 @@ class CyberbossApp {
           }
           activeDraft = this.pendingInboundByScope.get(scopeKey) || activeDraft;
         }
+        const refreshedQuietUntilMs = Date.parse(normalizeText(activeDraft.quietUntil));
+        if (Number.isFinite(refreshedQuietUntilMs) && refreshedQuietUntilMs > Date.now()) {
+          if (typeof this.schedulePendingInboundFlush === "function") {
+            this.schedulePendingInboundFlush(scopeKey);
+          }
+          continue;
+        }
         const nextDispatchAtMs = Date.parse(normalizeText(activeDraft.nextDispatchAt));
         if (Number.isFinite(nextDispatchAtMs) && nextDispatchAtMs > Date.now()) {
+          if (typeof this.schedulePendingInboundFlush === "function") {
+            this.schedulePendingInboundFlush(scopeKey);
+          }
           continue;
         }
         if (this.isTurnDispatchBlocked(activeDraft.bindingKey, activeDraft.workspaceRoot, {
@@ -1571,13 +2448,29 @@ class CyberbossApp {
         const dispatched = await this.dispatchPreparedTurn({
           bindingKey: pendingDispatch.prepared.bindingKey,
           workspaceRoot: pendingDispatch.prepared.workspaceRoot,
+          sourceMessageIds: pendingDispatch.consumedIds,
           prepared: {
             workspaceId: pendingDispatch.prepared.workspaceId,
             accountId: pendingDispatch.prepared.accountId,
             senderId: pendingDispatch.prepared.senderId,
+            chatId: pendingDispatch.prepared.chatId,
+            sourceMessageIds: pendingDispatch.prepared.sourceMessageIds,
             contextToken: pendingDispatch.prepared.contextToken,
             provider: pendingDispatch.prepared.provider,
             deliveryPolicy: pendingDispatch.prepared.deliveryPolicy,
+            suppressAcknowledgement: pendingDispatch.prepared.suppressAcknowledgement,
+            modelCanaryExecutionPolicy: pendingDispatch.prepared.modelCanaryExecutionPolicy,
+            modelCanaryRunId: pendingDispatch.prepared.modelCanaryRunId,
+            modelCanaryNonce: pendingDispatch.prepared.modelCanaryNonce,
+            modelCanaryObligationFingerprint: pendingDispatch.prepared.modelCanaryObligationFingerprint,
+            replyUserId: pendingDispatch.prepared.replyUserId,
+            replyWeflowContact: pendingDispatch.prepared.replyWeflowContact,
+            replyWeflowTalker: pendingDispatch.prepared.replyWeflowTalker,
+            replyWeflowExactContact: pendingDispatch.prepared.replyWeflowExactContact,
+            replyMessageKind: pendingDispatch.prepared.replyMessageKind,
+            replyIdempotencyKey: pendingDispatch.prepared.replyIdempotencyKey,
+            replyCanonicalText: pendingDispatch.prepared.replyCanonicalText,
+            replyDesktopInputLease: pendingDispatch.prepared.replyDesktopInputLease,
             originalText: pendingDispatch.prepared.originalText,
             text: pendingDispatch.prepared.text,
             quotedContexts: Array.isArray(pendingDispatch.prepared.quotedContexts)
@@ -1586,6 +2479,7 @@ class CyberbossApp {
             attachments: pendingDispatch.prepared.attachments,
             attachmentFailures: pendingDispatch.prepared.attachmentFailures,
             receivedAt: pendingDispatch.prepared.receivedAt,
+            sharedHandoffScopeKey: pendingDispatch.prepared.sharedHandoffScopeKey,
           },
           suppressFailureReply: Number(activeDraft.dispatchAttemptCount) > 0,
         });
@@ -1596,6 +2490,9 @@ class CyberbossApp {
             });
             if (deferred) {
               this.pendingInboundByScope.set(scopeKey, deferred);
+              if (typeof this.schedulePendingInboundFlush === "function") {
+                this.schedulePendingInboundFlush(scopeKey);
+              }
               console.warn(
                 `[cyberboss] pending inbound retry deferred scope=${scopeKey} `
                 + `attempt=${deferred.dispatchAttemptCount} next=${deferred.nextDispatchAt}`
@@ -1607,6 +2504,9 @@ class CyberbossApp {
               Date.now() + Math.min(15 * 60_000, 15_000 * (2 ** Math.min(6, activeDraft.dispatchAttemptCount - 1)))
             ).toISOString();
             this.pendingInboundByScope.set(scopeKey, activeDraft);
+            if (typeof this.schedulePendingInboundFlush === "function") {
+              this.schedulePendingInboundFlush(scopeKey);
+            }
           }
           continue;
         }
@@ -1653,8 +2553,17 @@ class CyberbossApp {
     if (!queued.length) {
       return null;
     }
-    if (queued.every((message) => shouldBatchImageOnlyInbound(message))) {
-      const { batchMessages, remainingMessages } = takeImageOnlyBatchMessages(queued, MAX_INBOUND_STICKER_IMAGE_BATCH);
+    // Shared-content handoff metadata exists for durable capacity accounting,
+    // not as a semantic turn boundary. Every message collected in this scope
+    // before the inactivity deadline remains eligible for the same batch.
+    const dispatchable = queued;
+    const boundarySuffix = [];
+
+    if (dispatchable.every((message) => shouldBatchImageOnlyInbound(message))) {
+      const { batchMessages, remainingMessages } = takeImageOnlyBatchMessages(
+        dispatchable,
+        MAX_INBOUND_STICKER_IMAGE_BATCH,
+      );
       return {
         prepared: buildMergedInboundPrepared({
           bindingKey: draft.bindingKey,
@@ -1662,11 +2571,12 @@ class CyberbossApp {
           messages: batchMessages,
         }),
         consumedIds: batchMessages.map(resolvePendingInboundId).filter(Boolean),
-        remainingMessages,
+        remainingMessages: [...remainingMessages, ...boundarySuffix],
       };
     }
 
-    const { batchMessages, remainingMessages } = takeBoundedPendingInboundMessages(queued);
+    const { batchMessages, remainingMessages } = takeBoundedPendingInboundMessages(dispatchable);
+    const queuedRemainder = [...remainingMessages, ...boundarySuffix];
 
     if (batchMessages.length === 1) {
       return {
@@ -1676,7 +2586,7 @@ class CyberbossApp {
           ...batchMessages[0],
         },
         consumedIds: [resolvePendingInboundId(batchMessages[0])].filter(Boolean),
-        remainingMessages,
+        remainingMessages: queuedRemainder,
       };
     }
 
@@ -1687,7 +2597,7 @@ class CyberbossApp {
       .map((message) => String(message.text || "").trim())
       .filter(Boolean);
     const batchText = [
-      "Multiple newer WeChat messages arrived while you were still handling the previous turn.",
+      "Multiple newer WeChat messages arrived within one collection window.",
       "Treat the following blocks as one ordered batch of fresh user input and respond once after considering all of them.",
       "",
       blocks.join("\n\n"),
@@ -1706,7 +2616,7 @@ class CyberbossApp {
         text: batchText,
       },
       consumedIds: batchMessages.map(resolvePendingInboundId).filter(Boolean),
-      remainingMessages,
+      remainingMessages: queuedRemainder,
     };
   }
 
@@ -2431,14 +3341,60 @@ class CyberbossApp {
   }
 
   async handleRuntimeEvent(event) {
-    const failureReplyTarget = event?.type === "runtime.turn.failed"
+    const eventThreadId = normalizeText(event?.payload?.threadId);
+    const eventSessionStore = this.runtimeAdapter.getSessionStore();
+    const eventLinkedBinding = eventThreadId
+      ? eventSessionStore.findBindingForThreadId(eventThreadId)
+      : null;
+    const eventReplyTarget = event?.payload?.threadId
+      && typeof this.streamDelivery.resolveReplyTargetForRun === "function"
       ? this.streamDelivery.resolveReplyTargetForRun({
           threadId: event?.payload?.threadId,
           turnId: event?.payload?.turnId,
         })
       : null;
-    await this.streamDelivery.handleRuntimeEvent(event);
+    const modelCanaryEvent = eventReplyTarget?.deliveryPolicy === MODEL_CANARY_DELIVERY_POLICY
+      || isModelCanarySenderId(eventLinkedBinding?.senderId);
+    if (
+      event?.type === "runtime.turn.completed"
+      && !modelCanaryEvent
+      && typeof this.reconcileGeneratedImagesForTurn === "function"
+    ) {
+      await this.reconcileGeneratedImagesForTurn(event);
+    }
+    if (event?.type === "runtime.media.completed") {
+      const preparedMediaEvent = this.prepareGeneratedImageRuntimeEvent(event);
+      if (!preparedMediaEvent) {
+        return;
+      }
+      await this.streamDelivery.handleRuntimeEvent(preparedMediaEvent);
+    } else {
+      await this.streamDelivery.handleRuntimeEvent(event);
+    }
     if (!event) {
+      return;
+    }
+    if (event.type === "runtime.tool.started") {
+      if (!modelCanaryEvent) return;
+      await this.weflowModelCanary.handleDeliveryEvent({
+        type: "tool_attempted",
+        target: eventReplyTarget,
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+        itemId: event.payload.itemId,
+        toolType: event.payload.toolType,
+      }).catch(() => ({ accepted: false }));
+      if (typeof this.runtimeAdapter.cancelTurn === "function") {
+        await this.runtimeAdapter.cancelTurn({
+          threadId: event.payload.threadId,
+          turnId: event.payload.turnId,
+          workspaceRoot: eventLinkedBinding?.workspaceRoot || "",
+        }).catch(() => {});
+      }
+      console.error(
+        `[cyberboss] model canary tool attempt cancelled thread=${event.payload.threadId}`
+        + ` toolType=${event.payload.toolType || "(unknown)"}`
+      );
       return;
     }
     if (event.type === "runtime.turn.completed" || event.type === "runtime.turn.failed") {
@@ -2448,9 +3404,9 @@ class CyberbossApp {
       if (pendingOperation && pendingOperations?.delete) {
         pendingOperations.delete(completedRunKey);
       }
-      const sessionStore = this.runtimeAdapter.getSessionStore();
+      const sessionStore = eventSessionStore;
       sessionStore.clearApprovalPrompt(event.payload.threadId);
-      const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(event.payload.threadId);
+      const linked = eventLinkedBinding || eventSessionStore.findBindingForThreadId(event.payload.threadId);
       const scopeKey = linked?.bindingKey && linked?.workspaceRoot
         ? buildScopeKey(linked.bindingKey, linked.workspaceRoot)
         : "";
@@ -2458,12 +3414,32 @@ class CyberbossApp {
         this.turnBoundaryScopeKeys.add(scopeKey);
       }
       try {
-        this.turnGateStore.releaseThread(event.payload.threadId);
+        let gateRelease = this.turnGateStore.releaseThread(event.payload.threadId);
+        if (gateRelease?.released !== true
+          && linked?.bindingKey
+          && linked?.workspaceRoot
+          && typeof this.turnGateStore.releaseScope === "function") {
+          gateRelease = this.turnGateStore.releaseScope(linked.bindingKey, linked.workspaceRoot);
+        }
+        const gateReleaseVerified = gateRelease?.released === true
+          && Boolean(scopeKey)
+          && gateRelease.scopeKey === scopeKey
+          && this.turnGateStore.isPending(linked.bindingKey, linked.workspaceRoot) === false;
+        if (modelCanaryEvent) {
+          await this.weflowModelCanary.handleDeliveryEvent({
+            type: gateReleaseVerified ? "turn_released" : "turn_release_failed",
+            target: eventReplyTarget,
+            threadId: event.payload.threadId,
+            turnId: event.payload.turnId,
+            expectedScopeKey: scopeKey,
+            releasedScopeKey: normalizeText(gateRelease?.scopeKey),
+          });
+        }
         if (event.type === "runtime.turn.failed") {
           await this.sendFailureToThread(
             event.payload.threadId,
             event.payload.text || "❌ Execution failed",
-            failureReplyTarget,
+            eventReplyTarget,
           );
         }
         if (linked?.bindingKey && linked?.workspaceRoot) {
@@ -2508,9 +3484,39 @@ class CyberbossApp {
           turnId: event.payload.turnId,
         })
       : null;
-    const sessionStore = this.runtimeAdapter.getSessionStore();
-    const linked = sessionStore.findBindingForThreadId(event.payload.threadId);
+    const sessionStore = eventSessionStore;
+    const linked = eventLinkedBinding || sessionStore.findBindingForThreadId(event.payload.threadId);
     if (!linked?.workspaceRoot) {
+      return;
+    }
+    if (modelCanaryEvent) {
+      await this.weflowModelCanary.handleDeliveryEvent({
+        type: "approval_denied",
+        target: eventReplyTarget,
+        threadId: event.payload.threadId,
+        turnId: event.payload.turnId,
+        requestId: event.payload.requestId,
+      });
+      const denial = buildApprovalResponsePayload(event.payload, "no");
+      let denied = false;
+      if (denial) {
+        denied = await this.runtimeAdapter.respondApproval(denial)
+          .then(() => true)
+          .catch(() => false);
+        if (denied) this.threadStateStore.resolveApproval(event.payload.threadId, "running");
+      }
+      if (!denied && typeof this.runtimeAdapter.cancelTurn === "function") {
+        await this.runtimeAdapter.cancelTurn({
+          threadId: event.payload.threadId,
+          turnId: event.payload.turnId,
+          workspaceRoot: linked.workspaceRoot,
+        }).catch(() => {});
+      }
+      sessionStore.clearApprovalPrompt(event.payload.threadId);
+      console.error(
+        `[cyberboss] model canary approval denied thread=${event.payload.threadId}`
+        + ` requestId=${event.payload.requestId || "(unknown)"}`
+      );
       return;
     }
     const allowlist = sessionStore.getApprovalCommandAllowlistForWorkspace(linked.workspaceRoot);
@@ -2552,8 +3558,94 @@ class CyberbossApp {
     this.threadStateStore.resolveApproval(event.payload.threadId, "running");
   }
 
+  async reconcileGeneratedImagesForTurn(event) {
+    if (typeof this.runtimeAdapter.listTurnGeneratedImages !== "function") {
+      return;
+    }
+    const threadId = normalizeText(event?.payload?.threadId);
+    const turnId = normalizeText(event?.payload?.turnId);
+    if (!threadId || !turnId) {
+      return;
+    }
+
+    let artifacts;
+    try {
+      artifacts = await this.runtimeAdapter.listTurnGeneratedImages({ threadId, turnId });
+    } catch (error) {
+      console.warn(
+        `[cyberboss] generated image discovery failed thread=${threadId} turn=${turnId}: ${formatErrorMessage(error)}`
+      );
+      return;
+    }
+    for (const artifact of Array.isArray(artifacts) ? artifacts : []) {
+      const mediaEvent = this.prepareGeneratedImageRuntimeEvent({
+        type: "runtime.media.completed",
+        payload: {
+          threadId,
+          turnId,
+          itemId: artifact?.itemId,
+          kind: "image",
+          filePath: artifact?.savedPath,
+          result: artifact?.result,
+          mimeType: "image/png",
+        },
+      });
+      if (mediaEvent) {
+        await this.streamDelivery.handleRuntimeEvent(mediaEvent);
+      }
+    }
+  }
+
+  prepareGeneratedImageRuntimeEvent(event) {
+    const threadId = normalizeText(event?.payload?.threadId);
+    const turnId = normalizeText(event?.payload?.turnId);
+    const itemId = normalizeText(event?.payload?.itemId);
+    if (!threadId || !turnId || !itemId) {
+      return null;
+    }
+    try {
+      const outputDir = this.config.generatedImageOutboundDir
+        || path.join(this.config.stateDir, "generated-images-outbound");
+      const codexHome = normalizeText(process.env.CODEX_HOME) || path.join(os.homedir(), ".codex");
+      const materialized = materializeGeneratedImageArtifact({
+        itemId,
+        savedPath: event?.payload?.filePath,
+        result: event?.payload?.result,
+      }, {
+        outputDir,
+        threadId,
+        turnId,
+        allowedSourceRoots: [
+          path.join(codexHome, "generated_images", threadId),
+          outputDir,
+        ],
+      });
+      return {
+        type: "runtime.media.completed",
+        payload: {
+          threadId,
+          turnId,
+          itemId,
+          kind: "image",
+          filePath: materialized.filePath,
+          mimeType: "image/png",
+          sha256: materialized.sha256,
+          idempotencyKey: materialized.idempotencyKey,
+        },
+      };
+    } catch (error) {
+      console.error(
+        `[cyberboss] generated image materialization failed thread=${threadId} turn=${turnId} item=${itemId}: ${formatErrorMessage(error)}`
+      );
+      return null;
+    }
+  }
+
   async stopTypingForThread(threadId) {
     const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(threadId);
+    if (normalizeText(linked?.senderId).startsWith("cyberboss-model-canary:")) {
+      return;
+    }
     const target = linked?.bindingKey ? this.resolveReplyTargetForBinding(linked.bindingKey) : null;
     if (!target) {
       return;
@@ -2568,8 +3660,8 @@ class CyberbossApp {
   async sendFailureToThread(threadId, text, fallbackTarget = null) {
     const linked = this.runtimeAdapter.getSessionStore().findBindingForThreadId(threadId);
     const fallback = normalizeReplyTarget(fallbackTarget);
-    if (fallback?.deliveryPolicy === SILENT_DELIVERY_POLICY) {
-      console.error(`[cyberboss] suppressed background turn failure thread=${threadId}`);
+    if (isSilentRuntimeDeliveryPolicy(fallback?.deliveryPolicy)) {
+      console.error(`[cyberboss] suppressed background/probe turn failure thread=${threadId}`);
       return;
     }
     const target = normalizeReplyTarget(
@@ -2578,8 +3670,8 @@ class CyberbossApp {
     if (!target) {
       return;
     }
-    if (target.deliveryPolicy === SILENT_DELIVERY_POLICY) {
-      console.error(`[cyberboss] suppressed background turn failure thread=${threadId}`);
+    if (isSilentRuntimeDeliveryPolicy(target.deliveryPolicy)) {
+      console.error(`[cyberboss] suppressed background/probe turn failure thread=${threadId}`);
       return;
     }
     await this.channelAdapter.sendText({
@@ -2597,9 +3689,9 @@ class CyberbossApp {
       );
       return;
     }
-    if (target.deliveryPolicy === SILENT_DELIVERY_POLICY) {
+    if (isSilentRuntimeDeliveryPolicy(target.deliveryPolicy)) {
       console.log(
-        `[cyberboss] approval prompt suppressed for background reminder binding=${bindingKey} requestId=${approval?.requestId || ""}`
+        `[cyberboss] approval prompt suppressed for background/probe turn binding=${bindingKey} requestId=${approval?.requestId || ""}`
       );
       return;
     }
@@ -2632,6 +3724,13 @@ class CyberbossApp {
       if (!bindingKey) {
         continue;
       }
+      if (isModelCanarySenderId(binding?.senderId)) {
+        // The canonical target is manifest-bound and intentionally not stored
+        // in the generic session binding. After a crash, fail closed: do not
+        // synthesize an ordinary Weixin target and do not resume the probe.
+        console.warn(`[cyberboss] model canary binding left dormant after restart binding=${bindingKey}`);
+        continue;
+      }
 
       const target = this.resolveReplyTargetForBinding(bindingKey);
       if (target) {
@@ -2658,7 +3757,7 @@ class CyberbossApp {
   resolveReplyTargetForBinding(bindingKey) {
     const binding = this.runtimeAdapter.getSessionStore().getBinding(bindingKey) || null;
     const userId = normalizeCommandArgument(binding?.senderId);
-    if (!userId) {
+    if (!userId || isModelCanarySenderId(userId)) {
       return null;
     }
     const contextToken = this.channelAdapter.getKnownContextTokens()[userId] || "";
@@ -2674,6 +3773,61 @@ function buildRunKey(threadId, turnId) {
   return `${normalizeCommandArgument(threadId)}:${normalizeCommandArgument(turnId)}`;
 }
 
+function buildReplyTargetFromPrepared(prepared = {}) {
+  const modelCanary = prepared.deliveryPolicy === MODEL_CANARY_DELIVERY_POLICY;
+  const target = {
+    userId: modelCanary ? normalizeText(prepared.replyUserId) : normalizeText(prepared.senderId),
+    contextToken: normalizeText(prepared.contextToken),
+    provider: normalizeText(prepared.provider),
+  };
+  const deliveryPolicy = normalizeText(prepared.deliveryPolicy);
+  if (deliveryPolicy) target.deliveryPolicy = deliveryPolicy;
+  if (modelCanary) {
+    target.modelCanaryExecutionPolicy = normalizeText(prepared.modelCanaryExecutionPolicy);
+    target.modelCanaryRunId = normalizeText(prepared.modelCanaryRunId);
+    target.modelCanaryNonce = normalizeText(prepared.modelCanaryNonce);
+    target.modelCanaryObligationFingerprint = normalizeText(prepared.modelCanaryObligationFingerprint);
+    target.weflowContact = normalizeText(prepared.replyWeflowContact);
+    target.weflowTalker = normalizeText(prepared.replyWeflowTalker);
+    target.weflowExactContact = prepared.replyWeflowExactContact === true;
+    target.messageKind = normalizeText(prepared.replyMessageKind);
+    target.idempotencyKey = normalizeText(prepared.replyIdempotencyKey);
+    target.canonicalText = normalizeText(prepared.replyCanonicalText);
+    target.desktopInputLease = normalizeDesktopInputLease(prepared.replyDesktopInputLease);
+  }
+  return target;
+}
+
+function stripModelCanaryPreparedFields(prepared = {}) {
+  const sanitized = { ...prepared };
+  for (const key of [
+    "suppressAcknowledgement",
+    "modelCanaryExecutionPolicy",
+    "modelCanaryRunId",
+    "modelCanaryNonce",
+    "modelCanaryObligationFingerprint",
+    "replyUserId",
+    "replyWeflowContact",
+    "replyWeflowTalker",
+    "replyWeflowExactContact",
+    "replyMessageKind",
+    "replyIdempotencyKey",
+    "replyCanonicalText",
+    "replyDesktopInputLease",
+  ]) {
+    delete sanitized[key];
+  }
+  if (sanitized.deliveryPolicy === MODEL_CANARY_DELIVERY_POLICY) {
+    delete sanitized.deliveryPolicy;
+  }
+  return sanitized;
+}
+
+function isSilentRuntimeDeliveryPolicy(value) {
+  const policy = normalizeText(value);
+  return policy === SILENT_DELIVERY_POLICY || policy === MODEL_CANARY_DELIVERY_POLICY;
+}
+
 function normalizeReplyTarget(target) {
   if (!target?.userId) {
     return null;
@@ -2687,7 +3841,50 @@ function normalizeReplyTarget(target) {
   if (deliveryPolicy) {
     normalized.deliveryPolicy = deliveryPolicy;
   }
+  for (const key of [
+    "replyObligationId",
+    "modelCanaryRunId",
+    "modelCanaryNonce",
+    "modelCanaryObligationFingerprint",
+    "modelCanaryExecutionPolicy",
+    "weflowContact",
+    "weflowTalker",
+    "messageKind",
+    "idempotencyKey",
+    "canonicalText",
+  ]) {
+    const value = normalizeText(target[key]);
+    if (value) normalized[key] = value;
+  }
+  if (target.weflowExactContact === true) normalized.weflowExactContact = true;
+  const desktopInputLease = normalizeDesktopInputLease(target.desktopInputLease);
+  if (desktopInputLease) normalized.desktopInputLease = desktopInputLease;
+  const requireDesktopIdleSeconds = normalizePositiveInteger(target.requireDesktopIdleSeconds);
+  if (requireDesktopIdleSeconds) normalized.requireDesktopIdleSeconds = requireDesktopIdleSeconds;
   return normalized;
+}
+
+function normalizeDesktopInputLease(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    version: Number(raw.version),
+    mode: normalizeText(raw.mode),
+    runId: normalizeText(raw.runId).toLowerCase(),
+    nonce: normalizeText(raw.nonce).toLowerCase(),
+    targetFingerprint: normalizeText(raw.targetFingerprint).toLowerCase(),
+    replyIdempotencyKey: normalizeText(raw.replyIdempotencyKey),
+    expiresAt: normalizeText(raw.expiresAt),
+    token: normalizeText(raw.token).toLowerCase(),
+  };
+}
+
+function isModelCanarySenderId(value) {
+  return normalizeText(value).startsWith("cyberboss-model-canary:");
+}
+
+function normalizePositiveInteger(value) {
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : 0;
 }
 
 function formatCompactNumber(value) {
@@ -2938,6 +4135,32 @@ function formatWechatCliKind(value) {
   }
 }
 
+function countPendingInboundMessages(scopeMap) {
+  if (!(scopeMap instanceof Map)) {
+    return 0;
+  }
+  let count = 0;
+  for (const scope of scopeMap.values()) {
+    count += Array.isArray(scope?.messages) ? scope.messages.length : 0;
+  }
+  return count;
+}
+
+function listPendingWeFlowRevokes(source, config = {}) {
+  if (!(source?.pendingEvents instanceof Map)) {
+    return [];
+  }
+  const configuredChat = normalizeText(config?.weflowInboxChat);
+  return [...source.pendingEvents.values()].filter((item) => {
+    if (normalizeText(item?.eventType) !== "message.revoke") {
+      return false;
+    }
+    const push = item?.push || {};
+    const chat = normalizeText(push.sessionId || push.talker || push.chatUsername);
+    return !configuredChat || !chat || chat === configuredChat;
+  });
+}
+
 module.exports = { CyberbossApp };
 
 function parseChannelCommand(text) {
@@ -3053,6 +4276,48 @@ function normalizeThreadId(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeSourceMessageIds(value) {
+  const seen = new Set();
+  const normalized = [];
+  for (const item of Array.isArray(value) ? value : [value]) {
+    const id = normalizeText(item);
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      normalized.push(id);
+    }
+  }
+  return normalized;
+}
+
+function normalizeWeFlowTalker(value) {
+  const normalized = normalizeText(value);
+  return normalized.startsWith("weflow:") ? normalized.slice("weflow:".length).trim() : normalized;
+}
+
+function normalizeWeFlowPendingId(value) {
+  const normalized = String(value ?? "").trim();
+  if (!normalized) {
+    return "";
+  }
+  return normalized.startsWith("weflow:") ? normalized : `weflow:${normalized}`;
+}
+
+function resolveInboundActivityTime(activity) {
+  const receivedAt = normalizeIsoTime(activity?.receivedAt);
+  if (receivedAt) {
+    return receivedAt;
+  }
+  const timestampMs = Number(activity?.timestamp) * 1_000;
+  return Number.isFinite(timestampMs) && timestampMs > 0
+    ? new Date(timestampMs).toISOString()
+    : "";
+}
+
+function resolvePendingInboundQuietWindowMs(app) {
+  const configured = Number(app?.config?.pendingInboundQuietWindowMs);
+  return Number.isSafeInteger(configured) && configured >= 0 ? configured : 15_000;
 }
 
 function normalizeIsoTime(value) {
@@ -3254,8 +4519,11 @@ function buildReminderSystemTrigger(reminder, config = {}) {
 }
 
 function shouldAcknowledgeInbound(prepared) {
-  return prepared?.provider === "weflow-uia"
-    || prepared?.deliveryPolicy === SILENT_DELIVERY_POLICY;
+  return prepared?.suppressAcknowledgement !== true
+    && (
+      prepared?.provider === "weflow-uia"
+      || prepared?.deliveryPolicy === SILENT_DELIVERY_POLICY
+    );
 }
 
 function resolvePendingInboundId(message) {

@@ -320,6 +320,120 @@ test("codex adapter enables native image input from model metadata or explicit o
   assert.equal(forcedOn.getTurnCapabilities({ model: "unknown" }).nativeImageInput, true);
 });
 
+test("codex adapter runs model probes on a spawned isolated client with the exact constant prompt", { concurrency: false }, async (t) => {
+  const indexPath = path.resolve(__dirname, "../src/adapters/runtime/codex/index.js");
+  const rpcClientPath = path.resolve(__dirname, "../src/adapters/runtime/codex/rpc-client.js");
+  const mcpConfigPath = path.resolve(__dirname, "../src/adapters/runtime/codex/mcp-config.js");
+  const originalIndex = require.cache[indexPath];
+  const originalRpc = require.cache[rpcClientPath];
+  const originalMcp = require.cache[mcpConfigPath];
+  const instances = [];
+
+  class MockCodexRpcClient {
+    constructor(options) {
+      this.options = options;
+      this.isReady = false;
+      this.transportReady = false;
+      this.startCalls = [];
+      this.sendCalls = [];
+      instances.push(this);
+    }
+    onMessage() { return () => {}; }
+    async connect() { this.transportReady = true; }
+    async initialize() { this.isReady = true; }
+    isTransportReady() { return this.transportReady; }
+    async listModels() { return { result: { data: [] } }; }
+    getIsolatedWorkspaceRoot() { return "D:/isolated-model-canary-workspace"; }
+    async startThread(params) {
+      this.startCalls.push(params);
+      return { result: { thread: { id: "thread-model-isolated" } } };
+    }
+    async resumeThread() { throw new Error("unexpected resume"); }
+    async sendUserMessage(params) {
+      this.sendCalls.push(params);
+      return { result: { turn: { id: "turn-model-isolated" } } };
+    }
+    async close() {}
+  }
+
+  delete require.cache[indexPath];
+  require.cache[rpcClientPath] = {
+    id: rpcClientPath,
+    filename: rpcClientPath,
+    loaded: true,
+    exports: { CodexRpcClient: MockCodexRpcClient },
+  };
+  require.cache[mcpConfigPath] = {
+    id: mcpConfigPath,
+    filename: mcpConfigPath,
+    loaded: true,
+    exports: { resolveCodexProjectToolMcpServerConfig() { return { name: "fixture" }; } },
+  };
+  t.after(() => {
+    delete require.cache[indexPath];
+    if (originalIndex) require.cache[indexPath] = originalIndex;
+    if (originalRpc) require.cache[rpcClientPath] = originalRpc;
+    else delete require.cache[rpcClientPath];
+    if (originalMcp) require.cache[mcpConfigPath] = originalMcp;
+    else delete require.cache[mcpConfigPath];
+  });
+
+  const {
+    MODEL_CANARY_EXECUTION_POLICY,
+    MODEL_CANARY_PROMPT,
+  } = require("../src/integrations/weflow-model-canary");
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-codex-isolated-probe-"));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const { createCodexRuntimeAdapter } = require(indexPath);
+  const adapter = createCodexRuntimeAdapter({
+    sessionsFile: path.join(tempDir, "sessions.json"),
+    codexEndpoint: "ws://127.0.0.1:8765",
+    codexCommand: "codex-fixture",
+    stateDir: tempDir,
+  });
+  adapter.createClient();
+  const result = await adapter.sendTurn({
+    bindingKey: "binding-model",
+    workspaceRoot: "D:/ordinary-workspace",
+    text: MODEL_CANARY_PROMPT,
+    attachments: [],
+    executionPolicy: MODEL_CANARY_EXECUTION_POLICY,
+    metadata: {
+      workspaceId: "cyberboss-model-canary",
+      accountId: "cyberboss-model-canary",
+      senderId: "cyberboss-model-canary:fixture",
+      modelCanaryDenySideEffects: true,
+    },
+  });
+
+  assert.equal(instances.length, 2);
+  assert.equal(instances[0].options.endpoint, "ws://127.0.0.1:8765");
+  assert.equal(instances[1].options.endpoint, "");
+  assert.equal(instances[1].options.isolatedProfile, true);
+  assert.equal(instances[1].options.mcpServerConfig, null);
+  assert.deepEqual(instances[1].startCalls, [{
+    cwd: "D:/isolated-model-canary-workspace",
+    model: "",
+    modelProvider: "",
+    dynamicTools: [],
+    environments: [],
+  }]);
+  assert.equal(instances[1].sendCalls[0].text, MODEL_CANARY_PROMPT);
+  assert.equal(instances[1].sendCalls[0].executionPolicy, MODEL_CANARY_EXECUTION_POLICY);
+  assert.equal(instances[1].sendCalls[0].workspaceRoot, "D:/isolated-model-canary-workspace");
+  assert.equal(instances[1].sendCalls[0].accessMode, null);
+  assert.deepEqual(result, {
+    threadId: "thread-model-isolated",
+    turnId: "turn-model-isolated",
+    executionPolicy: MODEL_CANARY_EXECUTION_POLICY,
+  });
+  assert.equal(
+    adapter.getSessionStore().getBinding("binding-model").modelCanaryDenySideEffects,
+    true,
+  );
+  await adapter.close();
+});
+
 function emitMockCodexTurnCompleted(listeners, threadId, turnId) {
   for (const listener of listeners) {
     listener({
