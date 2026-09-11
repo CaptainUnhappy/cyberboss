@@ -64,10 +64,88 @@ test("outbound ledger persists its lifecycle without storing message text", (t) 
   const duplicatePlan = restarted.planOutbound({
     talker: "wxid_control",
     text: "private fixture reply",
+    messageKind: "final_reply",
     idempotencyKey: "turn-1:final",
   });
   assert.equal(duplicatePlan.id, planned.id);
   assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).entries.length, 1);
+});
+
+test("atomic outbound planning claims one sender and permits a certain-failure retry", (t) => {
+  const { clock, createStore, filePath } = fixture(t);
+  const store = createStore();
+  const payload = {
+    talker: "chat-atomic-claim",
+    text: "exactly once",
+    messageKind: "final_reply",
+    expectedDirection: "outgoing",
+    idempotencyKey: "turn-atomic:final",
+  };
+
+  const first = store.planAndClaimOutbound(payload);
+  const concurrent = store.planAndClaimOutbound(payload);
+  assert.equal(first.claimed, true);
+  assert.equal(first.entry.status, "sending");
+  assert.equal(first.entry.attemptCount, 1);
+  assert.equal(concurrent.claimed, false);
+  assert.equal(concurrent.entry.id, first.entry.id);
+  assert.equal(concurrent.entry.status, "sending");
+  assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).entries.length, 1);
+
+  clock.value += 1_000;
+  const failed = store.markFailed(first.entry, { uncertain: false, error: "bridge rejected" });
+  assert.equal(failed.status, "failed");
+  clock.value += 1_000;
+  const retry = store.planAndClaimOutbound(payload);
+  assert.equal(retry.claimed, true);
+  assert.equal(retry.entry.id, first.entry.id);
+  assert.equal(retry.entry.status, "sending");
+  assert.equal(retry.entry.attemptCount, 2);
+});
+
+test("reusing a text idempotency key with different content is rejected", (t) => {
+  const { createStore } = fixture(t);
+  const store = createStore();
+  store.planOutbound({
+    talker: "chat-text-key-conflict",
+    text: "original text",
+    messageKind: "final_reply",
+    expectedDirection: "outgoing",
+    idempotencyKey: "same-text-key",
+  });
+
+  assert.throws(() => store.planOutbound({
+    talker: "chat-text-key-conflict",
+    text: "different text",
+    messageKind: "final_reply",
+    expectedDirection: "outgoing",
+    idempotencyKey: "same-text-key",
+  }), (error) => (
+    error?.code === "IDEMPOTENCY_KEY_REUSE_MISMATCH"
+    && error.mismatchedFields?.includes("contentHash")
+  ));
+});
+
+test("reusing an image idempotency key with another digest is rejected", (t) => {
+  const { createStore } = fixture(t);
+  const store = createStore();
+  const base = {
+    talker: "chat-image-key-conflict",
+    text: "[图片]",
+    contentKind: "image",
+    messageKind: "generated_image",
+    expectedDirection: "outgoing",
+    idempotencyKey: "same-image-key",
+  };
+  store.planAndClaimOutbound({ ...base, imageDigest: "a".repeat(64) });
+
+  assert.throws(() => store.planAndClaimOutbound({
+    ...base,
+    imageDigest: "b".repeat(64),
+  }), (error) => (
+    error?.code === "IDEMPOTENCY_KEY_REUSE_MISMATCH"
+    && error.mismatchedFields?.includes("imageDigest")
+  ));
 });
 
 test("content fallback normalizes text and consumes equal messages in FIFO order", (t) => {
@@ -194,6 +272,201 @@ test("zero local ids are missing values and fall through to a positive message i
   assert.equal(manual.origin, "self_manual");
 });
 
+test("image plans persist media identity and idempotency retries return the original state", (t) => {
+  const { createStore, filePath } = fixture(t);
+  const digest = "A".repeat(64);
+  const store = createStore();
+  const planned = store.planOutbound({
+    talker: "chat-image-plan",
+    text: "[图片]",
+    contentKind: "image",
+    imageDigest: digest,
+    idempotencyKey: "turn-image-1",
+  });
+  assert.equal(planned.contentKind, "image");
+  assert.equal(planned.imageDigest, digest.toLowerCase());
+  assert.equal(planned.contentHash, hashWeFlowMessageContent("[图片]"));
+  assert.equal("text" in planned, false);
+
+  store.markSending(planned);
+  const verified = store.markVerified(planned, { localId: 1_501 });
+  assert.equal(verified.status, "verified");
+
+  const restarted = createStore();
+  const duplicate = restarted.planOutbound({
+    talker: "chat-image-plan",
+    text: "[图片]",
+    contentKind: "image",
+    imageDigest: digest,
+    idempotencyKey: "turn-image-1",
+  });
+  assert.equal(duplicate.id, planned.id);
+  assert.equal(duplicate.status, "verified");
+  assert.equal(duplicate.localId, "1501");
+  assert.equal(duplicate.contentKind, "image");
+  assert.equal(duplicate.imageDigest, digest.toLowerCase());
+  assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).entries.length, 1);
+});
+
+test("image fallback is direction-aware content-kind FIFO and leaves unmatched manual images alone", (t) => {
+  const { clock, createStore } = fixture(t);
+  const store = createStore();
+  const first = store.planOutbound({
+    talker: "chat-image-fifo",
+    text: "[图片]",
+    contentKind: "image",
+    imageDigest: "1".repeat(64),
+    expectedDirection: "outgoing",
+  });
+  store.markSending(first);
+  clock.value += 10;
+  const second = store.planOutbound({
+    talker: "chat-image-fifo",
+    text: "[图片]",
+    contentKind: "image",
+    imageDigest: "2".repeat(64),
+    expectedDirection: "outgoing",
+  });
+  store.markSending(second);
+
+  const oppositeDirection = store.classifyObservedOutgoing({
+    talker: "chat-image-fifo",
+    kind: "image",
+    text: "",
+    direction: "incoming",
+    observedAt: clock.value,
+  });
+  assert.equal(oppositeDirection.origin, "self_manual");
+
+  const unrelatedManual = store.classifyObservedOutgoing({
+    talker: "another-image-chat",
+    contentKind: "image",
+    text: "[图片]",
+    direction: "outgoing",
+    observedAt: clock.value,
+  });
+  assert.equal(unrelatedManual.origin, "self_manual");
+
+  const firstEcho = store.classifyObservedOutgoing({
+    talker: "chat-image-fifo",
+    contentKind: "image",
+    text: "",
+    direction: "outgoing",
+    localId: 1_601,
+    observedAt: clock.value,
+  });
+  assert.equal(firstEcho.origin, "cyberboss");
+  assert.equal(firstEcho.matchedBy, "content_kind_fifo");
+  assert.equal(firstEcho.entry.id, first.id);
+
+  clock.value += 1;
+  const secondEcho = store.classifyObservedOutgoing({
+    talker: "chat-image-fifo",
+    kind: "image",
+    text: "[图片]",
+    direction: "outgoing",
+    localId: 1_602,
+    observedAt: clock.value,
+  });
+  assert.equal(secondEcho.entry.id, second.id);
+
+  const noThirdPlan = store.classifyObservedOutgoing({
+    talker: "chat-image-fifo",
+    kind: "image",
+    text: "",
+    direction: "outgoing",
+    observedAt: clock.value,
+  });
+  assert.equal(noThirdPlan.origin, "self_manual");
+});
+
+test("an exact verified image local id wins before an older image FIFO candidate", (t) => {
+  const { clock, createStore } = fixture(t);
+  const store = createStore();
+  const older = store.planOutbound({
+    talker: "chat-image-local-id",
+    text: "[图片]",
+    contentKind: "image",
+  });
+  store.markSending(older);
+  clock.value += 10;
+  const exactEntry = store.planOutbound({
+    talker: "chat-image-local-id",
+    text: "[图片]",
+    contentKind: "image",
+  });
+  store.markSending(exactEntry);
+  store.markVerified(exactEntry, { localId: 1_701 });
+
+  const exact = store.classifyObservedOutgoing({
+    talker: "chat-image-local-id",
+    localId: 1_701,
+    contentKind: "image",
+    text: "",
+    direction: "outgoing",
+    observedAt: clock.value,
+  });
+  assert.equal(exact.origin, "cyberboss");
+  assert.equal(exact.matchedBy, "local_id");
+  assert.equal(exact.entry.id, exactEntry.id);
+
+  const remainingFifo = store.classifyObservedOutgoing({
+    talker: "chat-image-local-id",
+    kind: "image",
+    text: "a WeFlow placeholder that is not stable",
+    direction: "outgoing",
+    localId: 1_702,
+    observedAt: clock.value,
+  });
+  assert.equal(remainingFifo.matchedBy, "content_kind_fifo");
+  assert.equal(remainingFifo.entry.id, older.id);
+});
+
+test("failed-uncertain image echoes survive restart only inside the bounded recovery window", (t) => {
+  const { clock, createStore } = fixture(t);
+  const store = createStore();
+  const recoverable = store.planOutbound({
+    talker: "chat-image-restart",
+    text: "[图片]",
+    contentKind: "image",
+    imageDigest: "3".repeat(64),
+  });
+  store.markSending(recoverable);
+  store.markFailed(recoverable, { uncertain: true, error: "verification timeout" });
+
+  clock.value += 5 * 60_000;
+  const restarted = createStore();
+  const recovered = restarted.classifyObservedOutgoing({
+    talker: "chat-image-restart",
+    contentKind: "image",
+    text: "",
+    direction: "outgoing",
+    localId: 1_801,
+    observedAt: clock.value,
+  });
+  assert.equal(recovered.origin, "cyberboss");
+  assert.equal(recovered.matchedBy, "content_kind_fifo");
+  assert.equal(recovered.entry.id, recoverable.id);
+  assert.equal(recovered.entry.imageDigest, "3".repeat(64));
+
+  const stale = restarted.planOutbound({
+    talker: "chat-image-restart",
+    text: "[图片]",
+    contentKind: "image",
+  });
+  restarted.markSending(stale);
+  restarted.markFailed(stale, { uncertain: true });
+  clock.value += 15 * 60_000 + 1;
+  const staleManual = createStore().classifyObservedOutgoing({
+    talker: "chat-image-restart",
+    kind: "image",
+    text: "",
+    direction: "outgoing",
+    observedAt: clock.value,
+  });
+  assert.equal(staleManual.origin, "self_manual");
+});
+
 test("certain failures and uncertain entries outside their bounded recovery window stay self manual", (t) => {
   const { clock, createStore } = fixture(t);
   const store = createStore();
@@ -231,7 +504,7 @@ test("a corrupt ledger is preserved and replaced with a usable empty document", 
 
   const recovered = createStore();
   assert.deepEqual(JSON.parse(fs.readFileSync(filePath, "utf8")), {
-    version: 2,
+    version: 3,
     entries: [],
   });
   assert.equal(fs.readdirSync(dir).some((name) => name.startsWith("outbound-ledger.json.corrupt-")), true);
@@ -353,7 +626,7 @@ test("native and failed-uncertain rows survive a five minute offline backfill wi
   assert.equal(laterManual.origin, "self_manual");
 });
 
-test("version one ledgers infer native incoming and UIA outgoing directions during migration", (t) => {
+test("version one ledgers infer directions and text content kind during migration", (t) => {
   const { createStore, filePath } = fixture(t);
   fs.writeFileSync(filePath, JSON.stringify({
     version: 1,
@@ -379,9 +652,12 @@ test("version one ledgers infer native incoming and UIA outgoing directions duri
 
   createStore();
   const migrated = JSON.parse(fs.readFileSync(filePath, "utf8"));
-  assert.equal(migrated.version, 2);
+  assert.equal(migrated.version, 3);
   assert.equal(migrated.entries.find((entry) => entry.id === "legacy-native").expectedDirection, "incoming");
   assert.equal(migrated.entries.find((entry) => entry.id === "legacy-uia").expectedDirection, "outgoing");
+  assert.equal(migrated.entries.find((entry) => entry.id === "legacy-native").contentKind, "text");
+  assert.equal(migrated.entries.find((entry) => entry.id === "legacy-uia").contentKind, "text");
+  assert.equal(migrated.entries.find((entry) => entry.id === "legacy-uia").imageDigest, "");
 });
 
 test("a migration write failure preserves the valid primary ledger", (t) => {

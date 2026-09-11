@@ -6,7 +6,7 @@ const DEFAULT_MATCH_WINDOW_MS = 120_000;
 const DEFAULT_UNCERTAIN_MATCH_WINDOW_MS = 15 * 60_000;
 const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_MAX_ENTRIES = 4_000;
-const LEDGER_VERSION = 2;
+const LEDGER_VERSION = 3;
 const VALID_EXPECTED_DIRECTIONS = new Set(["incoming", "outgoing"]);
 const MATCHABLE_STATUSES = new Set(["sending", "failed_uncertain"]);
 const VALID_STATUSES = new Set([
@@ -102,48 +102,57 @@ class WeFlowMessageLedgerStore {
 
   planOutbound(payload = {}) {
     this.load();
-    const talker = normalizeTalker(resolveTalker(payload));
-    const normalizedContent = normalizeWeFlowMessageContent(payload.text ?? payload.content);
-    if (!talker || !normalizedContent) {
-      throw new Error("outbound talker and text are required");
-    }
-
-    const requestedIdempotencyKey = normalizeOpaque(payload.idempotencyKey);
-    if (requestedIdempotencyKey) {
+    const normalized = normalizeOutboundPayload(payload, this.currentTimeMs());
+    if (normalized.requestedIdempotencyKey) {
       const existing = this.state.entries.find((entry) => (
-        entry.talker === talker && entry.idempotencyKey === requestedIdempotencyKey
+        entry.talker === normalized.talker
+        && entry.idempotencyKey === normalized.requestedIdempotencyKey
       ));
       if (existing) {
+        assertIdempotencyPayloadMatches(existing, normalized);
         return cloneEntry(existing);
       }
     }
 
-    const id = normalizeOpaque(payload.id) || crypto.randomUUID();
-    const createdAt = toIsoTime(payload.plannedAt ?? payload.createdAt, this.currentTimeMs());
-    const entry = {
-      id,
-      idempotencyKey: requestedIdempotencyKey || id,
-      talker,
-      contentHash: hashNormalizedContent(normalizedContent),
-      messageKind: normalizeOpaque(payload.messageKind),
-      expectedDirection: normalizeExpectedDirection(payload.expectedDirection) || "outgoing",
-      status: "planned",
-      localId: "",
-      attemptCount: 0,
-      uncertain: false,
-      createdAt,
-      updatedAt: createdAt,
-      sendingAt: "",
-      verifiedAt: "",
-      failedAt: "",
-      observedAt: "",
-      failureCode: "",
-      failureHash: "",
-    };
+    const entry = createPlannedEntry(normalized);
     this.state.entries.push(entry);
     this.state.entries.sort(compareEntries);
     this.save();
     return cloneEntry(entry);
+  }
+
+  planAndClaimOutbound(payload = {}) {
+    this.load();
+    const nowMs = this.currentTimeMs();
+    const normalized = normalizeOutboundPayload(payload, nowMs);
+    let entry = normalized.requestedIdempotencyKey
+      ? this.state.entries.find((candidate) => (
+        candidate.talker === normalized.talker
+        && candidate.idempotencyKey === normalized.requestedIdempotencyKey
+      ))
+      : null;
+
+    if (entry) {
+      assertIdempotencyPayloadMatches(entry, normalized);
+      if (entry.status !== "planned" && entry.status !== "failed") {
+        return { entry: cloneEntry(entry), claimed: false };
+      }
+    } else {
+      entry = createPlannedEntry(normalized);
+      this.state.entries.push(entry);
+      this.state.entries.sort(compareEntries);
+    }
+
+    const at = toIsoTime(payload.sendingAt ?? payload.at, nowMs);
+    entry.status = "sending";
+    entry.sendingAt = at;
+    entry.updatedAt = at;
+    entry.attemptCount += 1;
+    entry.uncertain = false;
+    entry.failureCode = "";
+    entry.failureHash = "";
+    this.save();
+    return { entry: cloneEntry(entry), claimed: true };
   }
 
   markSending(reference, details = {}) {
@@ -227,6 +236,9 @@ class WeFlowMessageLedgerStore {
     );
     const normalizedContent = normalizeWeFlowMessageContent(observed.text ?? observed.content);
     const contentHash = normalizedContent ? hashNormalizedContent(normalizedContent) : "";
+    const explicitContentKind = normalizeContentKind(observed.contentKind ?? observed.kind);
+    const observedContentKind = explicitContentKind
+      || inferContentKindFromContent(normalizedContent);
 
     if (!talker) {
       return classification("self_manual");
@@ -238,8 +250,10 @@ class WeFlowMessageLedgerStore {
         && entry.localId === localId
         && entryMatchesDirection(entry, observedDirection)
       ));
-      const contentMatches = !contentHash || exact?.contentHash === contentHash;
-      if (exact && contentMatches && entryMatchesObservationTime(
+      if (exact && entryMatchesObservedContent(exact, {
+        contentHash,
+        observedContentKind,
+      }) && entryMatchesObservationTime(
         exact,
         observedAtMs,
         this.retentionMs,
@@ -247,15 +261,49 @@ class WeFlowMessageLedgerStore {
         this.verifyObservedEntry(exact, { localId, observedAtMs });
         return classification("cyberboss", exact, "local_id");
       }
+      if (exact) {
+        // A stable local id is stronger than every heuristic. If its content,
+        // kind, or time is incompatible, do not let that same observation fall
+        // through and consume an unrelated pending image FIFO row.
+        return classification("self_manual");
+      }
+    }
+
+    if (observedContentKind === "image") {
+      const candidate = this.state.entries
+        .filter((entry) => (
+          entry.talker === talker
+          && entry.contentKind === "image"
+          && entryMatchesDirection(entry, observedDirection)
+          && MATCHABLE_STATUSES.has(entry.status)
+          && (!localId || !entry.localId || entry.localId === localId)
+          && entryMatchesObservationTime(
+            entry,
+            observedAtMs,
+            resolveEntryMatchWindowMs(entry, {
+              matchWindowMs: this.matchWindowMs,
+              uncertainMatchWindowMs: this.uncertainMatchWindowMs,
+              nativeMatchWindowMs: this.retentionMs,
+            }),
+          )
+        ))
+        .sort(compareEntries)[0];
+      if (!candidate) {
+        return classification("self_manual");
+      }
+      this.verifyObservedEntry(candidate, { localId, observedAtMs });
+      return classification("cyberboss", candidate, "content_kind_fifo");
     }
 
     if (!normalizedContent) {
       return classification("self_manual");
     }
+    const fallbackContentKind = observedContentKind || "text";
     const candidate = this.state.entries
       .filter((entry) => {
         if (entry.talker !== talker
           || entry.contentHash !== contentHash
+          || entry.contentKind !== fallbackContentKind
           || !entryMatchesDirection(entry, observedDirection)
           || !MATCHABLE_STATUSES.has(entry.status)) {
           return false;
@@ -363,6 +411,8 @@ function normalizeLedgerEntry(raw) {
   const createdAt = normalizeOptionalIsoTime(raw.createdAt);
   let status = normalizeOpaque(raw.status);
   const messageKind = normalizeOpaque(raw.messageKind);
+  const contentKind = normalizeContentKind(raw.contentKind)
+    || inferLegacyContentKind(raw);
   if (status === "failed" && raw.uncertain === true) {
     status = "failed_uncertain";
   }
@@ -374,6 +424,8 @@ function normalizeLedgerEntry(raw) {
     idempotencyKey: normalizeOpaque(raw.idempotencyKey) || id,
     talker,
     contentHash,
+    contentKind,
+    imageDigest: contentKind === "image" ? normalizeImageDigest(raw.imageDigest) : "",
     messageKind,
     expectedDirection: normalizeExpectedDirection(raw.expectedDirection)
       || inferLegacyExpectedDirection(messageKind),
@@ -408,12 +460,125 @@ function compareEntries(left, right) {
   return timeDifference || left.id.localeCompare(right.id);
 }
 
+function normalizeOutboundPayload(payload, nowMs) {
+  const talker = normalizeTalker(resolveTalker(payload));
+  const normalizedContent = normalizeWeFlowMessageContent(payload.text ?? payload.content);
+  if (!talker || !normalizedContent) {
+    throw new Error("outbound talker and text are required");
+  }
+  const contentKind = resolveContentKind(payload, normalizedContent);
+  const id = normalizeOpaque(payload.id) || crypto.randomUUID();
+  const createdAt = toIsoTime(payload.plannedAt ?? payload.createdAt, nowMs);
+  return {
+    id,
+    requestedIdempotencyKey: normalizeOpaque(payload.idempotencyKey),
+    talker,
+    contentHash: hashNormalizedContent(normalizedContent),
+    contentKind,
+    imageDigest: contentKind === "image" ? normalizeImageDigest(payload.imageDigest) : "",
+    messageKind: normalizeOpaque(payload.messageKind),
+    expectedDirection: normalizeExpectedDirection(payload.expectedDirection) || "outgoing",
+    createdAt,
+  };
+}
+
+function createPlannedEntry(normalized) {
+  return {
+    id: normalized.id,
+    idempotencyKey: normalized.requestedIdempotencyKey || normalized.id,
+    talker: normalized.talker,
+    contentHash: normalized.contentHash,
+    contentKind: normalized.contentKind,
+    imageDigest: normalized.imageDigest,
+    messageKind: normalized.messageKind,
+    expectedDirection: normalized.expectedDirection,
+    status: "planned",
+    localId: "",
+    attemptCount: 0,
+    uncertain: false,
+    createdAt: normalized.createdAt,
+    updatedAt: normalized.createdAt,
+    sendingAt: "",
+    verifiedAt: "",
+    failedAt: "",
+    observedAt: "",
+    failureCode: "",
+    failureHash: "",
+  };
+}
+
+function assertIdempotencyPayloadMatches(existing, normalized) {
+  const mismatchedFields = [
+    "contentHash",
+    "contentKind",
+    "imageDigest",
+    "expectedDirection",
+    "messageKind",
+  ].filter((field) => existing[field] !== normalized[field]);
+  if (mismatchedFields.length === 0) {
+    return;
+  }
+  const error = new Error(
+    `idempotency key reuse does not match the original outbound payload (${mismatchedFields.join(", ")})`,
+  );
+  error.code = "IDEMPOTENCY_KEY_REUSE_MISMATCH";
+  error.mismatchedFields = mismatchedFields;
+  throw error;
+}
+
 function resolveTalker(value) {
   return value?.talker ?? value?.talkerId ?? value?.chatId ?? value?.weflowInboxChat;
 }
 
 function normalizeTalker(value) {
   return typeof value === "string" ? value.normalize("NFKC").trim() : "";
+}
+
+function resolveContentKind(payload, normalizedContent) {
+  return normalizeContentKind(payload?.contentKind ?? payload?.kind)
+    || inferContentKindFromContent(normalizedContent)
+    || "text";
+}
+
+function normalizeContentKind(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_")
+    .slice(0, 40);
+}
+
+function inferContentKindFromContent(normalizedContent) {
+  return normalizedContent ? "text" : "";
+}
+
+function inferLegacyContentKind(raw) {
+  return normalizeContentKind(raw?.kind)
+    || (normalizeImageDigest(raw?.imageDigest) ? "image" : "")
+    || "text";
+}
+
+function normalizeImageDigest(value) {
+  return normalizeOpaque(value)
+    .normalize("NFKC")
+    .toLowerCase()
+    .slice(0, 256);
+}
+
+function entryMatchesObservedContent(entry, { contentHash = "", observedContentKind = "" } = {}) {
+  if (observedContentKind && entry.contentKind !== observedContentKind) {
+    return false;
+  }
+  if (entry.contentKind === "image") {
+    // WeFlow image rows may expose `[图片]`, another placeholder, or no text at
+    // all. A stable local id plus talker/direction/kind remains authoritative.
+    return !observedContentKind || observedContentKind === "image";
+  }
+  return !contentHash || entry.contentHash === contentHash;
 }
 
 function normalizeWeFlowMessageContent(value) {
