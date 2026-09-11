@@ -23,3 +23,8 @@ __pycache__/
 .tmp/
 output/
 outputs/
+
+# Local WeChat QR-login debugging artifacts (credential-equivalent captures)
+qr-network-*.pcap
+wechat-login-qr.*
+wechatpad-root.html
