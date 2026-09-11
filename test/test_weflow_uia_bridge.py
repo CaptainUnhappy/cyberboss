@@ -915,10 +915,14 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
 
         with mock.patch.object(BRIDGE.automation, "ControlFromHandle", return_value=root), \
                 mock.patch.object(BRIDGE.automation, "WalkControl", side_effect=walk_at_live_depth):
-            selected_root, selected_input = BRIDGE.select_exact_contact_session(123, "Azzy")
-        self.assertIs(selected_root, root)
-        self.assertIs(selected_input, chat_input)
-        self.assertEqual(session.selections, 1)
+            with self.assertRaises(BRIDGE.TargetNotConfirmedError):
+                BRIDGE.select_exact_contact_session(123, "Azzy")
+        # The direct-main rows are audited but never selected: with row clicking
+        # retired there is no safe mouse path, so the route fails closed here
+        # instead of falling through to a physical click.  Selection must go
+        # through the search-box keyboard flow (covered by the
+        # SearchFallbackFixture tests below).
+        self.assertEqual(session.selections, 0)
         self.assertEqual(session.clicks, 0)
 
         duplicate = FakeControl(
@@ -948,7 +952,16 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(BRIDGE.TargetNotConfirmedError, "title"):
                 BRIDGE.confirm_current_chat_target(root, "Azzy")
 
-    def test_exact_session_falls_back_select_then_invoke_then_one_hit_tested_click(self) -> None:
+    def test_main_session_selection_never_clicks_a_session_row(self) -> None:
+        """Session-list row clicks are retired: they are the automation pattern
+        Weixin's risk control reacts to, and live Weixin can hit-test a row as
+        ours yet route the click to another conversation.
+
+        The direct-main path may still *audit* the row (identity/ancestry), and
+        it may use the provider Selection/Invoke patterns, but it must never
+        issue a physical mouse click - and with no safe mouse path left it must
+        fail closed rather than fall through to one.
+        """
         actions: list[str] = []
 
         class SelectionPattern:
@@ -978,49 +991,37 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
                 return None
 
             def Click(self, **kwargs: object) -> None:
+                # Must never be reached.
                 actions.append("click")
                 self.click_kwargs = kwargs
 
         row = SessionRow()
-        confirmed_input = SimpleNamespace(Name="Azzy")
         provider_noop = BRIDGE.TargetNotConfirmedError("fixture provider false success")
-
-        def safe_click(_handle: int, _row: object) -> tuple[float, float]:
-            actions.append("hit-test")
-            return (0.5, 0.5)
 
         with mock.patch.object(BRIDGE, "find_controls_by_automation_id", return_value=[row]), \
                 mock.patch.object(BRIDGE, "control_has_ancestor", return_value=True), \
                 mock.patch.object(
                     BRIDGE,
                     "wait_for_fresh_session_confirmation",
-                    side_effect=[
-                        (None, provider_noop),
-                        (None, provider_noop),
-                        (confirmed_input, None),
-                    ],
-                ), mock.patch.object(
-                    BRIDGE,
-                    "require_safe_session_row_click",
-                    side_effect=safe_click,
+                    return_value=(None, provider_noop),
                 ):
-            selected = BRIDGE.select_session_item_and_confirm(
-                984206,
-                object(),
-                row,
-                "Azzy",
-                timeout=0.75,
-                source="main",
-            )
+            with self.assertRaisesRegex(
+                BRIDGE.TargetNotConfirmedError,
+                "no longer selected by mouse",
+            ):
+                BRIDGE.select_session_item_and_confirm(
+                    984206,
+                    object(),
+                    row,
+                    "Azzy",
+                    timeout=0.75,
+                    source="main",
+                )
 
-        self.assertIs(selected, confirmed_input)
-        self.assertEqual(actions, ["select", "invoke", "hit-test", "click"])
-        self.assertEqual(row.click_kwargs, {
-            "ratioX": 0.5,
-            "ratioY": 0.5,
-            "simulateMove": False,
-            "waitTime": 0.2,
-        })
+        # Provider patterns were exercised, but no mouse input was ever issued.
+        self.assertEqual(actions, ["select", "invoke"])
+        self.assertNotIn("click", actions)
+        self.assertFalse(hasattr(row, "click_kwargs"))
 
         user32 = BRIDGE.ctypes.windll.user32
         with mock.patch.object(BRIDGE, "require_foreground_continuity") as foreground, \
