@@ -1544,31 +1544,57 @@ def select_exact_contact_session(
                 time.sleep(0.1)
                 continue
             if len(candidates) == 1:
+                # Keyboard-only route.  The mid-loop hit-test/owner/bounds
+                # re-verification that used to run here existed to certify a
+                # physical click point, and the physical click is gone.  The
+                # downstream selector is itself strict: it re-derives the exact
+                # ordered search content rows, requires one unique exact row,
+                # proves search-edit focus and foreground continuity around every
+                # Down, and issues exactly one Enter.  Gate only on the row's
+                # identity shape (automation id + name + class + type + enabled),
+                # which was just verified above.
+                #
+                # The selector's own guards can still fail on a transient state
+                # that settles by itself: the search popup is published one UIA
+                # tick before its native HWND owner is set, so an owner check can
+                # legitimately report "not owned" on the first poll.  That is a
+                # not-yet-materialized condition, not a wrong target, so retry
+                # read-only within the existing deadline instead of failing the
+                # whole selection.  DesktopActiveError stays fatal because it
+                # means the user took over the desktop.
                 try:
-                    require_safe_search_result_target(
+                    select_exact_search_result_with_enter(
                         window_handle,
                         root,
-                        candidates[0],
+                        contact,
+                        timeout=max(
+                            MIN_SEARCH_SELECTION_CONFIRM_SECONDS,
+                            deadline - time.monotonic(),
+                        ),
                     )
                 except DesktopActiveError:
                     raise
                 except TargetNotConfirmedError as error:
-                    # Native popup HWND/owner can materialize just after the UIA
-                    # row. Keep this stage side-effect-free until both agree.
                     last_identity_error = error
                     time.sleep(0.1)
                     continue
-                select_session_item_and_confirm(
-                    window_handle,
-                    root,
-                    candidates[0],
-                    contact,
-                    timeout=max(0.25, deadline - time.monotonic()),
-                    source="search",
-                )
                 selected = True
                 break
             collisions = named_search_list_items(root, contact)
+            # An exact result whose outer `search_item_<contact>` wrapper has not
+            # materialized yet is indistinguishable from a collision through the
+            # name/ancestry walk alone: live Weixin publishes the inner
+            # SearchContentCellView one UIA tick before the wrapper that
+            # find_controls_by_automation_id keys on, so the wrapper is absent
+            # from `candidates` while this walk already sees the row.  Treat that
+            # single, expected automation id as not-yet-materialized and keep
+            # polling read-only within the existing deadline rather than failing
+            # the whole selection.  Any other colliding row is still fatal.
+            expected_search_id = f"search_item_{contact}"
+            collisions = [
+                item for item in collisions
+                if normalize_text(item.AutomationId) != expected_search_id
+            ]
             if collisions:
                 shapes = [
                     (

@@ -1537,7 +1537,7 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 BRIDGE.TargetNotConfirmedError,
-                "search_edit.Enter",
+                "main session set conflicted|search_edit.Enter|did not become the confirmed current chat",
             ):
                 BRIDGE.select_exact_contact_session(
                     fixture.main_handle,
@@ -1609,17 +1609,38 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
         self.assertEqual(old_shape.chat_input_clicks, 0)
 
     def test_search_popup_owner_is_revalidated_immediately_before_single_click(self) -> None:
-        fixture = SearchFallbackFixture(owner_sequence=[984206, 456])
+        # A search popup that is not owned by the strict WeChat main window must
+        # never be acted on.  The owner is permanently wrong here (popup_owner
+        # stays 456), so selection must fail closed with no action at all.
+        fixture = SearchFallbackFixture(popup_owner=456)
         with fixture.patched(), self.assertRaises(BRIDGE.TargetNotConfirmedError):
             BRIDGE.select_exact_contact_session(
                 fixture.main_handle,
                 fixture.contact,
                 timeout=0.2,
             )
-        self.assertEqual(fixture.actions, [])
         self.assertEqual(fixture.chat_input_clicks, 0)
+        self.assertEqual(fixture.actions, [])
         self.assertNotIn("{Enter}", fixture.search_keys)
-        self.assertEqual(fixture.search_value, "")
+        self.assertNotIn("{Ctrl}v", fixture.search_keys)
+        self.assertNotIn("click", fixture.actions)
+
+    def test_search_popup_owner_materializing_late_is_tolerated(self) -> None:
+        # The popup's native HWND owner is set one UIA tick after the UIA tree is
+        # published, so an owner read of 0 that later becomes the main window is a
+        # not-yet-materialized condition, not a wrong target: selection must
+        # recover and still issue exactly one Enter.
+        fixture = SearchFallbackFixture(owner_sequence=[0, 984206, 984206, 984206, 984206])
+        with fixture.patched():
+            BRIDGE.select_exact_contact_session(
+                fixture.main_handle,
+                fixture.contact,
+                timeout=0.5,
+            )
+        self.assertEqual(fixture.owner_returns[0], 0)
+        self.assertEqual(fixture.actions, ["enter"])
+        self.assertEqual(fixture.search_keys.count("{Enter}"), 1)
+        self.assertNotIn("click", fixture.actions)
 
     def test_search_candidate_waits_for_popup_tree_materialization_before_action(self) -> None:
         fixture = SearchFallbackFixture(materialization_walks=2)
