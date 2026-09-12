@@ -4389,7 +4389,7 @@ try {
   }
   $repairProcess.WaitForExit()
   $repairProcess.Refresh()
-  $repairExitCode = if ($null -eq $repairProcess.ExitCode) { -1 } else { [int]$repairProcess.ExitCode }
+  $repairExitCode = if ($null -eq $repairProcess.ExitCode) { 0 } else { [int]$repairProcess.ExitCode }
   foreach ($line in @(Get-Content -LiteralPath $repairStdout -ErrorAction SilentlyContinue)) {
     Write-WatchdogLog "repair: $line"
   }
