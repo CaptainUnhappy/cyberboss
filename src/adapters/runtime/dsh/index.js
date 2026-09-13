@@ -19,6 +19,7 @@
  */
 
 const path = require("node:path");
+const fs = require("node:fs");
 
 const { DshRpcClient, defaultDshBin } = require("./rpc-client");
 const { mapDshSessionEvent } = require("./events");
@@ -37,6 +38,78 @@ const TURN_START_TIMEOUT_MS = 120_000;
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+// The only raster types DSH admits inline (SdkEncodedImageBlock.mimeType).
+const SUPPORTED_IMAGE_MIMES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+]);
+
+const IMAGE_MIME_BY_EXTENSION = new Map([
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".webp", "image/webp"],
+  [".gif", "image/gif"],
+]);
+
+function isSupportedImageMime(value) {
+  return SUPPORTED_IMAGE_MIMES.has(normalizeText(value).toLowerCase());
+}
+
+function imageMimeForPath(filePath) {
+  return IMAGE_MIME_BY_EXTENSION.get(path.extname(normalizeText(filePath)).toLowerCase()) || "";
+}
+
+/**
+ * Build the DSH `contentBlocks` for one turn.
+ *
+ * Accepts both shapes the app can hand over - an `absolutePath` reference (what
+ * the WeChat inbound path produces, and what the Codex adapter consumes) and
+ * already-inlined `{data, mimeType}` - so an image is never silently dropped.
+ * `readFileSync` is injected so this contract is testable without touching disk.
+ */
+function buildDshContentBlocks({ text, attachments, readFileSync } = {}) {
+  const blocks = [];
+  const body = normalizeText(text);
+  if (body) blocks.push({ type: "text", text: body });
+  for (const attachment of Array.isArray(attachments) ? attachments : []) {
+    const absolutePath = normalizeText(attachment?.absolutePath || attachment?.filePath);
+    const declaredMime = normalizeText(attachment?.mimeType).toLowerCase();
+    const inlineData = normalizeText(attachment?.data || attachment?.base64);
+
+    if (inlineData && isSupportedImageMime(declaredMime)) {
+      blocks.push({ type: "image", data: inlineData, mimeType: declaredMime });
+      continue;
+    }
+    if (!absolutePath) continue;
+
+    const mime = isSupportedImageMime(declaredMime) ? declaredMime : imageMimeForPath(absolutePath);
+    if (isSupportedImageMime(mime)) {
+      let encoded = "";
+      try {
+        encoded = readFileSync(absolutePath).toString("base64");
+      } catch (error) {
+        // An unreadable image must not abort the turn: the text still has to
+        // reach the model, and the failure has to be visible.
+        console.error(
+          `[cyberboss] dsh could not read image attachment ${absolutePath}: `
+          + `${error?.message || error}`
+        );
+        continue;
+      }
+      if (encoded) {
+        blocks.push({ type: "image", data: encoded, mimeType: mime });
+        continue;
+      }
+    }
+    // Not an inline-capable image: tell the model where the file is instead.
+    blocks.push({ type: "text", text: `[attachment] ${absolutePath}` });
+  }
+  return blocks;
 }
 
 function withTimeout(promise, timeoutMs) {
@@ -202,24 +275,18 @@ function createDshRuntimeAdapter(config = {}) {
     for (const event of mapDshSessionEvent(params, context)) emit(event);
   }
 
-  /** Convert Cyberboss turn input into DSH content blocks. */
+  /**
+   * Convert Cyberboss turn input into DSH content blocks.
+   *
+   * Cyberboss hands the runtime attachment *references*, not bytes: the Codex
+   * adapter reads `attachment.absolutePath` and sends {type:'localImage', path}.
+   * DSH has no local-path image block - `SdkEncodedImageBlock` takes base64 - so
+   * the file is read here and inlined. Reading by path (rather than expecting
+   * inline data) is what makes inbound WeChat images actually reach the model;
+   * an adapter that only understood {data, mimeType} would silently drop them.
+   */
   function buildContentBlocks({ text, attachments }) {
-    const blocks = [];
-    const body = normalizeText(text);
-    if (body) blocks.push({ type: "text", text: body });
-    for (const attachment of Array.isArray(attachments) ? attachments : []) {
-      const mime = normalizeText(attachment?.mimeType).toLowerCase();
-      const data = normalizeText(attachment?.data || attachment?.base64);
-      if (!data) continue;
-      if (mime === "image/png" || mime === "image/jpeg" || mime === "image/webp" || mime === "image/gif") {
-        blocks.push({ type: "image", data, mimeType: mime });
-        continue;
-      }
-      // DSH accepts durable file references, not raw bytes, for non-image input.
-      const filePath = normalizeText(attachment?.filePath);
-      if (filePath) blocks.push({ type: "text", text: `[attachment] ${filePath}` });
-    }
-    return blocks;
+    return buildDshContentBlocks({ text, attachments, readFileSync: fs.readFileSync });
   }
 
   function resolveModel(model = "", storedParams = null) {
@@ -426,4 +493,10 @@ function createDshRuntimeAdapter(config = {}) {
   };
 }
 
-module.exports = { createDshRuntimeAdapter, resolveDshBin };
+module.exports = {
+  createDshRuntimeAdapter,
+  resolveDshBin,
+  isSupportedImageMime,
+  imageMimeForPath,
+  buildDshContentBlocks,
+};
