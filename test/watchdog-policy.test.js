@@ -1676,3 +1676,22 @@ test("watchdog process health requires both a live PID and the expected command 
   assert.match(healthFunction, /Test-VerifiedPidAlive -PidValue \$appServerPid -CommandPattern \$AppServerCommandPattern/u);
   assert.match(healthFunction, /Test-VerifiedPidAlive -PidValue \$uiaPid -CommandPattern \$UiaCommandPattern/u);
 });
+
+// The shared Codex app-server only exists for the codex runtime. Startup waited
+// for its identity and readyz unconditionally, so with another runtime the
+// deadline tripped, the rollback tore down the healthy stack it had just
+// started, and the service died ~60s after every launch.
+test("service startup does not require the Codex app-server under another runtime", () => {
+  const servicePath = path.join(projectRoot, "scripts", "cyberboss-service.ps1");
+  const source = fs.readFileSync(servicePath, "utf8");
+
+  assert.match(source, /\$AppServerRequired = \$ServiceRuntime[\s\S]{0,40}-eq "codex"/u,
+    "the app-server requirement must be derived from the configured runtime");
+  assert.match(source, /\$appServerIdentityReady = -not \$AppServerRequired/u,
+    "app-server identity must not gate startup under another runtime");
+  assert.match(source, /\$appServerReady = -not \$AppServerRequired -or \(Test-Ready\)/u,
+    "app-server readyz must not gate startup under another runtime");
+  // The gating must not silently weaken the codex path: Test-Ready is still the
+  // readiness probe whenever the app-server is required.
+  assert.match(source, /function Test-Ready[\s\S]{0,220}:(\$Port)\/readyz|function Test-Ready[\s\S]{0,220}\/readyz/u);
+});

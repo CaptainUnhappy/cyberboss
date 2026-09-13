@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [ValidateSet("Start", "Stop", "Restart", "FullRestart", "Status")]
   [string]$Mode = "Start"
@@ -122,6 +122,13 @@ $BridgeCommandPattern = "(?:^|[\\/])bin[\\/]cyberboss\.js\s+start(?:\s|$)"
 $AppServerCommandPattern = "(?:^|\s)app-server(?:\s|$).*--listen\s+ws://127\.0\.0\.1:$Port(?:\s|$)"
 $WeFlowUiaCommandPattern = 'weflow-uia-bridge\.py"?(?:\s|$)'
 $SharedStartCommandPattern = 'shared-start\.js"?(?:\s|$)'
+# The shared Codex app-server belongs to the codex runtime only; every other
+# runtime skips it. Startup readiness must not require a component the selected
+# runtime never starts, or the deadline trips and the rollback tears down a
+# perfectly healthy stack.
+$ServiceRuntime = Get-ProjectEnvValue -Name "CYBERBOSS_RUNTIME"
+if ([string]::IsNullOrWhiteSpace($ServiceRuntime)) { $ServiceRuntime = "codex" }
+$AppServerRequired = $ServiceRuntime.Trim().ToLowerInvariant() -eq "codex"
 
 function Read-PidFile {
   param([Parameter(Mandatory = $true)][string]$Path)
@@ -1199,7 +1206,8 @@ function Start-CyberbossService {
     $inboxEnabled = Test-ProjectEnvFlag -Name "CYBERBOSS_ENABLE_WEFLOW_INBOX"
     $newUiaPid = Read-PidFile -Path $WeFlowUiaBridgePidFile
     $bridgeIdentityReady = Test-VerifiedPidAlive -PidValue $newBridgePid -CommandPattern $BridgeCommandPattern
-    $appServerIdentityReady = Test-VerifiedPidAlive -PidValue $newAppServerPid -CommandPattern $AppServerCommandPattern
+    $appServerIdentityReady = -not $AppServerRequired `
+      -or (Test-VerifiedPidAlive -PidValue $newAppServerPid -CommandPattern $AppServerCommandPattern)
     $uiaIdentityReady = -not $inboxEnabled `
       -or -not $WeFlowUiaEndpoint.IsLoopback `
       -or (Test-VerifiedPidAlive -PidValue $newUiaPid -CommandPattern $WeFlowUiaCommandPattern)
@@ -1207,7 +1215,7 @@ function Start-CyberbossService {
       -or -not $WeFlowUiaEndpoint.IsLoopback `
       -or (Test-WeFlowUiaHealthReady)
     $uiaReady = $uiaIdentityReady -and (Test-WeFlowUiaReady)
-    $appServerReady = Test-Ready
+    $appServerReady = -not $AppServerRequired -or (Test-Ready)
     $coreReady = $bridgeIdentityReady `
       -and $appServerIdentityReady `
       -and $uiaHealthReady `
