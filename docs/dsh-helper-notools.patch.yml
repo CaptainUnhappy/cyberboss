@@ -1,0 +1,42 @@
+# Helper profile overlay for the DSH approval decider (stage 2).
+#
+# Purpose: run a second DSH runtime that can decide approval requests but can
+# never act, so it cannot recurse into its own approval request and escalate.
+#
+# Usage (verified: every entry below reports disabled: true):
+#   dsh --profile sdk-minimal --patch docs/dsh-helper-notools.patch.yml --dump-config
+#
+# IMPORTANT: `--patch` layers merge by `id`, not by name and not by position.
+# These ids are the real ones from `--profile sdk-minimal --dump-default-config`;
+# guessing them silently disables nothing.
+
+# The tool registry itself.
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+  disabled: true
+
+# Terminal tools (note: both ids carry the bash plugin's name in the shipped
+# config; the ids are what distinguish them).
+- id: terminal-pwsh
+  name: '@deepseek-ai/dsh-terminal-bash'
+  disabled: true
+- id: terminal-bash
+  name: '@deepseek-ai/dsh-terminal-bash'
+  disabled: true
+
+# Persistent shells. These are the ones actually enabled on Windows by default.
+- id: persistent-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+  disabled: true
+- id: persistent-bash
+  name: '@deepseek-ai/dsh-tool-bash-persistent'
+  disabled: true
+
+# No approval entry is needed here. `dsh-user-approval` is not part of
+# `sdk-minimal` at all (verified: `--dump-default-config` shows no
+# `dsh-user-approval` entry and no `approval` id), so this runtime has no
+# composed answerer. Per the approval contract, a request with no answerer
+# resolves `unavailable` and fails closed - which is exactly the behaviour the
+# helper needs if a tool ever became reachable. An earlier revision of this file
+# carried an `id: approval` overlay; it was inert because no such id exists in
+# this profile's tree, and it has been removed rather than left misleading.
