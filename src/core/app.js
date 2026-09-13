@@ -87,9 +87,13 @@ const MAX_PENDING_INBOUND_BATCH_ATTACHMENTS = 10;
 const PENDING_INBOUND_COMMIT_RETRY_BASE_MS = 15_000;
 const PENDING_INBOUND_COMMIT_RETRY_MAX_MS = 5 * 60_000;
 const WEFLOW_STARTUP_REVOKE_RECONCILE_TIMEOUT_MS = 2_000;
-// Orphaned atomic-write temporaries older than this are collected at startup.
+// Orphaned atomic-write temporaries older than this are collected at startup
+// and then periodically, because this process runs for days at a time.
 // Generous so an in-flight write from another process is never mistaken for one.
 const STALE_TEMP_FILE_GRACE_MS = 60 * 60_000;
+// How often the long-running loop re-runs that collection. The startup sweep
+// alone let a multi-day run accumulate temporaries between restarts.
+const STALE_TEMP_FILE_SWEEP_INTERVAL_MS = 60 * 60_000;
 const WEFLOW_PENDING_REVOKE_GATE_POLL_MS = 100;
 const WEFLOW_UIA_INBOUND_ACK_TEXT = "处理中";
 const REMINDER_INBOUND_ACK_TEXT = "已记录";
@@ -316,6 +320,7 @@ class CyberbossApp {
       while (!shutdown.stopped) {
         try {
           this.sweepReplyObligations();
+          this.sweepStaleTemporaryFilesIfDue();
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -336,6 +341,7 @@ class CyberbossApp {
             await this.handleIncomingMessage(message);
           }
           this.sweepReplyObligations();
+          this.sweepStaleTemporaryFilesIfDue();
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -787,7 +793,24 @@ class CyberbossApp {
     if (removed > 0) {
       console.log(`[cyberboss] removed ${removed} stale atomic-write temp file(s) from the state directory`);
     }
+    this.lastStaleTempSweepAtMs = Date.now();
     return removed;
+  }
+
+  /**
+   * Re-run the stale-temporary collection at most once per interval. The bridge
+   * loop runs for days, so a startup-only sweep let temporaries from failed
+   * renames accumulate again between restarts.
+   */
+  sweepStaleTemporaryFilesIfDue({
+    intervalMs = STALE_TEMP_FILE_SWEEP_INTERVAL_MS,
+    graceMs = STALE_TEMP_FILE_GRACE_MS,
+  } = {}) {
+    const lastSweepMs = Number(this.lastStaleTempSweepAtMs);
+    if (Number.isFinite(lastSweepMs) && Date.now() - lastSweepMs < intervalMs) {
+      return 0;
+    }
+    return this.sweepStaleTemporaryFiles({ graceMs });
   }
 
   buildPipelineActivitySnapshot() {

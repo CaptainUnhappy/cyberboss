@@ -90,3 +90,51 @@ test("the grace period keeps a recently written temporary", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * The bridge loop runs for days, so a startup-only sweep let temporaries from
+ * failed renames accumulate again between restarts. The loop now re-runs it, but
+ * throttled: the sweep walks the state directory, so it must not run on every
+ * long-poll turn.
+ */
+test("the periodic sweep runs once, then stays throttled until the interval elapses", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-sweep-"));
+  try {
+    const app = harness(dir);
+    makeTempFile(dir, { ageMs: 2 * 60 * 60_000 });
+    assert.equal(app.sweepStaleTemporaryFilesIfDue(), 1, "the first call must sweep");
+
+    // A fresh orphan appears, but the interval has not elapsed.
+    makeTempFile(dir, { ageMs: 2 * 60 * 60_000 });
+    assert.equal(app.sweepStaleTemporaryFilesIfDue(), 0, "a due check must not sweep twice");
+    assert.equal(
+      fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")).length,
+      1,
+      "the throttled call must leave the new orphan in place",
+    );
+
+    // Force the interval to have elapsed.
+    app.lastStaleTempSweepAtMs = Date.now() - 2 * 60 * 60_000;
+    assert.equal(app.sweepStaleTemporaryFilesIfDue(), 1, "the sweep must resume");
+    assert.equal(fs.readdirSync(dir).filter((name) => name.endsWith(".tmp")).length, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an explicit startup sweep still re-arms the throttle", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-sweep-"));
+  try {
+    const app = harness(dir);
+    assert.equal(app.sweepStaleTemporaryFiles(), 0);
+    assert.equal(
+      Number.isFinite(app.lastStaleTempSweepAtMs),
+      true,
+      "the startup sweep must record when it ran so the loop does not repeat it immediately",
+    );
+    makeTempFile(dir, { ageMs: 2 * 60 * 60_000 });
+    assert.equal(app.sweepStaleTemporaryFilesIfDue(), 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
