@@ -8,6 +8,7 @@
  *
  * Usage: node scripts/dsh-probe.js [--dsh <path-to-bin.js>] [--cwd <dir>]
  *                                  [--prompt "<text>"] [--timeout <ms>]
+ *                                  [--patch <path> ...]
  */
 
 const { spawn } = require("node:child_process");
@@ -37,6 +38,7 @@ function parseArgs(argv) {
     model: "deepseek-flash",
     provider: "deepseek-official",
     dump: path.join(os.tmpdir(), "dsh-probe-events.jsonl"),
+    patchPaths: [],
   };
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -49,6 +51,7 @@ function parseArgs(argv) {
     else if (token === "--model") { options.model = value; index += 1; }
     else if (token === "--provider") { options.provider = value; index += 1; }
     else if (token === "--dump") { options.dump = value; index += 1; }
+    else if (token === "--patch") { options.patchPaths.push(value); index += 1; }
   }
   return options;
 }
@@ -128,15 +131,20 @@ function main() {
     }
   };
 
+  const spawnArgs = [options.dshBin, "--profile", options.profile];
+  for (const patchPath of options.patchPaths) {
+    spawnArgs.push("--patch", patchPath);
+  }
+
   log("spawn", {
     command: process.execPath,
-    args: [options.dshBin, "--profile", options.profile],
+    args: spawnArgs,
     cwd: options.cwd,
   });
 
   const child = spawn(
     process.execPath,
-    [options.dshBin, "--profile", options.profile],
+    spawnArgs,
     {
       cwd: options.cwd,
       env: sanitizedEnv(process.env),

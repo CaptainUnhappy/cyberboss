@@ -1,0 +1,24 @@
+# Main-runtime overlay: give the `approval/request` waterfall a real answerer.
+#
+# Without an answerer the sdk profile resolves every escalation to `unavailable`
+# (fail closed), so a sandbox escalation can never succeed. This insert adds the
+# Cyberboss answerer, which forwards the request to a decider and returns a
+# closed ApprovalOutcome. Loaded by the adapter via `dsh --patch <this file>`.
+#
+# `name` must be the path to this checkout's plugin. A bare package name does not
+# resolve: cordis resolves loader entries relative to the *profile* directory
+# (~/.dsh/profiles/<name>), not the workspace, so a bare name fails with
+# ERR_MODULE_NOT_FOUND. A failure here is fatal - DSH exits 5 and the runtime is
+# unusable - so test/dsh-approval-patch.test.js asserts this path exists.
+#
+# Verified against dsh 0.1.5-rc.2: with `mode: never` the decided outcome is
+# `rejected`, and with `mode: session` and no endpoint it is `unavailable`,
+# which proves this answerer claims the waterfall.
+- insert:
+    - id: cyberboss-approval
+      name: 'D:/Projects/cyberboss/dsh-plugins/cyberboss-approval/src/index.js'
+      config:
+        # `session` consults the decider; `never` rejects without asking.
+        mode: session
+        # Empty means no decider transport: every request fails closed.
+        endpoint: ''

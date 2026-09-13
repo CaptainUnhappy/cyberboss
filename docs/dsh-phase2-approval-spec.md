@@ -83,16 +83,75 @@ export declare class ApprovalService extends Service {
 
 ---
 
-## 二、未核实的项（实现前必须先确认，不要猜）
+## 二、本轮实测结论（2026-09-14，替换了原先的「未核实」清单）
 
-1. **answerer 的确切注册写法**：`ctx.on('approval/request', (req, next) => ...)` 是否就是正确形式？是否需要 scope 包装（`createScope`/`scopeTarget`，见 `@deepseek-ai/dsh-scope`）才能只接收某个 agent 的请求？
-2. **插件包的最小骨架**：`dsh.profile.bundles` 里如何声明一个 out-of-tree 包，以及插件导出的形状（cordis plugin 是函数还是 `{ apply }`？）。
-3. ~~helper session 如何做到"无工具"~~ → **已核实，见第 2.5 节**。
-4. **`runtime.approval.decided` 事件**：`events.js` 已映射（有测试），但 Cyberboss 的 `respondApproval` 目前返回 `false` 并声明不支持。需要决定：有了插件的旁路后，`respondApproval` 是保留 no-op，还是改为向插件发送"人工裁决"（用于人也能介入的场景）。
-5. **插件与 Cyberboss 之间的传输**：候选（按推荐排序）：
-   - **本地 HTTP**：Cyberboss 侧已有 `channelAdapter`/bridge 模式可循；插件 POST 到 `127.0.0.1:<port>/approval/decide`。
-   - 文件邮箱（简单但时序脆弱）。
-   - 复用 `claudecode` 的 `ipc-server.js` 模式（已存在先例）。
+原先第 2 节列的 5 个未知项，第 1、2、5 项已实测落地，并推翻了本文件早先的两个说法。
+
+### 2.1 answerer 注册写法 —— **已实测生效**
+
+`ctx.on('approval/request', (req, next) => this.answer(req, next))` **确实**会在真实升级请求上触发。
+
+证据是**行为差分**，不是日志（插件的 `ctx.logger` 在 SDK profile 下不产出 stderr，光看日志无法区分「没被调用」和「被调用但没日志」）：
+
+| 配置 | `approval/decided.outcome` |
+|---|---|
+| 不加载插件（profile 默认，无 answerer） | `unavailable` |
+| 加载插件，`mode: never` | **`rejected`** |
+| 加载插件，`mode: session` + `endpoint: ''` | `unavailable` |
+
+`mode: never` 让插件在**不询问任何人**的情况下直接返回 `rejected`。outcome 随之从 `unavailable` 变成 `rejected`，只有当插件真的认领了这次瀑布才可能发生。所以：**注册签名正确，answerer 生效，且 `session` 无 endpoint 时确实 fail-closed。**
+
+复现升级请求的提示词（已验证可复现）：让模型用 pwsh 在 workspace 之外创建文件；它先被拒，然后用 `sandbox_permissions: danger-full-access` + `justification` 重试，触发 `approval/asked` → `approval/decided`。载荷实测：
+
+```jsonc
+// approval/asked
+{ "id": "5474d092-...", "toolName": "pwsh",
+  "callId": "call_00_ZdoDYRG0LtxdeWkg1F1y9620",
+  "reason": "escalate sandbox to danger-full-access: The target path ... lies outside the session workspace ..." }
+// approval/decided
+{ "id": "5474d092-...", "outcome": "rejected" }
+```
+
+### 2.2 插件包骨架 —— **已实测，但解析基准与本文件早先的假设不同**
+
+insert 语法（对照 `@deepseek-ai/dsh-sdk-app/cordis.patch.yml` 实读）：
+
+```yaml
+- insert:
+    - id: cyberboss-approval
+      name: '<插件入口的绝对路径>'
+      config: { mode: session, endpoint: '' }
+```
+
+**关键坑（我踩了）**：`name` 里的裸包名**不能**解析。cordis 是**相对 profile 目录**（`~/.dsh/profiles/<profile>/`）解析 loader entry 的，**不是**相对 workspace，也不是相对进程 cwd：
+
+```
+Error: Cannot find package 'cyberboss-approval' imported from C:\Users\79388\.dsh\profiles\sdk\
+```
+
+而且**这个失败是致命的**：DSH 直接 `exit 5`，整个 runtime 不可用（不是降级）。所以在启用前必须先用 `--dump-config` 做只读校验，再真跑。
+
+两个可用的解法（都已实测）：
+
+1. **绝对路径**（当前采用，见 `dsh-plugins/cyberboss-approval/main.patch.yml`）：`name: 'D:/Projects/cyberboss/dsh-plugins/cyberboss-approval/src/index.js'`。profile **完全不用改**。
+2. 把插件装进 profile 的 `node_modules`（junction 或 `dsh plugin --profile sdk add`），然后就能用裸包名。
+
+**已实测不可用**：`name: !!js "process.env.X"` → `TypeError: name.startsWith is not a function`。patch 里的 `!!js` 不能用来生成 `name`。
+
+因为路径写错就是 exit 5，`test/dsh-approval-patch.test.js` 把这个路径钉住了：断言它存在、与 `package.json` 的入口一致、且 overlay 只 insert 不 disable 别的东西。
+
+### 2.3 修正：`sdk` profile **有** approval 服务
+
+本文件第 2.5 节末尾曾说「`sdk-minimal` 里根本没有 `dsh-user-approval`」——那句对 `sdk-minimal`（helper）成立，但**不要误推到 `sdk`（主 runtime）**：`dsh --profile sdk --dump-config` 里**有** `- id: approval / name: '@deepseek-ai/dsh-user-approval'`。
+
+主 runtime 的问题是**没有 answerer**（不是没有服务），所以每次升级都解析成 `unavailable`。这正是本插件要补的那一格。
+
+### 2.4 仍然未核实
+
+1. **`respondApproval` 的最终语义**：有了插件旁路后，是保留 no-op，还是让 Cyberboss 把「人工裁决」也送进同一个决定通道。未决。
+2. **插件 → Cyberboss 的传输**：未实现。候选仍是本地 HTTP（见第 2 节第 5 项原文）。当前 `decide()` 是 stub，恒返回 `unavailable`。
+3. **`patchPaths` 还没从 adapter 接到 client**：`src/adapters/runtime/dsh/rpc-client.js` 支持 `--patch`，但 `index.js` 的 `ensureRuntime()` 还没把配置传下去。启用开关（`CYBERBOSS_DSH_APPROVAL`）也还没接。
+
 
 ---
 
@@ -195,6 +254,18 @@ export declare class ApprovalService extends Service {
 ```
 runtime            = dsh（.env，已启用）
 cyberboss/DSH 适配器 = 已实现并实测（文本 + 图片均通过）
-DSH 审批           = respondApproval 返回 false（fail-closed），未实现协作裁决
-canary             = 陈旧失败，nextDueAt 21:59:34Z（约 3 小时），是 healthy=true 的唯一阻碍
+DSH 审批           = 插件已写好并通过 live 差分验证会认领瀑布；
+                     但 decide() 仍是 stub，传输/启用开关/patchPaths 接线都还没做，
+                     所以线上仍是 fail-closed（= 安全的一侧）
+用户 profile        = 未被修改（验证用的 node_modules junction 已删除）
+canary             = budget_daily 推迟；下一次真正可跑约 2026-09-14T04:01:33Z，
+                     是 healthy=true 的唯一阻碍
 ```
+
+### 下一步（按顺序）
+
+1. 把 `patchPaths` 从 config 接到 `ensureRuntime()` → `DshRpcClient`，由 `CYBERBOSS_DSH_APPROVAL` 三态控制是否加载 `main.patch.yml`。
+2. 实现 `decide()` 的本地 HTTP 传输 + Cyberboss 侧 `POST /approval/decide`（内部调用已有的 `src/core/approval-decider.js`）。
+3. 三态端到端复验：`never` → `rejected`；`session` + 无 endpoint → `unavailable`；`session` + 有 endpoint → 按 helper 裁决返回。
+4. 补「helper 无法自我批准」的测试（第 4 节第 4 步，仍未做）。
+
