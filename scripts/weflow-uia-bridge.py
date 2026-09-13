@@ -1126,7 +1126,9 @@ def select_exact_search_result_with_enter(
     stable_rows: list[automation.Control] | None = None
     stable_identity: tuple[tuple[Any, ...], ...] | None = None
     target_index = -1
+    polls = 0
     while True:
+        polls += 1
         require_foreground_continuity(window_handle)
         require_search_edit_focus(window_handle, edit)
         candidates = find_controls_by_automation_id(
@@ -1144,33 +1146,50 @@ def select_exact_search_result_with_enter(
                 exact_search_result_shape_matches(observed, contact)
                 and strict_search_result_context_matches(root, observed)
             ):
-                rows, identity = ordered_strict_search_content_rows(root)
-                target_positions = [
-                    index for index, row in enumerate(rows)
-                    if exact_search_result_shape_matches(row, contact)
-                ]
-                if len(target_positions) > 1:
-                    raise TargetNotConfirmedError(
-                        "exact target was ambiguous in the ordered search content list"
-                    )
-                if len(target_positions) == 1 and same_exact_control_identity(
-                    rows[target_positions[0]],
-                    observed,
-                ):
-                    if previous_identity == identity:
-                        stable_rows = rows
-                        stable_identity = identity
-                        target_index = target_positions[0]
-                        break
-                    previous_identity = identity
-                    last_identity_error = (
-                        "ordered search content identity had not repeated yet"
-                    )
-                else:
+                try:
+                    rows, identity = ordered_strict_search_content_rows(root)
+                except TargetNotConfirmedError as error:
+                    # Weixin publishes the popup one UIA tick before every row is
+                    # visible/activatable and before the ordered identity is
+                    # unambiguous, so the ordered walk legitimately fails on the
+                    # first polls (measured on live Weixin: a transient failure in
+                    # 6 of 10 runs, always settling within one or two polls).
+                    # That is exactly the not-yet-materialized state this loop
+                    # exists to wait out.  Letting it escape abandons the whole
+                    # stabilization window and re-enters through the caller's
+                    # shorter budget, which is how one transient popup rebuild
+                    # became a hard canary failure.  Retrying here can only delay
+                    # approval, never grant it: the loop still requires two
+                    # consecutive complete identical ordered snapshots.
                     previous_identity = None
-                    last_identity_error = (
-                        "exact target was missing from the ordered search content list"
-                    )
+                    last_identity_error = error
+                else:
+                    target_positions = [
+                        index for index, row in enumerate(rows)
+                        if exact_search_result_shape_matches(row, contact)
+                    ]
+                    if len(target_positions) > 1:
+                        raise TargetNotConfirmedError(
+                            "exact target was ambiguous in the ordered search content list"
+                        )
+                    if len(target_positions) == 1 and same_exact_control_identity(
+                        rows[target_positions[0]],
+                        observed,
+                    ):
+                        if previous_identity == identity:
+                            stable_rows = rows
+                            stable_identity = identity
+                            target_index = target_positions[0]
+                            break
+                        previous_identity = identity
+                        last_identity_error = (
+                            "ordered search content identity had not repeated yet"
+                        )
+                    else:
+                        previous_identity = None
+                        last_identity_error = (
+                            "exact target was missing from the ordered search content list"
+                        )
             else:
                 previous_identity = None
                 last_identity_error = "exact search result identity was not fully materialized"
@@ -1181,7 +1200,8 @@ def select_exact_search_result_with_enter(
         if remaining <= 0:
             raise TargetNotConfirmedError(
                 "exact search result was not stably confirmed before Enter: "
-                f"{last_identity_error}"
+                f"{last_identity_error} "
+                f"(polls={polls}, window={min(MAX_SEARCH_RESULT_STABILIZATION_SECONDS, timeout):.1f}s)"
             )
         time.sleep(min(0.1, remaining))
 

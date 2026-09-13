@@ -1295,6 +1295,79 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
         self.assertNotIn("{Down}", fixture.search_keys)
         self.assertEqual(fixture.click_kwargs, {})
 
+    def test_search_enter_survives_a_transiently_unordered_popup(self) -> None:
+        # Live Weixin publishes the popup one UIA tick before every row is
+        # visible and before the ordered identity is unambiguous, so the ordered
+        # walk fails transiently on the first polls: measured on live Weixin as a
+        # failure in 6 of 10 runs, always settling within one or two polls. That
+        # transient must be waited out inside the stabilization window rather
+        # than escaping and consuming the caller's shorter budget.
+        fixture = SearchFallbackFixture()
+        fixture.popup_open = True
+        fixture.focused = fixture.search_edit
+        original_ordered = BRIDGE.ordered_strict_search_content_rows
+        reads = {"count": 0}
+
+        def transient_ordered(root):
+            reads["count"] += 1
+            if reads["count"] <= 2:
+                raise BRIDGE.TargetNotConfirmedError(
+                    "search content row was not visibly activatable"
+                )
+            return original_ordered(root)
+
+        with fixture.patched(), mock.patch.object(
+            BRIDGE,
+            "ordered_strict_search_content_rows",
+            side_effect=transient_ordered,
+        ):
+            confirmed, error = BRIDGE.select_exact_search_result_with_enter(
+                fixture.main_handle,
+                fixture.root,
+                fixture.contact,
+                timeout=0.5,
+            )
+
+        self.assertIs(confirmed, fixture.chat_input)
+        self.assertIsNone(error)
+        self.assertGreaterEqual(reads["count"], 3)
+        self.assertEqual(fixture.actions, ["enter"])
+        self.assertEqual(fixture.search_keys.count("{Enter}"), 1)
+        self.assertNotIn("{Down}", fixture.search_keys)
+        self.assertEqual(fixture.click_kwargs, {})
+
+    def test_search_enter_still_fails_closed_when_the_popup_never_orders(self) -> None:
+        # Waiting out the transient must not become a way to press Enter against
+        # an unproven popup: with no stable ordering the loop has to keep failing
+        # closed for the whole window and never dispatch.
+        fixture = SearchFallbackFixture()
+        fixture.popup_open = True
+        fixture.focused = fixture.search_edit
+
+        def never_ordered(root):
+            raise BRIDGE.TargetNotConfirmedError(
+                "ordered search content identities were empty or ambiguous"
+            )
+
+        with fixture.patched(), mock.patch.object(
+            BRIDGE,
+            "ordered_strict_search_content_rows",
+            side_effect=never_ordered,
+        ), self.assertRaisesRegex(
+            BRIDGE.TargetNotConfirmedError,
+            "was not stably confirmed before Enter",
+        ):
+            BRIDGE.select_exact_search_result_with_enter(
+                fixture.main_handle,
+                fixture.root,
+                fixture.contact,
+                timeout=0.3,
+            )
+
+        self.assertEqual(fixture.actions, [])
+        self.assertNotIn("{Enter}", fixture.search_keys)
+        self.assertEqual(fixture.click_kwargs, {})
+
     def test_search_enter_rejects_fresh_duplicate_rows_without_action(self) -> None:
         fixture = SearchFallbackFixture(duplicate_exact=True)
         fixture.popup_open = True
