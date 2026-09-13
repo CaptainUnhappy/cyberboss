@@ -51,7 +51,14 @@ DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 MIN_CANARY_DESKTOP_IDLE_SECONDS = 300
 MIN_SEARCH_SELECTION_CONFIRM_SECONDS = 2.0
-MAX_SEARCH_RESULT_STABILIZATION_SECONDS = 1.0
+# How long to wait for two consecutive identical ordered-search snapshots before
+# deriving a Down count.  This only waits for Weixin's search popup to stop
+# re-rendering; every fail-closed condition (foreground/focus loss, ambiguous or
+# missing target rows, unexpected control types) still trips immediately, so a
+# larger budget cannot make a wrong target acceptable.  It was 1.0s while the
+# direct session-row route handled the common case, and the search route now runs
+# for every send, so a cold popup needs a realistic window.
+MAX_SEARCH_RESULT_STABILIZATION_SECONDS = 3.0
 MAX_SEARCH_NAVIGATION_DOWNS = 10
 CHAT_INPUT_VALUE_VERIFY_TIMEOUT_SECONDS = 1.0
 GA_ROOT = 2
