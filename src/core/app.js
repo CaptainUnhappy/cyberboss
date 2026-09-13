@@ -749,7 +749,21 @@ class CyberbossApp {
     const activeTurnCount = threadStates.filter((state) => (
       state?.status === "running" || state?.status === "waiting_approval"
     )).length;
-    const turnGateCount = Number(this.turnGateStore?.pendingScopeKeys?.size) || 0;
+    // Drop gates that can never be released by an event before reporting the
+    // count. A gate that was opened but never attached to a thread has no
+    // terminal event coming, and leaving it counted made the pipeline look busy
+    // forever - which silently blocked the watchdog's repair path.
+    const staleGates = this.turnGateStore?.releaseStaleGates?.() || [];
+    for (const gate of staleGates) {
+      console.error(
+        `[cyberboss] released a stale turn gate with no attached thread `
+        + `scope=${gate.scopeKey} ageMs=${gate.ageMs}`
+      );
+    }
+    const pending = this.turnGateStore?.describePending?.();
+    const turnGateCount = pending
+      ? pending.live.length
+      : (Number(this.turnGateStore?.pendingScopeKeys?.size) || 0);
     const activeDeliveryCount = Number(this.streamDelivery?.stateByRunKey?.size) || 0;
     const pendingInboundCount = countPendingInboundMessages(this.pendingInboundByScope)
       + countPendingInboundMessages(this.pendingSharedContentInboundByScope)

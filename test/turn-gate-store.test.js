@@ -1162,3 +1162,83 @@ test("flushPendingInboundMessages falls back to messageId ordering when received
   assert.equal(dispatched[0].prepared.contextToken, "ctx-200");
   assert.match(dispatched[0].prepared.text, /第一条[\s\S]*第二条[\s\S]*第三条/);
 });
+
+// A gate opened but never attached to a thread has no terminal event coming, so
+// leaving it pending made the pipeline report "busy" forever and silently blocked
+// the watchdog's repair path. These pin the classification that lets callers tell
+// real in-flight work from a leak.
+test("a gate pending past the stale bound without an attached thread is reported stale", () => {
+  let nowMs = 1_000_000;
+  const gate = new TurnGateStore({ now: () => nowMs, staleAfterMs: 60_000 });
+  gate.begin("binding-1", "/ws");
+
+  assert.deepEqual(gate.describePending().stale, [], "not stale yet");
+  nowMs += 60_001;
+
+  const described = gate.describePending();
+  assert.equal(described.total, 1);
+  assert.equal(described.live.length, 0);
+  assert.equal(described.stale.length, 1);
+  assert.equal(described.stale[0].scopeKey, "binding-1::/ws");
+  assert.equal(described.stale[0].attached, false);
+});
+
+test("a gate with an attached thread is never treated as stale", () => {
+  let nowMs = 1_000_000;
+  const gate = new TurnGateStore({ now: () => nowMs, staleAfterMs: 60_000 });
+  const scopeKey = gate.begin("binding-1", "/ws");
+  gate.attachThread(scopeKey, "thread-1");
+
+  nowMs += 10 * 60_000;
+  const described = gate.describePending();
+  assert.equal(described.stale.length, 0,
+    "a turn the runtime accepted can still end, however long it runs");
+  assert.equal(described.live.length, 1);
+  assert.equal(described.live[0].attached, true);
+});
+
+test("releaseStaleGates drops only the leaked gates and reports them", () => {
+  let nowMs = 1_000_000;
+  const gate = new TurnGateStore({ now: () => nowMs, staleAfterMs: 60_000 });
+  const leaked = gate.begin("binding-leak", "/ws");
+  const healthy = gate.begin("binding-ok", "/ws");
+  gate.attachThread(healthy, "thread-ok");
+
+  nowMs += 60_001;
+  const released = gate.releaseStaleGates();
+
+  assert.equal(released.length, 1);
+  assert.equal(released[0].scopeKey, leaked);
+  assert.equal(gate.isPending("binding-leak", "/ws"), false, "the leak is gone");
+  assert.equal(gate.isPending("binding-ok", "/ws"), true, "live work is untouched");
+  assert.equal(gate.describePending().total, 1);
+});
+
+test("releasing a stale gate clears its thread mapping too", () => {
+  let nowMs = 1_000_000;
+  const gate = new TurnGateStore({ now: () => nowMs, staleAfterMs: 1_000 });
+  const scopeKey = gate.begin("binding-1", "/ws");
+  gate.attachThread(scopeKey, "thread-1");
+
+  // Force the unattached-stale shape: the mapping exists but the gate record was
+  // never marked attached, which is the leak this guards against.
+  gate.pendingScopeKeys.get(scopeKey).attachedAtMs = null;
+  nowMs += 2_000;
+
+  const released = gate.releaseStaleGates();
+  assert.equal(released.length, 1);
+  assert.equal(gate.releaseThread("thread-1").released, false,
+    "the thread mapping must not outlive the gate it pointed at");
+});
+
+test("a gate released normally is not reported stale afterwards", () => {
+  let nowMs = 1_000_000;
+  const gate = new TurnGateStore({ now: () => nowMs, staleAfterMs: 60_000 });
+  const scopeKey = gate.begin("binding-1", "/ws");
+  gate.attachThread(scopeKey, "thread-1");
+  gate.releaseThread("thread-1");
+
+  nowMs += 10 * 60_000;
+  assert.equal(gate.describePending().total, 0);
+  assert.deepEqual(gate.releaseStaleGates(), []);
+});
