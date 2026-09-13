@@ -87,6 +87,9 @@ const MAX_PENDING_INBOUND_BATCH_ATTACHMENTS = 10;
 const PENDING_INBOUND_COMMIT_RETRY_BASE_MS = 15_000;
 const PENDING_INBOUND_COMMIT_RETRY_MAX_MS = 5 * 60_000;
 const WEFLOW_STARTUP_REVOKE_RECONCILE_TIMEOUT_MS = 2_000;
+// Orphaned atomic-write temporaries older than this are collected at startup.
+// Generous so an in-flight write from another process is never mistaken for one.
+const STALE_TEMP_FILE_GRACE_MS = 60 * 60_000;
 const WEFLOW_PENDING_REVOKE_GATE_POLL_MS = 100;
 const WEFLOW_UIA_INBOUND_ACK_TEXT = "处理中";
 const REMINDER_INBOUND_ACK_TEXT = "已记录";
@@ -248,6 +251,7 @@ class CyberbossApp {
   }
 
   async start() {
+    this.sweepStaleTemporaryFiles();
     const account = this.channelAdapter.resolveAccount();
     this.activeAccountId = account.accountId;
     this.systemMessageDispatcher = new SystemMessageDispatcher({
@@ -742,6 +746,48 @@ class CyberbossApp {
 
   async closeVoiceTranscription() {
     await this.voiceTranscriptionService?.close?.();
+  }
+
+  /**
+   * Remove orphaned atomic-write temporaries from the state directory.
+   *
+   * Every durable store writes through a `.<name>.<pid>.<timestamp>.tmp` sibling
+   * and then renames it into place. A rename that fails - the live state showed
+   * EPERM during the canary poll - leaves that sibling behind, and nothing ever
+   * collected them (91 had accumulated since 2026-08-28).
+   *
+   * Deliberately conservative: only files matching the exact atomic-write shape
+   * whose embedded timestamp is older than the grace period are removed, so an
+   * in-flight write from a running process is never touched.
+   */
+  sweepStaleTemporaryFiles({ graceMs = STALE_TEMP_FILE_GRACE_MS } = {}) {
+    const stateDir = normalizeText(this.config?.stateDir);
+    if (!stateDir) return 0;
+    let removed = 0;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(stateDir, { withFileTypes: true });
+    } catch {
+      return 0;
+    }
+    const cutoffMs = Date.now() - graceMs;
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const match = /^\..+\.(\d+)\.(\d{10,})\.tmp$/u.exec(entry.name);
+      if (!match) continue;
+      const writtenAtMs = Number(match[2]);
+      if (!Number.isFinite(writtenAtMs) || writtenAtMs > cutoffMs) continue;
+      try {
+        fs.unlinkSync(path.join(stateDir, entry.name));
+        removed += 1;
+      } catch {
+        // Another process may have collected it, or it is momentarily locked.
+      }
+    }
+    if (removed > 0) {
+      console.log(`[cyberboss] removed ${removed} stale atomic-write temp file(s) from the state directory`);
+    }
+    return removed;
   }
 
   buildPipelineActivitySnapshot() {
