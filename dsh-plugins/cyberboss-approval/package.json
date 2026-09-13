@@ -1,0 +1,15 @@
+{
+  "name": "cyberboss-approval",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH answerer that lets Cyberboss decide tool-approval escalations instead of failing closed",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-user-approval": "^0.1.5-rc.2"
+  }
+}
