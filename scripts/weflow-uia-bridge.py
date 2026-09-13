@@ -922,18 +922,32 @@ def select_session_item_and_confirm(
             f"after actions={attempted_actions!r}: {last_error}"
         )
 
-    # The direct-main route previously ended in a hit-tested physical
-    # `row.Click` here.  That is removed: clicking left-session-list rows is the
-    # exact automation pattern Weixin's risk control reacts to, and the file's
-    # own note above records that Weixin can report an exact ControlFromPoint hit
-    # for a search row yet route the click to a different conversation.  With no
-    # safe mouse path left, the direct route is no longer selected at all - see
-    # select_exact_contact_session, which now always uses the search-box
-    # keyboard flow.  This branch is retained only as a fail-closed guard.
+    # Direct main rows may expose provider patterns that return success without
+    # changing chat. Use one hit-tested physical click as their last fallback.
+    click_row = fresh_action_row()
+    click_ratio = require_safe_session_row_click(window_handle, click_row)
+    try:
+        click_row.Click(
+            ratioX=click_ratio[0],
+            ratioY=click_ratio[1],
+            simulateMove=False,
+            waitTime=0.2,
+        )
+        attempted_actions.append("row.Click")
+    except Exception as error:
+        raise TargetNotConfirmedError(f"exact session row click failed: {error}") from error
+    confirmed, observed_error = wait_for_fresh_session_confirmation(
+        root,
+        contact,
+        stage_timeout,
+        source="main",
+    )
+    if confirmed is not None:
+        return confirmed
+    last_error = observed_error or last_error
     raise TargetNotConfirmedError(
-        "direct main session rows are no longer selected by mouse; "
-        "the search-box keyboard route must be used instead "
-        f"(attempted={attempted_actions!r}, last_error={last_error})"
+        "exact session did not become the confirmed current chat "
+        f"after actions={attempted_actions!r}: {last_error}"
     )
 
 
@@ -1506,19 +1520,18 @@ def select_exact_contact_session(
         raise TargetNotConfirmedError(
             f"main session identity mismatch: expected={contact!r}, observed={names!r}"
         )
-    # Keyboard-only selection policy.  Weixin's own risk control is sensitive to
-    # a process that scans the left session list and physically clicks a row, and
-    # live Weixin can report an exact ControlFromPoint hit for a session row yet
-    # route the click to a different conversation.  The direct-main route used a
-    # hit-tested physical `row.Click` as its last fallback, which produced a
-    # sustained pattern of session-list clicking; it is deliberately gone.
-    #
-    # The conversation is now always reached through the bounded search-box
-    # keyboard flow: type the exact name, derive the ordered Down count, then
-    # issue exactly one Enter.  Every identity/order/focus proof is retained -
-    # only the mouse actions are removed.  The checks above remain as an
-    # unconditional identity audit, so an ambiguous or mismatched direct row
-    # still fails closed instead of silently falling through to search.
+    if len(direct_candidates) == 1:
+        select_session_item_and_confirm(
+            window_handle,
+            root,
+            direct_candidates[0],
+            contact,
+            timeout=timeout,
+            source="main",
+        )
+        # Re-apply the full direct-main proof so this route never inherits the
+        # search-only allowance for a not-yet-materialized row.
+        return root, confirm_fresh_session_state(root, contact, source="main")
 
     selected = False
     selection_error: Exception | None = None
