@@ -484,6 +484,26 @@ test("routine canary requires five minutes of desktop input idle and fails close
   assert.match(source, /Invoke-PostRepairCanaryVerification[\s\S]+?Test-CanaryIdleGate -Snapshot \$Snapshot/u);
 });
 
+// A repair calls Ensure-AzzySource right after (re)starting the UIA bridge. The
+// bridge is contacted with a 3 second per-request timeout, so a bridge that has
+// not started listening yet failed the first call, which aborted the repair and
+// drove another - the stack was seen restarting every few minutes while the
+// endpoint answered correctly moments later. Pin the bounded retry.
+test("setting the azzy send source retries a bridge that has not started listening yet", () => {
+  const source = fs.readFileSync(watchdogPath, "utf8");
+  const start = source.indexOf("function Ensure-AzzySource");
+  assert.notEqual(start, -1, "Ensure-AzzySource must exist");
+  const body = source.slice(start, source.indexOf("\n}\n", start));
+
+  assert.match(body, /\[int\]\$TimeoutSeconds\s*=\s*30/u,
+    "the retry window must be configurable with a sane default");
+  assert.match(body, /while\s*\(\$true\)/u, "it must poll instead of trying once");
+  assert.match(body, /Start-Sleep/u, "it must wait between attempts");
+  assert.match(body, /did not persist the azzy send source within/u,
+    "it must still fail loudly once the window is exhausted");
+  assert.match(body, /deadline/u, "the retry must be bounded");
+});
+
 test("outgoing backfill uses fresh cursor progress instead of wall-clock range lag", {
   skip: process.platform !== "win32",
 }, (t) => {

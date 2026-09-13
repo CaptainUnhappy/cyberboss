@@ -3115,10 +3115,32 @@ function Ensure-WeixinStarted {
 }
 
 function Ensure-AzzySource {
+  param([int]$TimeoutSeconds = 30)
+
+  # The UIA bridge is contacted over a 3 second per-request timeout, and a repair
+  # runs this immediately after (re)starting the bridge. A bridge that has not
+  # finished listening yet therefore fails the first request, and treating that as
+  # a hard error aborted the repair and drove another one - the stack was observed
+  # restarting every few minutes while this endpoint was actually healthy moments
+  # later. Poll within a bounded window instead, and only fail once it is clear the
+  # bridge genuinely will not serve the command.
   $body = @{ command = "/azzy"; contact = "yourself"; notify = $false } | ConvertTo-Json -Compress
-  $result = Invoke-JsonEndpoint -Uri "$($UiaBaseUrl.TrimEnd('/'))/api/command" -Method POST -Body $body
-  if (-not $result.Ok -or [string]$result.Body.send_source -ne "azzy") {
-    throw "UIA bridge did not persist the azzy send source"
+  $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+  $lastError = ""
+  while ($true) {
+    try {
+      $result = Invoke-JsonEndpoint -Uri "$($UiaBaseUrl.TrimEnd('/'))/api/command" -Method POST -Body $body
+      if ($result.Ok -and [string]$result.Body.send_source -eq "azzy") {
+        return
+      }
+      $lastError = if ($result.Error) { $result.Error } else { "send_source=$([string]$result.Body.send_source)" }
+    } catch {
+      $lastError = $_.Exception.Message
+    }
+    if ((Get-Date) -ge $deadline) {
+      throw "UIA bridge did not persist the azzy send source within ${TimeoutSeconds}s: $lastError"
+    }
+    Start-Sleep -Milliseconds 500
   }
 }
 
