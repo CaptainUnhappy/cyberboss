@@ -26,6 +26,12 @@
  * - A plugin's default export is the Service class; cordis constructs it with
  *   `(ctx, config)` and `super(ctx, '<service-name>')`. Confirmed against
  *   `@deepseek-ai/dsh-user-approval`, which exports `ApprovalService as default`.
+ * - Event registration is `ctx.on(name, listener)` returning a disposer
+ *   (`() => boolean`); cordis mixes the event-bus methods onto `ctx`
+ *   ("Its methods are also mixed onto `ctx` (`ctx.on`, `ctx.emit`, ...)").
+ *   The listener type for a waterfall event is exactly
+ *   `(req: ApprovalRequestEvent, next: () => Promise<ApprovalOutcome>) => Promise<ApprovalOutcome>`,
+ *   so the registration used below matches the declared event type.
  *
  * ## Recursion hazard (the reason for the helper design)
  *
@@ -40,12 +46,10 @@
  *
  * - `decide()` is a stub: it always returns `unavailable` (fail closed).
  * - The Cyberboss-side transport (local HTTP endpoint) does not exist.
- * - The plugin has not been loaded into a profile or run once.
- *
- * Prerequisite for the loader (unverified): `ctx.on(...)` returns a disposer and
- * cordis supplies the `next` continuation to waterfall listeners. Confirm by
- * loading the plugin into a profile and observing a log line on a real
- * escalation before writing any decision logic.
+ * - The plugin has never been loaded into a profile or run once. The
+ *   registration signature is verified against the types, but that the listener
+ *   actually fires on a live escalation is still unproven - load it into a
+ *   profile and observe a log line before writing any decision logic.
  */
 
 import { Service } from '@deepseek-ai/cordis';
