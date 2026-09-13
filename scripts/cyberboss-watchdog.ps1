@@ -57,6 +57,12 @@ $DeferredSystemReplies = Join-Path $StateDir "deferred-system-replies.json"
 $ReplyObligations = Join-Path $StateDir "reply-obligations.json"
 $WeFlowMessageLedger = Join-Path $StateDir "weflow-message-ledger.json"
 $PipelineActivityFile = Join-Path $StateDir "cyberboss-pipeline-activity.json"
+# Which runtime the bridge is configured to drive. The shared Codex app-server is
+# only part of the stack for the codex runtime, so several health checks below are
+# runtime-dependent.
+$WatchdogRuntime = (Get-ProjectEnvValue -Name "CYBERBOSS_RUNTIME")
+if ([string]::IsNullOrWhiteSpace($WatchdogRuntime)) { $WatchdogRuntime = "codex" }
+$WatchdogRuntime = $WatchdogRuntime.Trim().ToLowerInvariant()
 $RestartNotificationState = Join-Path $StateDir "cyberboss-watchdog-restart-notifications.json"
 $BridgePidFile = Join-Path $LogDir "shared-wechat.pid"
 $AppServerPidFile = Join-Path $LogDir "shared-app-server.pid"
@@ -3167,7 +3173,12 @@ function Get-WatchdogFailedComponents {
 
   $failed = @()
   if (-not $Snapshot.cyberboss.alive) { $failed += "cyberboss" }
-  if (-not $Snapshot.appServer.alive -or -not $Snapshot.appServer.ready) { $failed += "app-server" }
+  # The shared Codex app-server only exists for the codex runtime. With another
+  # runtime (dsh, claudecode) the service intentionally skips it, so requiring it
+  # would report a permanent failure and drive repairs that cannot help.
+  if ($WatchdogRuntime -eq "codex") {
+    if (-not $Snapshot.appServer.alive -or -not $Snapshot.appServer.ready) { $failed += "app-server" }
+  }
   if (-not $Snapshot.weflow.ready) { $failed += "weflow" }
   if (-not $Snapshot.uiaBridge.alive -or -not $Snapshot.uiaBridge.health -or -not $Snapshot.uiaBridge.ready) { $failed += "uia" }
   if (-not $Snapshot.weixin.alive) { $failed += "weixin" }
