@@ -149,6 +149,7 @@ class ReplyObligationStore {
       turnCompletedAt: "",
       runtimeFailedAt: "",
       terminalAt: "",
+      failureNotifiedAt: "",
       noReplyTimeoutMs: this.noReplyTimeoutMs,
       noReplyDeadlineAt: new Date(this.currentTimeMs() + this.noReplyTimeoutMs).toISOString(),
       noReplyTimedOutAt: "",
@@ -237,6 +238,23 @@ class ReplyObligationStore {
         entry.lastError = "";
       },
     });
+  }
+
+  /**
+   * Claim the one-time "this turn produced no reply" notice.
+   *
+   * Returns true only for the caller that wins the claim, so the user is told at
+   * most once per obligation even if the process restarts between the terminal
+   * outcome and the send. Unknown or already-claimed entries return false.
+   */
+  markFailureNotified(id, { at = "" } = {}) {
+    const entry = this.findMutable(id);
+    if (!entry) return false;
+    if (entry.failureNotifiedAt) return false;
+    entry.failureNotifiedAt = normalizeIsoTime(at, this.currentTimeMs());
+    entry.updatedAt = entry.failureNotifiedAt;
+    this.save();
+    return true;
   }
 
   markDeliveryFailure(id, { error = null, deliveryUncertain } = {}) {
@@ -563,6 +581,9 @@ function normalizeEntry(raw) {
     turnCompletedAt: normalizeOptionalIsoTime(raw.turnCompletedAt),
     runtimeFailedAt: normalizeOptionalIsoTime(raw.runtimeFailedAt),
     terminalAt: normalizeOptionalIsoTime(raw.terminalAt),
+    // Persisted so the one-time "no reply" notice survives a restart instead of
+    // being re-sent on the next observation of the same terminal obligation.
+    failureNotifiedAt: normalizeOptionalIsoTime(raw.failureNotifiedAt),
     noReplyTimeoutMs: normalizePositiveInteger(raw.noReplyTimeoutMs, DEFAULT_NO_REPLY_TIMEOUT_MS),
     noReplyDeadlineAt: normalizeRequiredIsoTime(raw.noReplyDeadlineAt, "noReplyDeadlineAt"),
     noReplyTimedOutAt: normalizeOptionalIsoTime(raw.noReplyTimedOutAt),

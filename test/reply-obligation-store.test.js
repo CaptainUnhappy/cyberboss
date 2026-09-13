@@ -304,3 +304,54 @@ test("commentary cannot discharge a durable reply obligation at turn completion"
   assert.equal(completed.deliveryAttemptCount, 0);
   assert.equal(completed.deliveryVerifiedAt, "");
 });
+
+// A turn that completes with no final reply is the shape a dead runtime takes
+// (expired credentials, failed connection). The user's message would otherwise
+// disappear right after the processing acknowledgement, so the app notifies once
+// and these tests pin that the claim is one-shot and survives a restart.
+test("a turn completed without a final reply can be claimed for notification exactly once", () => {
+  let nowMs = Date.parse("2026-09-13T16:51:10.000Z");
+  const { store } = fixture({ now: () => nowMs });
+  const { entry: obligation } = beginFixture(store);
+  store.markTurnAccepted(obligation.id, { threadId: "thread-1", turnId: "turn-1" });
+
+  const completed = store.markTurnCompleted(obligation.id, { hadFinalReply: false });
+  assert.equal(completed.terminalOutcome, "turn_completed_without_final",
+    "the app keys the user notice off terminalOutcome, not a bare outcome field");
+  assert.equal(completed.threadId, "thread-1");
+
+  assert.equal(store.markFailureNotified(obligation.id), true, "first claim wins");
+  assert.equal(store.markFailureNotified(obligation.id), false, "second claim is refused");
+});
+
+test("the no-reply notification claim survives a restart", () => {
+  let nowMs = Date.parse("2026-09-13T16:51:10.000Z");
+  const { filePath, store } = fixture({ now: () => nowMs });
+  const { entry: obligation } = beginFixture(store);
+  store.markTurnAccepted(obligation.id, { threadId: "thread-1", turnId: "turn-1" });
+  store.markTurnCompleted(obligation.id, { hadFinalReply: false });
+  assert.equal(store.markFailureNotified(obligation.id), true);
+
+  // A fresh store over the same file must not re-notify the user.
+  const reloaded = new ReplyObligationStore({ filePath, now: () => nowMs, instanceId: "instance-b" });
+  assert.equal(reloaded.get(obligation.id).failureNotifiedAt !== "", true,
+    "failureNotifiedAt must survive the load normalizer");
+  assert.equal(reloaded.markFailureNotified(obligation.id), false);
+});
+
+test("a normal turn with a final reply is never treated as a missing reply", () => {
+  let nowMs = Date.parse("2026-09-13T16:51:10.000Z");
+  const { store } = fixture({ now: () => nowMs });
+  const { entry: obligation } = beginFixture(store);
+  store.markTurnAccepted(obligation.id, { threadId: "thread-1", turnId: "turn-1" });
+
+  const completed = store.markTurnCompleted(obligation.id, { hadFinalReply: true });
+  assert.notEqual(completed.terminalOutcome, "turn_completed_without_final");
+});
+
+test("claiming a notification for an unknown obligation is refused", () => {
+  const { store } = fixture();
+  assert.equal(store.markFailureNotified("reply-obligation:does-not-exist"), false);
+  assert.equal(store.markFailureNotified(""), false);
+});
+

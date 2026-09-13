@@ -176,10 +176,22 @@ class CyberbossApp {
         payload.replyObligationId,
         payload
       ),
-      onReplyTurnCompleted: (payload) => this.replyObligationStore.markTurnCompleted(
-        payload.replyObligationId,
-        payload
-      ),
+      onReplyTurnCompleted: (payload) => {
+        const entry = this.replyObligationStore.markTurnCompleted(
+          payload.replyObligationId,
+          payload
+        );
+        // A turn can complete while producing no final reply at all - most
+        // commonly when the runtime itself is unusable (expired credentials, a
+        // dead connection). Nothing else on this path tells the user, so the
+        // message would otherwise vanish right after the processing
+        // acknowledgement. Report it instead of failing silently; background and
+        // probe turns are suppressed inside sendFailureToThread.
+        if (entry && entry.terminalOutcome === "turn_completed_without_final") {
+          this.notifyTerminalReplyFailure(entry).catch(() => {});
+        }
+        return entry;
+      },
       onReplyTurnFailed: (payload) => this.replyObligationStore.markRuntimeFailed(
         payload.replyObligationId,
         payload
@@ -3659,6 +3671,27 @@ class CyberbossApp {
       status: 0,
       contextToken: target.contextToken,
     }).catch(() => {});
+  }
+
+  /**
+   * Tell the user that their turn ended without any reply. The store atomically
+   * claims the notification so it fires at most once per obligation, even across
+   * restarts; background/probe turns are filtered out by sendFailureToThread.
+   */
+  async notifyTerminalReplyFailure(entry) {
+    const threadId = normalizeText(entry?.threadId);
+    if (!threadId) return;
+    if (this.replyObligationStore.markFailureNotified?.(entry.id) !== true) return;
+    const runtimeId = normalizeText(this.runtimeAdapter?.describe?.().id);
+    console.error(
+      `[cyberboss] turn produced no final reply; notifying user `
+      + `thread=${threadId} runtime=${runtimeId || "(unknown)"}`
+    );
+    await this.sendFailureToThread(
+      threadId,
+      "❌ 这一轮没有产生任何回复。\n"
+        + "通常是运行时不可用（登录凭据过期或连接失败）。你的消息已被记录，但内容无法送达，请检查后重发。",
+    );
   }
 
   async sendFailureToThread(threadId, text, fallbackTarget = null) {
