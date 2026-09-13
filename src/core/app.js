@@ -7,6 +7,7 @@ const { DEFAULT_MIN_WEIXIN_CHUNK, MAX_MIN_WEIXIN_CHUNK } = require("../adapters/
 const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin/media-receive");
 const { createCodexRuntimeAdapter } = require("../adapters/runtime/codex");
 const { createClaudeCodeRuntimeAdapter } = require("../adapters/runtime/claudecode");
+const { createDshRuntimeAdapter } = require("../adapters/runtime/dsh");
 const { findModelByQuery } = require("../adapters/runtime/codex/model-catalog");
 const { createTimelineIntegration } = require("../integrations/timeline");
 const {
@@ -94,6 +95,9 @@ const SILENT_DELIVERY_POLICY = "silent";
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
     return createClaudeCodeRuntimeAdapter(config);
+  }
+  if (config.runtime === "dsh") {
+    return createDshRuntimeAdapter(config);
   }
   return createCodexRuntimeAdapter(config);
 }

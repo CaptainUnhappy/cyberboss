@@ -169,6 +169,17 @@ function readConfig() {
     claudePermissionMode: readTextEnv("CYBERBOSS_CLAUDE_PERMISSION_MODE") || "default",
     claudeDisableVerbose: readBoolEnv("CYBERBOSS_CLAUDE_DISABLE_VERBOSE"),
     claudeExtraArgs: readListEnv("CYBERBOSS_CLAUDE_EXTRA_ARGS"),
+    // DSH runtime (`CYBERBOSS_RUNTIME=dsh`). Sessions use their own store file so
+    // switching runtimes never mixes Codex thread ids with DSH session ids.
+    dshBin: readTextEnv("CYBERBOSS_DSH_BIN"),
+    dshProfile: readTextEnv("CYBERBOSS_DSH_PROFILE") || "sdk",
+    dshProvider: readTextEnv("CYBERBOSS_DSH_PROVIDER") || "deepseek-official",
+    dshModel: readTextEnv("CYBERBOSS_DSH_MODEL") || "deepseek-flash",
+    dshReasoningEffort: readTextEnv("CYBERBOSS_DSH_REASONING_EFFORT"),
+    dshMaxTokens: readIntEnv("CYBERBOSS_DSH_MAX_TOKENS"),
+    dshInitializeTimeoutMs: readIntEnv("CYBERBOSS_DSH_INITIALIZE_TIMEOUT_MS") || 120_000,
+    dshRequestTimeoutMs: readIntEnv("CYBERBOSS_DSH_REQUEST_TIMEOUT_MS") || 60_000,
+    dshSessionsFile: path.join(stateDir, "dsh-sessions.json"),
     sessionsFile: path.join(stateDir, "sessions.json"),
     startWithCheckin: resolveCheckinEnabled({
       mode,
