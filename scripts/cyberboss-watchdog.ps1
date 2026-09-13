@@ -63,6 +63,11 @@ $PipelineActivityFile = Join-Path $StateDir "cyberboss-pipeline-activity.json"
 $WatchdogRuntime = (Get-ProjectEnvValue -Name "CYBERBOSS_RUNTIME")
 if ([string]::IsNullOrWhiteSpace($WatchdogRuntime)) { $WatchdogRuntime = "codex" }
 $WatchdogRuntime = $WatchdogRuntime.Trim().ToLowerInvariant()
+# Single source of truth for every app-server prerequisite in this script. The
+# service already skips the shared app-server for non-codex runtimes, so any
+# check that still demands it would be permanently unsatisfiable, would report a
+# phantom failure, and would keep the canary and model-E2E probes parked forever.
+$AppServerRequired = $WatchdogRuntime -eq "codex"
 $RestartNotificationState = Join-Path $StateDir "cyberboss-watchdog-restart-notifications.json"
 $BridgePidFile = Join-Path $LogDir "shared-wechat.pid"
 $AppServerPidFile = Join-Path $LogDir "shared-app-server.pid"
@@ -2136,7 +2141,7 @@ function Get-CanaryTargetConfigurationFailure {
 function Test-CanaryPrerequisites {
   param([Parameter(Mandatory = $true)]$Snapshot)
   return $Snapshot.cyberboss.alive `
-    -and $Snapshot.appServer.ready `
+    -and (-not $AppServerRequired -or $Snapshot.appServer.ready) `
     -and $Snapshot.weflow.ready `
     -and $Snapshot.uiaBridge.ready `
     -and $Snapshot.weixin.alive `
@@ -2520,9 +2525,17 @@ function Test-SnapshotInfrastructureHealthy {
     -or [bool]$Snapshot.uiaBridge.alive
   $uiaHealth = -not (Test-WatchdogMember -Value $Snapshot.uiaBridge -Name "health") `
     -or [bool]$Snapshot.uiaBridge.health
+  # Under the codex runtime the shared app-server must be both alive and ready.
+  # Under any other runtime the service intentionally never starts it, so it must
+  # not appear in the predicate at all -- otherwise the "app-server is missing"
+  # verdict is permanent and unsatisfiable.
+  $appServerReady = if ($AppServerRequired) {
+    $appServerAlive -and [bool]$Snapshot.appServer.ready
+  } else {
+    $true
+  }
   return $Snapshot.cyberboss.alive `
-    -and $appServerAlive `
-    -and $Snapshot.appServer.ready `
+    -and $appServerReady `
     -and $Snapshot.weflow.ready `
     -and $uiaAlive `
     -and $uiaHealth `
@@ -2581,7 +2594,7 @@ function Get-CanaryIdleGateBlockers {
 
   $blockers = [System.Collections.Generic.List[string]]::new()
   if (-not $Snapshot.cyberboss.alive) { $blockers.Add("cyberboss_unavailable") }
-  if (-not $Snapshot.appServer.ready) { $blockers.Add("app_server_unavailable") }
+  if ($AppServerRequired -and -not $Snapshot.appServer.ready) { $blockers.Add("app_server_unavailable") }
   if (-not $Snapshot.weflow.ready) { $blockers.Add("weflow_unavailable") }
   if (-not $Snapshot.uiaBridge.ready) { $blockers.Add("uia_unavailable") }
   if (-not $Snapshot.weixin.alive) { $blockers.Add("weixin_unavailable") }
@@ -2720,7 +2733,12 @@ function Test-PipelineRepairIdleGate {
   # stranded in-memory gate rather than permanent activity: the durable queues
   # remain authoritative across the guarded restart.  Real active work (any
   # activeTurn/delivery/pending count) continues to block repair.
-  $strandedGateOnDeadAppServer = -not [bool]$Snapshot.appServer.ready `
+  # Only the codex runtime routes turns through the shared app-server, so only
+  # there does "app-server not ready" imply "nothing can advance this gate".
+  # Under another runtime the app-server is absent by design and this shape must
+  # not silently excuse a genuinely held gate.
+  $strandedGateOnDeadAppServer = $AppServerRequired `
+    -and -not [bool]$Snapshot.appServer.ready `
     -and $Snapshot.activity.ready `
     -and $Snapshot.activity.healthy `
     -and [int]$Snapshot.activity.turnGateCount -gt 0 `
@@ -3168,7 +3186,7 @@ function Test-UiAWaitingForWeixinSnapshot {
   param([Parameter(Mandatory = $true)]$Snapshot)
 
   return $Snapshot.cyberboss.alive `
-    -and $Snapshot.appServer.ready `
+    -and (-not $AppServerRequired -or $Snapshot.appServer.ready) `
     -and $Snapshot.weflow.ready `
     -and $Snapshot.uiaBridge.alive `
     -and $Snapshot.uiaBridge.health `

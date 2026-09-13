@@ -702,7 +702,7 @@ test("dead services can recover while every live repair remains activity-idle ga
   skip: process.platform !== "win32",
 }, (t) => {
   const stateDir = tempDir(t);
-  const result = invokeLibrary([
+  const command = [
     "$base=[pscustomobject]@{cyberboss=[pscustomobject]@{alive=$true};appServer=[pscustomobject]@{alive=$true};activity=[pscustomobject]@{ready=$true;healthy=$true;idle=$true;userIdleSeconds=600};inboxQueue=[pscustomobject]@{healthy=$true;pendingCount=0;outgoingPoll=[pscustomobject]@{ready=$true}};pendingInbound=[pscustomobject]@{healthy=$true;pendingCount=0};deferredReplies=[pscustomobject]@{healthy=$true;pendingCount=0}};",
     "$dead=$base.PSObject.Copy(); $dead.cyberboss=[pscustomobject]@{alive=$false}; $dead.activity=[pscustomobject]@{ready=$false;healthy=$false;idle=$false;userIdleSeconds=$null};",
     "$appDeadBusy=$base.PSObject.Copy(); $appDeadBusy.appServer=[pscustomobject]@{alive=$false;ready=$false}; $appDeadBusy.activity=[pscustomobject]@{ready=$true;healthy=$true;idle=$false;activeTurnCount=1;turnGateCount=1;activeDeliveryCount=0;pendingInboundCount=0;userIdleSeconds=600};",
@@ -710,11 +710,27 @@ test("dead services can recover while every live repair remains activity-idle ga
     "$busy=$base.PSObject.Copy(); $busy.activity=[pscustomobject]@{ready=$true;healthy=$true;idle=$false;userIdleSeconds=600};",
     "$recent=$base.PSObject.Copy(); $recent.activity=[pscustomobject]@{ready=$true;healthy=$true;idle=$true;userIdleSeconds=30};",
     "$value=[ordered]@{dead=(Test-PipelineRepairIdleGate -Snapshot $dead);appDeadBusy=(Test-PipelineRepairIdleGate -Snapshot $appDeadBusy);appDeadStrandedGate=(Test-PipelineRepairIdleGate -Snapshot $appDeadStrandedGate);busy=(Test-PipelineRepairIdleGate -Snapshot $busy);recent=(Test-PipelineRepairIdleGate -Snapshot $recent);idle=(Test-PipelineRepairIdleGate -Snapshot $base)}; $value | ConvertTo-Json -Compress",
-  ].join(" "), stateDir);
+  ].join(" ");
+  // The runtime is pinned because these shapes are runtime-dependent, and an
+  // ambient CYBERBOSS_RUNTIME in .env must not silently change what is asserted.
+  const result = invokeLibrary(command, stateDir, { CYBERBOSS_RUNTIME: "codex" });
   assert.deepEqual(result, {
     dead: true,
     appDeadBusy: false,
     appDeadStrandedGate: true,
+    busy: false,
+    recent: false,
+    idle: true,
+  });
+
+  // Under a non-codex runtime the shared app-server is absent by design, so a
+  // missing app-server cannot explain a stranded gate: it must keep reading as
+  // busy instead of silently excusing a repair that nothing justifies.
+  const nonCodex = invokeLibrary(command, stateDir, { CYBERBOSS_RUNTIME: "dsh" });
+  assert.deepEqual(nonCodex, {
+    dead: true,
+    appDeadBusy: false,
+    appDeadStrandedGate: false,
     busy: false,
     recent: false,
     idle: true,
