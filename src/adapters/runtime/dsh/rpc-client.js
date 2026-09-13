@@ -328,17 +328,26 @@ function newSessionId(prefix = "cyberboss") {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
+/**
+ * Resolve the `dsh` launcher, preferring an installed dependency over the npx
+ * cache. `@deepseek-ai/dsh` is declared in package.json, so a normal install puts
+ * it under node_modules; the npx cache path is a development fallback that
+ * disappears whenever that cache is pruned.
+ */
 function defaultDshBin() {
+  const packageBin = path.join("@deepseek-ai", "dsh", "lib", "bin.js");
+  try {
+    return require.resolve(packageBin);
+  } catch {
+    // Not installed as a dependency; fall through to the development cache.
+  }
   return path.join(
     process.env.LOCALAPPDATA || "",
     "npm-cache",
     "_npx",
     "1e7f6d9597241db0",
     "node_modules",
-    "@deepseek-ai",
-    "dsh",
-    "lib",
-    "bin.js",
+    packageBin,
   );
 }
 
