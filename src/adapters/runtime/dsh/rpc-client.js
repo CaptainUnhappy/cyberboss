@@ -63,6 +63,13 @@ class DshRpcClient {
     this.nodePath = options.nodePath || process.execPath;
     this.dshBin = options.dshBin;
     this.profile = normalizeText(options.profile) || "sdk";
+    // Additional patch overlays, applied after the profile layer. `--patch` is
+    // repeatable and merges by `id`; an id absent from the composed tree is
+    // silently a no-op, so a caller relying on an overlay must verify the
+    // resulting config (see docs/dsh-helper-notools.patch.yml).
+    this.patchPaths = (Array.isArray(options.patchPaths) ? options.patchPaths : [])
+      .map((item) => normalizeText(item))
+      .filter(Boolean);
     this.cwd = options.cwd;
     this.provider = normalizeText(options.provider);
     this.model = normalizeText(options.model);
@@ -115,9 +122,13 @@ class DshRpcClient {
     this.stdoutBuffer = "";
     this.stderrTail = "";
 
+    const args = [this.dshBin, "--profile", this.profile];
+    for (const patchPath of this.patchPaths) {
+      args.push("--patch", patchPath);
+    }
     const child = spawn(
       this.nodePath,
-      [this.dshBin, "--profile", this.profile],
+      args,
       {
         cwd: this.cwd,
         env: sanitizeEnvironment(process.env),
