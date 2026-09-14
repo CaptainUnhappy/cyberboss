@@ -179,6 +179,14 @@ function readConfig() {
     dshMaxTokens: readIntEnv("CYBERBOSS_DSH_MAX_TOKENS"),
     dshInitializeTimeoutMs: readIntEnv("CYBERBOSS_DSH_INITIALIZE_TIMEOUT_MS") || 120_000,
     dshRequestTimeoutMs: readIntEnv("CYBERBOSS_DSH_REQUEST_TIMEOUT_MS") || 60_000,
+    // Three-state approval policy for the DSH runtime:
+    //   session -> a constrained collaborative session decides each escalation
+    //   never   -> every escalation is rejected without asking anyone
+    //   (unset) -> no answerer is composed, so DSH resolves `unavailable`
+    //              (fail closed). This stays the default: enabling a decider is
+    //              an explicit opt-in.
+    dshApprovalMode: resolveDshApprovalMode(readTextEnv("CYBERBOSS_DSH_APPROVAL")),
+    dshApprovalTimeoutMs: readIntEnv("CYBERBOSS_DSH_APPROVAL_TIMEOUT_MS") || 60_000,
     dshSessionsFile: path.join(stateDir, "dsh-sessions.json"),
     sessionsFile: path.join(stateDir, "sessions.json"),
     startWithCheckin: resolveCheckinEnabled({
@@ -292,6 +300,21 @@ function resolveCheckinEnabled({ mode, argv, enabled }) {
   return enabled === true || hasArgFlag(argv, "--checkin");
 }
 
+/**
+ * `CYBERBOSS_DSH_APPROVAL` selects how a DSH tool escalation is answered.
+ *
+ * Returns `""` for anything unrecognised, which means "compose no answerer" and
+ * therefore fail closed. An unreadable value must never be quietly promoted to
+ * the deciding mode.
+ */
+function resolveDshApprovalMode(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "session" || normalized === "never") {
+    return normalized;
+  }
+  return "";
+}
+
 function assertWeFlowCanaryTalkerIsolation({ weflowInboxChat, weflowCanaryChat } = {}) {
   const primaryTalker = typeof weflowInboxChat === "string" ? weflowInboxChat.trim() : "";
   const canaryTalker = typeof weflowCanaryChat === "string" ? weflowCanaryChat.trim() : "";
@@ -306,4 +329,9 @@ function assertWeFlowCanaryTalkerIsolation({ weflowInboxChat, weflowCanaryChat }
   throw error;
 }
 
-module.exports = { assertWeFlowCanaryTalkerIsolation, readConfig, resolveCheckinEnabled };
+module.exports = {
+  assertWeFlowCanaryTalkerIsolation,
+  readConfig,
+  resolveCheckinEnabled,
+  resolveDshApprovalMode,
+};

@@ -71,6 +71,12 @@ class DshRpcClient {
       .map((item) => normalizeText(item))
       .filter(Boolean);
     this.cwd = options.cwd;
+    // Extra environment for the child. The approval answerer receives its
+    // per-spawn endpoint and bearer token this way: both change on every spawn,
+    // and a `--patch` file is static.
+    this.envOverrides = (options.env && typeof options.env === "object" && !Array.isArray(options.env))
+      ? options.env
+      : {};
     this.provider = normalizeText(options.provider);
     this.model = normalizeText(options.model);
     this.reasoningEffort = normalizeText(options.reasoningEffort);
@@ -131,7 +137,7 @@ class DshRpcClient {
       args,
       {
         cwd: this.cwd,
-        env: sanitizeEnvironment(process.env),
+        env: sanitizeEnvironment({ ...process.env, ...this.envOverrides }),
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       },

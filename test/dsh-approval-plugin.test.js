@@ -108,8 +108,141 @@ test("a throwing or timing-out decider fails closed", async () => {
     decide: () => new Promise(() => {}),
   });
   assert.equal(
-    await Answerer.prototype.answer.call(hanging, {}, async () => "allowed-once"),
+    await Answerer.prototype.answer.call(hanging, {}, async () => "unavailable"),
     "unavailable",
     "a decider that never answers must not stall the turn",
   );
+});
+
+/**
+ * The transport is the half that cannot be proven by types: the plugin has to
+ * reach the Cyberboss endpoint over a real socket, with the real header, and map
+ * the real response. These tests run the plugin's own `decide()` against a real
+ * ApprovalEndpoint rather than a stub.
+ */
+async function withRealEndpoint(t, decide) {
+  const { ApprovalEndpoint } = require("../src/core/approval-endpoint");
+  const endpoint = new ApprovalEndpoint({
+    decide,
+    logger: { warn() {}, error() {}, log() {} },
+  });
+  await endpoint.start();
+  t.after(() => endpoint.close());
+  return endpoint;
+}
+
+test("decide() posts the callId and maps the endpoint's outcome", async (t) => {
+  const seen = [];
+  const endpoint = await withRealEndpoint(t, async (request) => {
+    seen.push(request);
+    return "allowed-once";
+  });
+  const { Context, Answerer } = await loadPlugin();
+  const ctx = new Context();
+  const plugin = new Answerer(ctx, {
+    mode: "session",
+    endpoint: endpoint.endpoint,
+    token: endpoint.token,
+  });
+
+  // Driven through decide() directly so the asserted shape is the wire payload.
+  assert.equal(await plugin.decide({ toolName: "pwsh", callId: "call_00_x", reason: "why" }), "allowed-once");
+  // The event carries no tool arguments, so nothing beyond these three may cross.
+  assert.deepEqual(seen, [{ toolName: "pwsh", callId: "call_00_x", reason: "why" }]);
+});
+
+test("the answerer grants exactly when a real endpoint says allowed-once", async (t) => {
+  const endpoint = await withRealEndpoint(t, async () => "allowed-once");
+  const { Context, Answerer } = await loadPlugin();
+  const ctx = new Context();
+  // eslint-disable-next-line no-new -- the constructor registers the listener
+  new Answerer(ctx, {
+    mode: "session",
+    endpoint: endpoint.endpoint,
+    token: endpoint.token,
+  });
+
+  const outcome = await ctx.waterfall(
+    "approval/request",
+    { toolName: "pwsh", callId: "call_00_y", reason: "fixture escalation" },
+    async () => "rejected",
+  );
+  assert.equal(outcome, "allowed-once",
+    "a granted decision must reach the waterfall, not be swallowed by the plugin");
+});
+
+test("a real endpoint that rejects yields rejected, and a 401 yields unavailable", async (t) => {
+  const { Context, Answerer } = await loadPlugin();
+
+  const denying = await withRealEndpoint(t, async () => "rejected");
+  const denyCtx = new Context();
+  // eslint-disable-next-line no-new
+  new Answerer(denyCtx, { mode: "session", endpoint: denying.endpoint, token: denying.token });
+  assert.equal(
+    await denyCtx.waterfall("approval/request", { toolName: "pwsh" }, async () => "allowed-once"),
+    "rejected",
+  );
+
+  // A token mismatch must not degrade into a grant or into `rejected`: it is an
+  // unavailable decider, which is the fail-closed outcome.
+  const guarded = await withRealEndpoint(t, async () => "allowed-once");
+  const wrongCtx = new Context();
+  // eslint-disable-next-line no-new
+  new Answerer(wrongCtx, { mode: "session", endpoint: guarded.endpoint, token: "0".repeat(64) });
+  assert.equal(
+    await wrongCtx.waterfall("approval/request", { toolName: "pwsh" }, async () => "rejected"),
+    "unavailable",
+  );
+});
+
+test("the endpoint and token fall back to the spawn environment", async (t) => {
+  const endpoint = await withRealEndpoint(t, async () => "allowed-once");
+  const previousEndpoint = process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT;
+  const previousToken = process.env.CYBERBOSS_DSH_APPROVAL_TOKEN;
+  process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT = endpoint.endpoint;
+  process.env.CYBERBOSS_DSH_APPROVAL_TOKEN = endpoint.token;
+  t.after(() => {
+    if (previousEndpoint === undefined) delete process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT;
+    else process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT = previousEndpoint;
+    if (previousToken === undefined) delete process.env.CYBERBOSS_DSH_APPROVAL_TOKEN;
+    else process.env.CYBERBOSS_DSH_APPROVAL_TOKEN = previousToken;
+  });
+
+  const { Context, Answerer } = await loadPlugin();
+  const ctx = new Context();
+  // No transport in config at all: the per-spawn environment must supply it.
+  // eslint-disable-next-line no-new
+  new Answerer(ctx, { mode: "session" });
+  assert.equal(
+    await ctx.waterfall("approval/request", { toolName: "pwsh" }, async () => "rejected"),
+    "allowed-once",
+  );
+});
+
+test("a half-configured transport fails closed instead of calling out", async () => {
+  const { Context, Answerer } = await loadPlugin();
+  // The environment fallback is exercised by another test in this file, so it
+  // must be cleared here or a half-configured case would look configured.
+  const savedEndpoint = process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT;
+  const savedToken = process.env.CYBERBOSS_DSH_APPROVAL_TOKEN;
+  delete process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT;
+  delete process.env.CYBERBOSS_DSH_APPROVAL_TOKEN;
+  try {
+    for (const config of [
+      { mode: "session", endpoint: "http://127.0.0.1:1/decide", token: "" },
+      { mode: "session", endpoint: "", token: "a".repeat(64) },
+    ]) {
+      const plugin = new Answerer(new Context(), config);
+      let called = false;
+      plugin.decide = async () => { called = true; return "allowed-once"; };
+      assert.equal(
+        await plugin.answer({ toolName: "pwsh" }, async () => "allowed-once"),
+        "unavailable",
+      );
+      assert.equal(called, false, "an incomplete transport must not attempt a call");
+    }
+  } finally {
+    if (savedEndpoint !== undefined) process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT = savedEndpoint;
+    if (savedToken !== undefined) process.env.CYBERBOSS_DSH_APPROVAL_TOKEN = savedToken;
+  }
 });

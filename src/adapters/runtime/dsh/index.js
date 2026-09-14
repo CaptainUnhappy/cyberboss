@@ -25,6 +25,8 @@ const { DshRpcClient, defaultDshBin } = require("./rpc-client");
 const { mapDshSessionEvent } = require("./events");
 const { SessionStore } = require("../codex/session-store");
 const { buildInstructionRefreshText } = require("../shared-instructions");
+const { ApprovalEndpoint } = require("../../../core/approval-endpoint");
+const { decideApprovalWithHelper } = require("../../../core/approval-decider");
 const {
   MODEL_CANARY_EXECUTION_POLICY,
 } = require("../../../integrations/weflow-model-canary");
@@ -62,6 +64,18 @@ function isSupportedImageMime(value) {
 
 function imageMimeForPath(filePath) {
   return IMAGE_MIME_BY_EXTENSION.get(path.extname(normalizeText(filePath)).toLowerCase()) || "";
+}
+
+/**
+ * Path to the overlay that composes the approval answerer into a DSH profile.
+ *
+ * A wrong path here is fatal rather than degraded: cordis resolves an insert's
+ * `name` relative to the profile directory, so a missing overlay target makes
+ * DSH exit 5 and the whole runtime unusable. Exported so a test can pin it
+ * against the repository instead of discovering it at spawn time.
+ */
+function resolveApprovalPatchPath(dirname = __dirname) {
+  return path.resolve(dirname, "..", "..", "..", "..", "dsh-plugins", "cyberboss-approval", "main.patch.yml");
 }
 
 /**
@@ -147,6 +161,72 @@ function createDshRuntimeAdapter(config = {}) {
   let readyState = null;
   let closed = false;
 
+  // `session` turns every escalation into a question for a constrained
+  // collaborative session; `never` rejects without asking; "" composes no
+  // answerer at all, which DSH resolves to `unavailable` (fail closed).
+  const approvalMode = normalizeText(config.dshApprovalMode).toLowerCase();
+  const approvalEnabled = approvalMode === "session" || approvalMode === "never";
+  const approvalPatchPath = approvalEnabled ? resolveApprovalPatchPath() : "";
+  let approvalEndpoint = null;
+  let approvalEndpointStarting = null;
+
+  /**
+   * Resolve the tool arguments for one escalation.
+   *
+   * `ApprovalRequestEvent` carries only `{toolName, callId, reason}`, so the
+   * command and justification have to come from the `tool/call` this adapter
+   * already recorded under that callId. Entries live per workspace runtime, and
+   * the endpoint is shared, so every runtime is searched. An unresolved callId
+   * yields empty fields rather than a guess.
+   */
+  function resolveApprovalCallContext(callId) {
+    const wanted = normalizeText(callId);
+    if (!wanted) return {};
+    for (const record of runtimes.values()) {
+      const block = record.pendingToolCalls?.get(wanted);
+      if (!block) continue;
+      const args = block.arguments && typeof block.arguments === "object" ? block.arguments : {};
+      return {
+        toolName: normalizeText(block.name),
+        command: normalizeText(args.command),
+        justification: normalizeText(args.justification),
+        requestedPermissions: normalizeText(args.sandbox_permissions),
+      };
+    }
+    return {};
+  }
+
+  async function ensureApprovalEndpoint() {
+    if (!approvalEnabled) return null;
+    if (approvalEndpoint) return approvalEndpoint;
+    if (approvalEndpointStarting) return approvalEndpointStarting;
+    approvalEndpointStarting = (async () => {
+      const endpoint = new ApprovalEndpoint({
+        logger: console,
+        decide: async ({ callId, reason }) => {
+          const context = resolveApprovalCallContext(callId);
+          return decideApprovalWithHelper({
+            ...context,
+            reason,
+            dshBin: resolveDshBin(config),
+            model: configuredModel,
+            provider: configuredProvider,
+            timeoutMs: config.dshApprovalTimeoutMs,
+            logger: console,
+          });
+        },
+      });
+      await endpoint.start();
+      approvalEndpoint = endpoint;
+      return endpoint;
+    })();
+    try {
+      return await approvalEndpointStarting;
+    } finally {
+      approvalEndpointStarting = null;
+    }
+  }
+
   const configuredModel = normalizeText(config.dshModel);
   const configuredProvider = normalizeText(config.dshProvider) || "deepseek-official";
 
@@ -189,6 +269,15 @@ function createDshRuntimeAdapter(config = {}) {
       initializeTimeoutMs: config.dshInitializeTimeoutMs,
       requestTimeoutMs: config.dshRequestTimeoutMs,
       logger: console,
+      // The answerer overlay names its plugin by absolute path, and the endpoint
+      // and bearer token are per-spawn, so both travel to the child here.
+      patchPaths: approvalPatchPath ? [approvalPatchPath] : [],
+      env: approvalEndpoint
+        ? {
+          CYBERBOSS_DSH_APPROVAL_ENDPOINT: approvalEndpoint.endpoint,
+          CYBERBOSS_DSH_APPROVAL_TOKEN: approvalEndpoint.token,
+        }
+        : {},
     });
 
     record = {
@@ -315,6 +404,10 @@ function createDshRuntimeAdapter(config = {}) {
           approvalRespond: false,
           compactThread: false,
         },
+        // Reported separately from `limitations` because it is configuration,
+        // not a capability gap: `""` is the fail-closed default, `session` means
+        // a collaborative session decides, `never` means reject outright.
+        approval: approvalMode || "(none)",
       };
     },
     onEvent(listener) {
@@ -341,6 +434,9 @@ function createDshRuntimeAdapter(config = {}) {
     },
     async initialize() {
       if (readyState || closed) return readyState;
+      // The endpoint must exist before the first child spawns, because the child
+      // receives its URL and token through the environment.
+      await ensureApprovalEndpoint();
       const runtime = ensureRuntime(config.workspaceRoot || process.cwd());
       const result = await runtime.client.initialize();
       readyState = {
@@ -356,6 +452,11 @@ function createDshRuntimeAdapter(config = {}) {
       runtimes.clear();
       for (const record of records) {
         await record.client.close();
+      }
+      const endpoint = approvalEndpoint;
+      approvalEndpoint = null;
+      if (endpoint) {
+        await endpoint.close();
       }
       eventListeners.clear();
       readyState = null;
@@ -499,4 +600,5 @@ module.exports = {
   isSupportedImageMime,
   imageMimeForPath,
   buildDshContentBlocks,
+  resolveApprovalPatchPath,
 };

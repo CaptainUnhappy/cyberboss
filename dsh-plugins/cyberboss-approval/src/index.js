@@ -42,14 +42,16 @@
  * (verified) and composes no approval service at all, so any request raised
  * there resolves `unavailable`.
  *
- * ## NOT DONE YET
+ * ## Status
  *
- * - `decide()` is a stub: it always returns `unavailable` (fail closed).
- * - The Cyberboss-side transport (local HTTP endpoint) does not exist.
- * - The plugin has never been loaded into a profile or run once. The
- *   registration signature is verified against the types, but that the listener
- *   actually fires on a live escalation is still unproven - load it into a
- *   profile and observe a log line before writing any decision logic.
+ * Wired and verified: the answerer claims the live `approval/request` waterfall
+ * (`mode: never` yields `rejected`, `mode: session` with no transport yields
+ * `unavailable`, and a bare profile yields `unavailable`).
+ *
+ * `decide()` now POSTs to the Cyberboss endpoint created by
+ * `src/core/approval-endpoint.js`, which resolves the tool arguments from the
+ * `callId` and consults `src/core/approval-decider.js`. When no transport is
+ * configured the answerer still fails closed.
  */
 
 import { Service } from '@deepseek-ai/cordis';
@@ -66,7 +68,15 @@ export default class CyberbossApprovalAnswerer extends Service {
     super(ctx, 'cyberbossApproval');
     this.config = config;
     this.mode = config.mode ?? 'session';
-    this.endpoint = (config.endpoint ?? '').trim();
+    // The endpoint and its bearer token are handed to this process through the
+    // environment, because they are per-spawn (ephemeral port + fresh token) and
+    // a patch file is static. Config still wins so a test can pin them.
+    this.endpoint = String(
+      config.endpoint || process.env.CYBERBOSS_DSH_APPROVAL_ENDPOINT || '',
+    ).trim();
+    this.token = String(
+      config.token || process.env.CYBERBOSS_DSH_APPROVAL_TOKEN || '',
+    ).trim();
     this.timeoutMs = Number.isFinite(Number(config.timeoutMs)) ? Number(config.timeoutMs) : 30_000;
 
     // Registered for every agent composing this plugin. Returning an outcome
@@ -84,10 +94,10 @@ export default class CyberbossApprovalAnswerer extends Service {
     if (this.mode === 'never' || this.mode === 'deny') {
       return 'rejected';
     }
-    if (!this.endpoint) {
+    if (!this.endpoint || !this.token) {
       // No transport configured: fail closed rather than pretend to decide.
       this.ctx.logger?.warn?.(
-        '[cyberboss-approval] no decider endpoint configured; failing closed',
+        '[cyberboss-approval] no decider transport configured; failing closed',
       );
       return 'unavailable';
     }
@@ -117,16 +127,34 @@ export default class CyberbossApprovalAnswerer extends Service {
   }
 
   /**
-   * Ask Cyberboss for a verdict. STUB: always fails closed.
+   * Ask Cyberboss for a verdict.
    *
-   * The real implementation POSTs `{toolName, callId, reason}` to `this.endpoint`
-   * and expects `{outcome}`. It must not forward tool arguments blindly - the
-   * endpoint resolves them from `callId`.
+   * Only `{toolName, callId, reason}` crosses the wire. The event carries no tool
+   * arguments, and forwarding arguments we do not have would be guesswork; the
+   * endpoint resolves them itself from the paired `tool/call` it already
+   * recorded for this callId.
    *
-   * @returns {Promise<string>}
+   * @returns {Promise<string>} a closed ApprovalOutcome
    */
-  async decide(_req) {
-    return 'unavailable';
+  async decide(req) {
+    const response = await fetch(this.endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        toolName: String(req?.toolName ?? ''),
+        callId: String(req?.callId ?? ''),
+        reason: String(req?.reason ?? ''),
+      }),
+      signal: req?.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`decider endpoint returned HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    return typeof payload?.outcome === 'string' ? payload.outcome : 'unavailable';
   }
 
   withTimeout(promise, timeoutMs, message) {
