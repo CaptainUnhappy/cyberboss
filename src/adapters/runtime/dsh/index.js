@@ -24,7 +24,7 @@ const fs = require("node:fs");
 const { DshRpcClient, defaultDshBin } = require("./rpc-client");
 const { mapDshSessionEvent } = require("./events");
 const { SessionStore } = require("../codex/session-store");
-const { buildInstructionRefreshText } = require("../shared-instructions");
+const { buildOpeningTurnText, buildInstructionRefreshText } = require("../shared-instructions");
 const { ApprovalEndpoint } = require("../../../core/approval-endpoint");
 const { decideApprovalWithHelper } = require("../../../core/approval-decider");
 const {
@@ -483,6 +483,7 @@ function createDshRuntimeAdapter(config = {}) {
       let threadId = bindingKey
         ? sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot)
         : "";
+      const openingTurn = !threadId;
       if (!threadId) {
         // DSH session ids are client-chosen and an unknown id lazily creates the
         // agent+session pair, so a fresh id is how a conversation starts.
@@ -496,7 +497,12 @@ function createDshRuntimeAdapter(config = {}) {
         }
       }
 
-      const contentBlocks = buildContentBlocks({ text, attachments });
+      // The Cyberboss persona travels inside the opening user message, exactly as
+      // the Codex and Claude Code adapters do it. Without this a fresh DSH
+      // session runs on DSH's own generic coding-agent system prompt alone, so
+      // the WeChat persona never applies to the first turn.
+      const turnText = openingTurn ? buildOpeningTurnText(config, text) : text;
+      const contentBlocks = buildContentBlocks({ text: turnText, attachments });
       if (contentBlocks.length === 0) {
         throw new Error("dsh turn requires text or an attachment");
       }

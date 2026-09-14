@@ -83,6 +83,64 @@ test("assistant/message with text maps to runtime.reply.completed", () => {
   assert.equal(events[0].type, "runtime.reply.completed");
   assert.equal(events[0].payload.text, "DSH_PROBE_OK");
   assert.equal(events[0].payload.itemId, "e63cfd68-c701-40c0-a574-90f5e83840ed");
+  assert.equal(events[0].payload.phase, "final_answer",
+    "a message with no tool call ends the turn, so its text is the final answer");
+});
+
+/**
+ * Cyberboss renders `phase: "commentary"` as a 【进度】 message and never lets it
+ * close the reply obligation, so the derived phase is what decides whether the
+ * user sees interim progress the way the Codex runtime produces it. DSH has no
+ * phase field, so it is derived from whether the same message also asks for a
+ * tool call.
+ */
+test("assistant/message with text and a tool call is commentary, not a final answer", () => {
+  const events = mapDshSessionEvent(sessionEvent("s1", {
+    type: "assistant/message",
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "thinking" },
+          { type: "text", text: "【进度】改用公共 API 读取仓库说明" },
+          {
+            type: "tool-call",
+            id: "call_00_progress",
+            name: "pwsh",
+            arguments: JSON.stringify({ command: "gh api repos/x/y" }),
+          },
+        ],
+        id: "msg-progress",
+      },
+    },
+  }));
+  const reply = events.find((event) => event.type === "runtime.reply.completed");
+  assert.ok(reply, "the interim note must still be delivered");
+  assert.equal(reply.payload.phase, "commentary",
+    "a message that still asks for a tool call cannot be the final answer");
+  assert.equal(reply.payload.text, "【进度】改用公共 API 读取仓库说明",
+    "reasoning blocks must not leak into the progress text");
+  const tool = events.find((event) => event.type === "runtime.tool.started");
+  assert.ok(tool, "the tool call in the same message must still be reported");
+});
+
+test("a commentary phase never appears without a tool call in the same message", () => {
+  // The derivation is structural, so a text-only message is always terminal.
+  // Leaving a turn with commentary and no final answer would resurrect the
+  // "turn completed without a final reply" failure this bridge reports on.
+  for (const content of [
+    [{ type: "text", text: "done" }],
+    [{ type: "text", text: "done" }, { type: "reasoning", text: "because" }],
+  ]) {
+    const events = mapDshSessionEvent(sessionEvent("s1", {
+      type: "assistant/message",
+      data: { turn: 1, step: 1, message: { role: "assistant", content, id: "m" } },
+    }));
+    const reply = events.find((event) => event.type === "runtime.reply.completed");
+    assert.equal(reply.payload.phase, "final_answer");
+  }
 });
 
 test("assistant/message carrying only a tool-call emits tool.started and no reply", () => {

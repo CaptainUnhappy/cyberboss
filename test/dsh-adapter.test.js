@@ -241,3 +241,137 @@ test("close is idempotent and clears listeners", async () => {
   assert.equal(calls, 0);
   state.cleanup();
 });
+
+/**
+ * Cyberboss's persona is not a DSH system prompt: the Codex and Claude Code
+ * adapters both fold it into the *opening user message*
+ * (`buildOpeningTurnText`). The DSH adapter originally skipped that, so a fresh
+ * DSH session ran on DSH's own generic coding-agent prompt and the WeChat
+ * persona never applied. These tests capture the outbound prompt payload.
+ */
+function capturePrompts() {
+  const prompts = [];
+  const originalStart = DshRpcClient.prototype.start;
+  const originalInitialize = DshRpcClient.prototype.initialize;
+  const originalPrompt = DshRpcClient.prototype.prompt;
+  DshRpcClient.prototype.start = function patchedStart() {
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.exitCode = null;
+    this.child = child;
+    this.closed = false;
+    child.stdout.setEncoding("utf8");
+    child.kill = () => { child.exitCode = 0; this.child = null; child.emit("exit", 0, null); };
+  };
+  DshRpcClient.prototype.initialize = async function patchedInitialize() {
+    this.initializeResult = { serverInfo: { name: "fake" } };
+    return this.initializeResult;
+  };
+  DshRpcClient.prototype.prompt = async function patchedPrompt(sessionId, blocks) {
+    prompts.push({ sessionId, blocks });
+    // Abort before the turn-start rendezvous: this test is about what leaves the
+    // adapter, not about the turn lifecycle, and waiting would need a real DSH.
+    throw new Error("STOP_AFTER_PROMPT");
+  };
+  return {
+    prompts,
+    restore() {
+      DshRpcClient.prototype.start = originalStart;
+      DshRpcClient.prototype.initialize = originalInitialize;
+      DshRpcClient.prototype.prompt = originalPrompt;
+    },
+  };
+}
+
+function promptText(blocks) {
+  return (blocks || [])
+    .filter((block) => block?.type === "text")
+    .map((block) => block.text)
+    .join("");
+}
+
+test("a fresh DSH session carries the Cyberboss persona in its opening turn", async () => {
+  const state = makeState();
+  const workspace = path.join(state.dir, "w-persona");
+  fs.mkdirSync(workspace);
+  const instructionsFile = path.join(state.dir, "weixin-instructions.md");
+  fs.writeFileSync(instructionsFile, "PERSONA_MARKER: you are the cyber boss.\n");
+  const capture = capturePrompts();
+
+  try {
+    const adapter = createDshRuntimeAdapter({
+      workspaceRoot: workspace,
+      sessionsFile: state.sessionsFile,
+      dshSessionsFile: state.sessionsFile,
+      weixinInstructionsFile: instructionsFile,
+    });
+    const store = adapter.getSessionStore();
+    const bindingKey = store.buildBindingKey({
+      workspaceId: "w", accountId: "a", senderId: "s",
+    });
+
+    await assert.rejects(
+      adapter.sendTurn({ bindingKey, workspaceRoot: workspace, text: "你好" }),
+      /STOP_AFTER_PROMPT/u,
+    );
+    assert.equal(capture.prompts.length, 1);
+    const opening = promptText(capture.prompts[0].blocks);
+    assert.match(opening, /PERSONA_MARKER/u,
+      "the opening turn must carry the configured persona");
+    assert.match(opening, /WECHAT SESSION INSTRUCTIONS/u);
+    assert.match(opening, /你好/u, "the user's own text must survive the wrapping");
+
+    // A reply on the same session must not re-send the whole persona.
+    await assert.rejects(
+      adapter.sendTurn({ bindingKey, workspaceRoot: workspace, text: "再说一次" }),
+      /STOP_AFTER_PROMPT/u,
+    );
+    assert.equal(capture.prompts.length, 2);
+    const followUp = promptText(capture.prompts[1].blocks);
+    assert.doesNotMatch(followUp, /PERSONA_MARKER/u,
+      "the persona belongs to the opening turn only");
+    assert.equal(followUp, "再说一次");
+    assert.equal(
+      capture.prompts[1].sessionId,
+      capture.prompts[0].sessionId,
+      "the follow-up must resume the session the opening turn created",
+    );
+
+    await adapter.close();
+  } finally {
+    capture.restore();
+    state.cleanup();
+  }
+});
+
+test("the opening turn still opens a session when no persona file is configured", async () => {
+  const state = makeState();
+  const workspace = path.join(state.dir, "w-nopersona");
+  fs.mkdirSync(workspace);
+  const capture = capturePrompts();
+
+  try {
+    const adapter = createDshRuntimeAdapter({
+      workspaceRoot: workspace,
+      sessionsFile: state.sessionsFile,
+      dshSessionsFile: state.sessionsFile,
+      weixinInstructionsFile: path.join(state.dir, "does-not-exist.md"),
+    });
+    const store = adapter.getSessionStore();
+    const bindingKey = store.buildBindingKey({
+      workspaceId: "w", accountId: "a", senderId: "s",
+    });
+    await assert.rejects(
+      adapter.sendTurn({ bindingKey, workspaceRoot: workspace, text: "hello" }),
+      /STOP_AFTER_PROMPT/u,
+    );
+    assert.equal(promptText(capture.prompts[0].blocks), "hello",
+      "a missing persona file must not inject an empty instruction wrapper");
+    await adapter.close();
+  } finally {
+    capture.restore();
+    state.cleanup();
+  }
+});

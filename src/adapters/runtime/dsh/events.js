@@ -127,7 +127,8 @@ function mapDshSessionEvent(params, context = {}) {
   if (type === "assistant/message") {
     const events = [];
     const message = data?.message;
-    for (const block of listAssistantToolCalls(message)) {
+    const toolCalls = listAssistantToolCalls(message);
+    for (const block of toolCalls) {
       const callId = normalizeText(block.id);
       if (context.pendingToolCalls && callId) {
         context.pendingToolCalls.set(callId, block);
@@ -152,9 +153,12 @@ function mapDshSessionEvent(params, context = {}) {
           turnId,
           itemId: normalizeText(message?.id),
           text,
-          // No DSH event carries a Codex-style message phase; a final answer and
-          // an interim note are indistinguishable here.
-          phase: "",
+          // DSH has no Codex-style `phase` field, so it is derived: a message that
+          // also asks for a tool call cannot be the final answer - the turn
+          // continues past it, so its text is an interim note. Cyberboss renders
+          // commentary as a 【进度】 message and never lets it close the reply
+          // obligation, which is the same shape Codex already produces.
+          phase: toolCalls.length > 0 ? "commentary" : "final_answer",
         },
       });
     }
