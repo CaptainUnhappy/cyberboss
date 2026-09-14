@@ -203,3 +203,44 @@ test("a healthy idle dsh stack keeps the pipeline repair gate open", () => {
     true,
   );
 });
+
+/**
+ * The snapshot's own `healthy` aggregate drives the scheduler's top-level
+ * outcome. It has to agree with Get-WatchdogFailedComponents, which is
+ * runtime-aware: while it demanded a live shared app-server unconditionally, a
+ * non-codex stack could never be healthy AND no component was ever attributed,
+ * so the scheduler fell through to "snapshot is unhealthy but no restartable
+ * component was attributed" and reported pipeline_blocked forever.
+ */
+test("the top-level healthy aggregate never demands an absent app-server", () => {
+  const source = fs.readFileSync(watchdogPath, "utf8");
+  const aggregate = /\$healthy = \$bridgeAlive[\s\S]*?\r?\n\r?\n/u.exec(source);
+  assert.ok(aggregate, "the healthy aggregate must still be where this test expects it");
+
+  // The aggregate tests the shared app-server twice: its process and its readyz
+  // probe. Both have to be runtime-guarded, and finding only one of them is how
+  // this stayed broken - `$appReady` is the app-server's readyz, not the UIAs.
+  for (const term of ["appServerAlive", "appReady\\.Ok"]) {
+    assert.match(
+      aggregate[0],
+      new RegExp(`-and \\(-not \\$AppServerRequired -or \\$${term}\\)`, "u"),
+      `the ${term} term must be guarded by the runtime switch`,
+    );
+    assert.doesNotMatch(
+      aggregate[0],
+      new RegExp(`-and \\$${term}(?!\\))`, "u"),
+      `an unguarded ${term} term makes healthy=true impossible off codex`,
+    );
+  }
+  // The guard must not remove the codex-path probes, only make them conditional.
+  assert.match(aggregate[0], /-and \$uiaProcess\.Ok/u);
+  assert.match(aggregate[0], /-and \$uiaReady\.Ok/u);
+
+  // Every other app-server prerequisite in this script must consult the switch.
+  const guardUsers = [...source.matchAll(/-and \$Snapshot\.appServer\.ready/gu)];
+  assert.equal(
+    guardUsers.length,
+    0,
+    "every snapshot-level app-server prerequisite must be runtime-guarded",
+  );
+});

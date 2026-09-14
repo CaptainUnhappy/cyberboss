@@ -2837,10 +2837,15 @@ function Get-HealthSnapshot {
   }
   $activity = Get-PipelineActivityHealth -ExpectedPid $bridgePid
   $desktopInput = Get-DesktopInputIdleState
+  # This aggregate must stay consistent with Get-WatchdogFailedComponents, which
+  # is runtime-aware. While it demanded a live shared app-server unconditionally -
+  # both its process and its readyz probe - a non-codex runtime could never be
+  # healthy AND no component was ever attributed, so the scheduler fell through to
+  # its "unattributed" branch and reported pipeline_blocked forever.
   $healthy = $bridgeAlive `
-    -and $appServerAlive `
+    -and (-not $AppServerRequired -or $appServerAlive) `
     -and $uiaAlive `
-    -and $appReady.Ok `
+    -and (-not $AppServerRequired -or $appReady.Ok) `
     -and $uiaProcess.Ok `
     -and $uiaReady.Ok `
     -and $weFlow.ready `
