@@ -375,3 +375,114 @@ test("the opening turn still opens a session when no persona file is configured"
     state.cleanup();
   }
 });
+
+/**
+ * The SDK server resolves a `session/prompt` for an id it does not hold in memory
+ * by *creating* it, and `dsh-session` refuses to create an id that already exists
+ * on disk. The protocol exposes only initialize/session/prompt/shutdown, so a
+ * session created by an earlier process can never be prompted again - which means
+ * every runtime restart (and every /stop, which respawns the runtime) would fail
+ * the next message with `session "<id>" already exists`.
+ */
+test("a session a new runtime process cannot resume is replaced, not fatal", async () => {
+  const state = makeState();
+  const workspace = path.join(state.dir, "w-conflict");
+  fs.mkdirSync(workspace);
+  const instructionsFile = path.join(state.dir, "weixin-instructions.md");
+  fs.writeFileSync(instructionsFile, "PERSONA_MARKER\n");
+  const capture = capturePrompts();
+
+  try {
+    const adapter = createDshRuntimeAdapter({
+      workspaceRoot: workspace,
+      sessionsFile: state.sessionsFile,
+      dshSessionsFile: state.sessionsFile,
+      weixinInstructionsFile: instructionsFile,
+    });
+    const store = adapter.getSessionStore();
+    const bindingKey = store.buildBindingKey({
+      workspaceId: "w", accountId: "a", senderId: "s",
+    });
+
+    // Establish a session id the way a completed turn would.
+    await assert.rejects(
+      adapter.sendTurn({ bindingKey, workspaceRoot: workspace, text: "first" }),
+      /STOP_AFTER_PROMPT/u,
+    );
+    const originalThreadId = store.getThreadIdForWorkspace(bindingKey, workspace);
+    assert.ok(originalThreadId, "the first turn must have stored a session id");
+
+    // The next turn hits the conflict a restarted runtime produces.
+    DshRpcClient.prototype.prompt = async function conflictPrompt(sessionId, blocks) {
+      capture.prompts.push({ sessionId, blocks });
+      if (sessionId === originalThreadId) {
+        throw new Error(`session "${sessionId}" already exists`);
+      }
+      throw new Error("STOP_AFTER_PROMPT");
+    };
+
+    await assert.rejects(
+      adapter.sendTurn({ bindingKey, workspaceRoot: workspace, text: "second" }),
+      /STOP_AFTER_PROMPT/u,
+      "the turn must retry on a fresh session instead of failing with the conflict",
+    );
+
+    const retries = capture.prompts.filter((entry) => entry.sessionId !== originalThreadId);
+    assert.equal(retries.length, 1, "expected exactly one retry on a replacement session");
+    const retry = retries[0];
+    assert.equal(store.getThreadIdForWorkspace(bindingKey, workspace), retry.sessionId,
+      "the replacement session must be persisted so later turns continue on it");
+    // A brand-new session has no history, so the persona has to travel again.
+    assert.match(promptText(retry.blocks), /PERSONA_MARKER/u,
+      "the replacement session needs the persona it never received");
+    assert.match(promptText(retry.blocks), /second/u);
+
+    await adapter.close();
+  } finally {
+    capture.restore();
+    state.cleanup();
+  }
+});
+
+test("only a session conflict triggers the replacement, not any prompt failure", async () => {
+  const state = makeState();
+  const workspace = path.join(state.dir, "w-othererror");
+  fs.mkdirSync(workspace);
+  const capture = capturePrompts();
+
+  try {
+    const adapter = createDshRuntimeAdapter({
+      workspaceRoot: workspace,
+      sessionsFile: state.sessionsFile,
+      dshSessionsFile: state.sessionsFile,
+    });
+    const store = adapter.getSessionStore();
+    const bindingKey = store.buildBindingKey({
+      workspaceId: "w", accountId: "a", senderId: "s",
+    });
+    await assert.rejects(
+      adapter.sendTurn({ bindingKey, workspaceRoot: workspace, text: "first" }),
+      /STOP_AFTER_PROMPT/u,
+    );
+    const before = store.getThreadIdForWorkspace(bindingKey, workspace);
+    const attemptsBefore = capture.prompts.length;
+
+    DshRpcClient.prototype.prompt = async function otherFailure(sessionId, blocks) {
+      capture.prompts.push({ sessionId, blocks });
+      throw new Error("dsh runtime process error: the child died");
+    };
+    await assert.rejects(
+      adapter.sendTurn({ bindingKey, workspaceRoot: workspace, text: "second" }),
+      /the child died/u,
+    );
+    assert.equal(capture.prompts.length, attemptsBefore + 1,
+      "an unrelated failure must not silently burn a second session");
+    assert.equal(store.getThreadIdForWorkspace(bindingKey, workspace), before,
+      "an unrelated failure must leave the stored session alone");
+
+    await adapter.close();
+  } finally {
+    capture.restore();
+    state.cleanup();
+  }
+});

@@ -42,6 +42,21 @@ function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/**
+ * Detect DSH's "this session already exists" conflict.
+ *
+ * `dsh-session` throws a plain Error with `session "<id>" already exists` (the
+ * forking path uses a typed `SessionForkError` with code SESSION_ALREADY_EXISTS,
+ * which does not apply here). The message is the only stable signal, so match it
+ * narrowly rather than treating every prompt failure as a session conflict.
+ */
+function isSessionConflictError(error) {
+  const code = normalizeText(error?.code);
+  if (code === "SESSION_ALREADY_EXISTS") return true;
+  const message = normalizeText(error?.message);
+  return /^session ".+" already exists$/u.test(message);
+}
+
 // The only raster types DSH admits inline (SdkEncodedImageBlock.mimeType).
 const SUPPORTED_IMAGE_MIMES = new Set([
   "image/png",
@@ -512,7 +527,7 @@ function createDshRuntimeAdapter(config = {}) {
       // rendezvous before prompting and return whatever it hands back, otherwise
       // the id returned here would never match the ids on the emitted events.
       let settleTurnStart;
-      const turnStarted = new Promise((resolve) => {
+      let turnStarted = new Promise((resolve) => {
         settleTurnStart = resolve;
       });
       runtime.turnStartWaiters.set(threadId, settleTurnStart);
@@ -522,7 +537,49 @@ function createDshRuntimeAdapter(config = {}) {
       } catch (error) {
         runtime.turnStartWaiters.delete(threadId);
         runtime.activeTurnBySession.delete(threadId);
-        throw error;
+        if (!isSessionConflictError(error)) {
+          throw error;
+        }
+        // The SDK server resolves a `session/prompt` for an id it does not hold
+        // in memory by *creating* it, and `dsh-session` refuses to create an id
+        // that already exists in its durable store. The protocol has no resume
+        // method (only initialize/session/prompt/shutdown), so a session created
+        // by an earlier process can never be prompted again: every runtime
+        // restart - and every `/stop`, which respawns the runtime - would fail
+        // the next message with `session "..." already exists`.
+        //
+        // Recovery is to continue the conversation on a new session. That costs
+        // the model's context for this thread, which is worth stating plainly
+        // rather than surfacing as a hard request failure.
+        const replacedThreadId = threadId;
+        threadId = `dsh-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+        if (bindingKey) {
+          sessionStore.setThreadIdForWorkspace(bindingKey, workspaceRoot, threadId, {
+            model: normalizeText(model) || configuredModel,
+            modelProvider: configuredProvider,
+            ...metadata,
+          });
+        }
+        console.warn(
+          `[cyberboss] dsh session ${replacedThreadId} is not resumable in a new runtime process; `
+          + `continuing on a fresh session ${threadId} (this thread's context was reset)`,
+        );
+        // A fresh session has no history, so the persona has to be re-sent.
+        const retryBlocks = buildContentBlocks({
+          text: buildOpeningTurnText(config, text),
+          attachments,
+        });
+        turnStarted = new Promise((resolve) => {
+          settleTurnStart = resolve;
+        });
+        runtime.turnStartWaiters.set(threadId, settleTurnStart);
+        try {
+          await runtime.client.prompt(threadId, retryBlocks);
+        } catch (retryError) {
+          runtime.turnStartWaiters.delete(threadId);
+          runtime.activeTurnBySession.delete(threadId);
+          throw retryError;
+        }
       }
 
       const turnId = await withTimeout(turnStarted, TURN_START_TIMEOUT_MS);
