@@ -138,6 +138,33 @@ const COMMAND_GROUPS = [
     ],
   },
   {
+    id: "channel",
+    label: "Send Source",
+    actions: [
+      {
+        action: "channel.weflow_source_bot",
+        summary: "Send through the big account (ClawBot) instead of the UIA bridge",
+        terminal: [],
+        weixin: ["/bot"],
+        status: "active",
+      },
+      {
+        action: "channel.weflow_source_azzy",
+        summary: "Send through the small account over the UIA bridge",
+        terminal: [],
+        weixin: ["/azzy"],
+        status: "active",
+      },
+      {
+        action: "channel.weflow_source_show",
+        summary: "Show which account is currently sending",
+        terminal: [],
+        weixin: ["/mode", "/状态"],
+        status: "active",
+      },
+    ],
+  },
+  {
     id: "approval",
     label: "Approvals & Control",
     actions: [
@@ -313,6 +340,7 @@ function groupEmoji(groupId) {
   switch (groupId) {
     case "lifecycle": return "🔄";
     case "workspace": return "📁";
+    case "channel": return "📡";
     case "approval": return "🔐";
     case "capabilities": return "⚡️";
     default: return "•";
@@ -329,6 +357,9 @@ function actionEmoji(action) {
     case "thread.switch": return "🔀";
     case "thread.stop": return "⏹️";
     case "system.checkin_range": return "⏰";
+    case "channel.weflow_source_bot": return "🅱️";
+    case "channel.weflow_source_azzy": return "🅰️";
+    case "channel.weflow_source_show": return "📡";
     case "approval.accept_once": return "✅";
     case "approval.accept_workspace": return "💡";
     case "approval.reject_once": return "❌";

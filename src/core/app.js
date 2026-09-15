@@ -3151,20 +3151,34 @@ class CyberbossApp {
         contextToken: normalized.contextToken,
         provider: normalized.provider,
       });
-      await this.runtimeAdapter.compactThread({
+      const compactResult = await this.runtimeAdapter.compactThread({
         threadId,
         workspaceRoot,
         model: sessionStore.getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model,
-      }).then((result) => {
-        const compactTurnId = normalizeCommandArgument(result?.turnId);
-        if (compactTurnId) {
-          this.pendingOperationByRunKey.set(buildRunKey(threadId, compactTurnId), {
-            kind: "compact",
-            userId: normalized.senderId,
-            contextToken: normalized.contextToken,
-          });
-        }
       });
+      const compactTurnId = normalizeCommandArgument(compactResult?.turnId);
+      if (compactTurnId) {
+        this.pendingOperationByRunKey.set(buildRunKey(threadId, compactTurnId), {
+          kind: "compact",
+          userId: normalized.senderId,
+          contextToken: normalized.contextToken,
+        });
+      }
+      // A runtime may answer "I cannot compact" instead of throwing. Reporting
+      // "request sent" for that would be a false success the user cannot detect,
+      // so surface the refusal with the runtime's own reason.
+      if (compactResult?.compacted === false) {
+        await this.channelAdapter.sendText({
+          userId: normalized.senderId,
+          text: [
+            "⚠️ 当前 runtime 不支持主动压缩上下文，未做任何改动",
+            `thread: ${threadId}`,
+            `reason: ${normalizeCommandArgument(compactResult.reason) || "unsupported"}`,
+          ].join("\n"),
+          contextToken: normalized.contextToken,
+        });
+        return;
+      }
       await this.channelAdapter.sendText({
         userId: normalized.senderId,
         text: `🗜️ Compact request sent\nthread: ${threadId}`,

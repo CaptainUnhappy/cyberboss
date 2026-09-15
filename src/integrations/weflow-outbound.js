@@ -530,6 +530,8 @@ function normalizeSha256(value) {
 }
 
 module.exports = {
+  CONTROL_COMMANDS,
+  CONTROL_CONFIRMATIONS,
   executeWeFlowControlCommand,
   formatWeFlowControlConfirmation,
   isWeFlowControlConfirmation,
