@@ -60,8 +60,17 @@ test("only the enabling modes reach the overlay", () => {
   );
   assert.match(source, /const approvalEnabled = approvalMode === "session" \|\| approvalMode === "never"/u);
   assert.match(source, /const approvalPatchPath = approvalEnabled \? resolveApprovalPatchPath\(\) : ""/u);
-  assert.match(source, /patchPaths: approvalPatchPath \? \[approvalPatchPath\] : \[\]/u,
-    "an empty mode must not hand the overlay to the child");
+  // The attachment-limits overlay is applied unconditionally, so the approval
+  // overlay can no longer be the whole patch list. What must hold is that an
+  // empty approval mode contributes nothing to it.
+  assert.match(
+    source,
+    /patchPaths: \[attachmentLimitsPatchPath, approvalPatchPath\]\.filter\(Boolean\)/u,
+    "an empty approval mode must not hand the approval overlay to the child, "
+    + "while the always-on attachment overlay must still be passed",
+  );
+  assert.match(source, /const attachmentLimitsPatchPath = resolveAttachmentLimitsPatchPath\(\)/u,
+    "the attachment overlay must be resolved unconditionally");
   assert.match(source, /CYBERBOSS_DSH_APPROVAL_ENDPOINT: approvalEndpoint\.endpoint/u);
   assert.match(source, /CYBERBOSS_DSH_APPROVAL_TOKEN: approvalEndpoint\.token/u);
 });

@@ -1,0 +1,32 @@
+# Attachment admission limits for the main DSH runtime.
+#
+# Always applied by the adapter (see src/adapters/runtime/dsh/index.js). The sdk
+# profile composes @deepseek-ai/dsh-attachment-local with no config, so it uses
+# the shipped defaults - and the default `maxImageDimension` of 8192 rejects a
+# whole class of ordinary images before the model ever sees them:
+#
+#   Image exceeds the configured per-side pixel limit.  (IMAGE_DIMENSION_TOO_LARGE)
+#
+# Observed in production: a 1260x8318 long screenshot from WeChat was refused for
+# exceeding a side limit by 126 pixels, while using only 10.5 MP of the 64 MP
+# pixel budget and 1.2 MB of the 20 MB byte budget. A per-side limit is the wrong
+# invariant for long screenshots, which are the common shape on a phone.
+#
+# So the side limit is raised out of the way and the pixel budget becomes the
+# real bound: `maxImagePixels` is deliberately left at its default (64 MP), which
+# is what actually protects memory. A 1080x30000 screenshot is 32 MP and is
+# accepted; anything past 64 MP is still refused.
+#
+# The normalized* fields are not touched: DSH still downscales to its own target
+# (4 MP / 8192 per side) before the model request, so this only widens admission,
+# it does not send larger images to the model.
+#
+# `--patch` merges by id and an id that does not exist is a silent no-op, so
+# test/dsh-attachment-limits.test.js asserts these values against --dump-config.
+- id: attachment-local
+  name: '@deepseek-ai/dsh-attachment-local'
+  config:
+    maxImageDimension: 32768
+    # Stated explicitly even though it matches the default, so the bound that is
+    # actually doing the work is visible in the composed config.
+    maxImagePixels: 67108864

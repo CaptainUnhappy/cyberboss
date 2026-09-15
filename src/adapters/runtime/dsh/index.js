@@ -94,6 +94,18 @@ function resolveApprovalPatchPath(dirname = __dirname) {
 }
 
 /**
+ * Path to the overlay that widens DSH's attachment admission limits.
+ *
+ * Applied unconditionally: the shipped default rejects any image with a side
+ * over 8192 px, which is an ordinary long screenshot. Same fatality rule as the
+ * approval overlay - a path that does not exist makes DSH exit 5 - so a test
+ * pins it against the repository.
+ */
+function resolveAttachmentLimitsPatchPath(dirname = __dirname) {
+  return path.resolve(dirname, "attachment-limits.patch.yml");
+}
+
+/**
  * Build the DSH `contentBlocks` for one turn.
  *
  * Accepts both shapes the app can hand over - an `absolutePath` reference (what
@@ -182,6 +194,9 @@ function createDshRuntimeAdapter(config = {}) {
   const approvalMode = normalizeText(config.dshApprovalMode).toLowerCase();
   const approvalEnabled = approvalMode === "session" || approvalMode === "never";
   const approvalPatchPath = approvalEnabled ? resolveApprovalPatchPath() : "";
+  // Always applied: the shipped 8192-per-side default refuses ordinary long
+  // screenshots before the model ever sees them.
+  const attachmentLimitsPatchPath = resolveAttachmentLimitsPatchPath();
   let approvalEndpoint = null;
   let approvalEndpointStarting = null;
 
@@ -286,7 +301,7 @@ function createDshRuntimeAdapter(config = {}) {
       logger: console,
       // The answerer overlay names its plugin by absolute path, and the endpoint
       // and bearer token are per-spawn, so both travel to the child here.
-      patchPaths: approvalPatchPath ? [approvalPatchPath] : [],
+      patchPaths: [attachmentLimitsPatchPath, approvalPatchPath].filter(Boolean),
       env: approvalEndpoint
         ? {
           CYBERBOSS_DSH_APPROVAL_ENDPOINT: approvalEndpoint.endpoint,
@@ -664,4 +679,5 @@ module.exports = {
   imageMimeForPath,
   buildDshContentBlocks,
   resolveApprovalPatchPath,
+  resolveAttachmentLimitsPatchPath,
 };
