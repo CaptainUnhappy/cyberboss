@@ -5,6 +5,12 @@ const { MODEL_CANARY_DELIVERY_POLICY } = require("../integrations/weflow-model-c
 
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
 const MAX_MEDIA_DELIVERY_ATTEMPTS = 2;
+// At most one 【进度】 message per turn per window. A multi-step turn can raise a
+// dozen tool events, and relaying each one would flood the chat.
+const TOOL_PROGRESS_THROTTLE_MS = 30_000;
+// Longest command fragment worth putting in a progress line before it stops
+// being a status and starts being a wall of text.
+const TOOL_PROGRESS_COMMAND_MAX = 80;
 
 class StreamDelivery {
   constructor({
@@ -138,6 +144,37 @@ class StreamDelivery {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
         this.attachReplyTarget(state);
+        return;
+      }
+      case "runtime.tool.started": {
+        const state = this.ensureRunState(threadId, turnId);
+        this.attachReplyTarget(state);
+        // Progress used to depend entirely on the model volunteering an interim
+        // text block. Codex did that; DSH's model goes straight from reasoning to
+        // a tool call, so nothing was ever rendered as 【进度】. Tool events are
+        // the one genuinely live signal, so progress is derived from them here.
+        //
+        // Throttled per run because a multi-step turn raises many of them; the
+        // first tool of a turn always reports, then at most one per window.
+        const nowMs = Date.now();
+        const lastProgressAtMs = Number(state.toolProgressAtMs) || 0;
+        if (nowMs - lastProgressAtMs < TOOL_PROGRESS_THROTTLE_MS) {
+          return;
+        }
+        const progressText = buildToolProgressText(event.payload);
+        if (!progressText) {
+          return;
+        }
+        state.toolProgressAtMs = nowMs;
+        this.upsertItem(state, {
+          itemId: `tool-progress-${normalizeText(event.payload.itemId) || state.itemOrder.length + 1}`,
+          text: progressText,
+          completed: true,
+          // Rendered as 【进度】 by the channel adapter. Progress never closes the
+          // reply obligation - the delivery path keys that off messageKind.
+          phase: "commentary",
+        });
+        await this.flush(state, { force: false });
         return;
       }
       case "runtime.reply.delta": {
@@ -1480,6 +1517,26 @@ function normalizeSystemActionName(value) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, "_");
+}
+
+/**
+ * Build the 【进度】 line for a tool call.
+ *
+ * Deliberately plain: the text is sanitized and markdown-stripped downstream,
+ * and a command that reads like a structured action payload would be routed to
+ * the action formatter instead of a progress message. Tool name plus a short
+ * command fragment is all a status line needs.
+ */
+function buildToolProgressText(payload) {
+  const toolType = normalizeText(payload?.toolType);
+  const command = normalizeText(payload?.command).replace(/\s+/gu, " ").slice(0, TOOL_PROGRESS_COMMAND_MAX);
+  if (!toolType && !command) {
+    return "";
+  }
+  if (!toolType) {
+    return `正在执行 ${command}`;
+  }
+  return command ? `正在执行 ${toolType}（${command}）` : `正在执行 ${toolType}`;
 }
 
 function normalizeMessagePhase(value) {
