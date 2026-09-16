@@ -1519,24 +1519,27 @@ function normalizeSystemActionName(value) {
     .replace(/\s+/g, "_");
 }
 
+// Tools that are quick read-only inspection rather than work worth narrating.
+// Announcing every `read` turned one question into four chat messages.
+const QUIET_TOOL_TYPES = new Set(["read", "grep", "glob", "list", "ls", "cat", "search_files", "view"]);
+
 /**
- * Build the 【进度】 line for a tool call.
+ * Build the 【进度】 line for a tool call, or "" when it should not be announced.
  *
- * Deliberately plain: the text is sanitized and markdown-stripped downstream,
- * and a command that reads like a structured action payload would be routed to
- * the action formatter instead of a progress message. Tool name plus a short
- * command fragment is all a status line needs.
+ * Deliberately plain: the text is sanitized and markdown-stripped downstream, and
+ * a command that reads like a structured action payload would be routed to the
+ * action formatter instead of a progress message.
  */
 function buildToolProgressText(payload) {
   const toolType = normalizeText(payload?.toolType);
-  const command = normalizeText(payload?.command).replace(/\s+/gu, " ").slice(0, TOOL_PROGRESS_COMMAND_MAX);
-  if (!toolType && !command) {
+  if (!toolType || QUIET_TOOL_TYPES.has(toolType.toLowerCase())) {
     return "";
   }
-  if (!toolType) {
-    return `正在执行 ${command}`;
-  }
-  return command ? `正在执行 ${toolType}（${command}）` : `正在执行 ${toolType}`;
+  const command = normalizeText(payload?.command).replace(/\s+/gu, " ").slice(0, TOOL_PROGRESS_COMMAND_MAX);
+  // Tool events often describe the call with the tool's own name, which produced
+  // status lines like "read（read）". Say it once.
+  const redundant = !command || command.toLowerCase() === toolType.toLowerCase();
+  return redundant ? `正在执行 ${toolType}` : `正在执行 ${toolType}（${command}）`;
 }
 
 function normalizeMessagePhase(value) {

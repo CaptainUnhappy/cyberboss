@@ -142,6 +142,44 @@ test("a tool event with nothing to describe reports nothing", async () => {
   assert.deepEqual(progressMessages(sent), []);
 });
 
+test("quick read-only inspection is not announced", async () => {
+  // Every `read` used to produce a message, which turned one question into four
+  // chat messages. These tools are steps, not progress worth reporting.
+  for (const toolType of ["read", "grep", "glob", "Read"]) {
+    const { sent, streamDelivery } = createHarness();
+    queueTarget(streamDelivery, `thread-quiet-${toolType}`);
+    const threadId = `thread-quiet-${toolType}`;
+    await startTurn(streamDelivery, threadId, "turn-q");
+    await toolStarted(streamDelivery, {
+      threadId, turnId: "turn-q", itemId: "call-1", toolType, command: toolType,
+    });
+    assert.deepEqual(progressMessages(sent), [], `${toolType} must stay quiet`);
+  }
+});
+
+test("a tool that describes itself by name is not repeated", async () => {
+  const { sent, streamDelivery } = createHarness();
+  queueTarget(streamDelivery, "thread-8");
+  await startTurn(streamDelivery, "thread-8", "turn-8");
+  await toolStarted(streamDelivery, {
+    threadId: "thread-8", turnId: "turn-8", itemId: "call-1", toolType: "web_search", command: "web_search",
+  });
+  const progress = progressMessages(sent);
+  assert.equal(progress.length, 1);
+  assert.equal(progress[0].text, "正在执行 web_search",
+    "the status line must not repeat the tool name in parentheses");
+});
+
+test("a tool with a distinct command keeps it as context", async () => {
+  const { sent, streamDelivery } = createHarness();
+  queueTarget(streamDelivery, "thread-9");
+  await startTurn(streamDelivery, "thread-9", "turn-9");
+  await toolStarted(streamDelivery, {
+    threadId: "thread-9", turnId: "turn-9", itemId: "call-1", toolType: "pwsh", command: "npm test",
+  });
+  assert.equal(progressMessages(sent)[0].text, "正在执行 pwsh（npm test）");
+});
+
 test("a silent delivery policy produces no progress at all", async () => {
   const { sent, streamDelivery } = createHarness();
   streamDelivery.queueReplyTargetForThread("thread-6", {
