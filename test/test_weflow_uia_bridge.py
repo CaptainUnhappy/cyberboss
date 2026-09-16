@@ -2404,5 +2404,92 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
         self.assertEqual(lifecycle, ["initialize", "uninitialize"])
 
 
+class ContactDisplayNameResolutionTests(unittest.TestCase):
+    """A remarked contact is named differently on Weixin's two UIA surfaces.
+
+    Verified against a live Weixin 4.x on 2026-09-16: the session row renders as
+    ``session_item_<displayName>`` (the remark whenever one is set) while the chat
+    editor carries ``<nickname>``.  A single caller-supplied string therefore
+    cannot satisfy both surfaces, which is what made remarked contacts
+    unreachable.
+    """
+
+    CONTACTS = [
+        {
+            "username": "wxid_remarked22",
+            "displayName": "备注名",
+            "remark": "备注名",
+            "nickname": ".",
+            "alias": "alias123",
+        },
+        {
+            "username": "wxid_plain22",
+            "displayName": "Azzy",
+            "nickname": "Azzy",
+            "alias": "Azsy20020407",
+        },
+    ]
+
+    def test_remarked_contact_splits_row_and_editor_names(self):
+        resolved = BRIDGE.resolve_contact_names("备注名", "wxid_remarked22", self.CONTACTS)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["rowName"], "备注名")
+        self.assertEqual(resolved["editorName"], ".")
+        self.assertEqual(resolved["accepted"][0], "备注名")
+        self.assertIn(".", resolved["accepted"])
+        self.assertIn("alias123", resolved["accepted"])
+
+    def test_nickname_request_still_resolves_to_the_row_display_name(self):
+        # .env holds the nickname for a remarked contact (INBOX_DISPLAY_NAME=yourself)
+        resolved = BRIDGE.resolve_contact_names(".", "wxid_remarked22", self.CONTACTS)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["rowName"], "备注名")
+        self.assertEqual(resolved["editorName"], ".")
+
+    def test_plain_contact_keeps_one_name_for_both_surfaces(self):
+        resolved = BRIDGE.resolve_contact_names("Azzy", "wxid_plain22", self.CONTACTS)
+        self.assertEqual(resolved["rowName"], "Azzy")
+        self.assertEqual(resolved["editorName"], "Azzy")
+
+    def test_unknown_talker_falls_back_to_a_name_lookup(self):
+        resolved = BRIDGE.resolve_contact_names("Azzy", "wxid_absent", self.CONTACTS)
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved["rowName"], "Azzy")
+
+    def test_unknown_contact_returns_none_so_callers_keep_old_behaviour(self):
+        self.assertIsNone(BRIDGE.resolve_contact_names("nobody", "wxid_absent", self.CONTACTS))
+
+    def test_editor_alias_is_only_accepted_inside_the_dispatch_scope(self):
+        contact = "备注名"
+        self.assertFalse(BRIDGE.chat_input_name_matches_contact(".", contact))
+        token = BRIDGE._TARGET_EDITOR_NAMES.set((".",))
+        try:
+            self.assertTrue(BRIDGE.chat_input_name_matches_contact(".", contact))
+            self.assertTrue(BRIDGE.chat_input_name_matches_contact("备注名", contact))
+            self.assertFalse(BRIDGE.chat_input_name_matches_contact("别的名字", contact))
+            self.assertFalse(BRIDGE.chat_input_name_matches_contact("", contact))
+        finally:
+            BRIDGE._TARGET_EDITOR_NAMES.reset(token)
+        self.assertFalse(BRIDGE.chat_input_name_matches_contact(".", contact))
+
+    def test_state_resolution_degrades_to_none_when_the_api_is_unreachable(self):
+        state = object.__new__(BRIDGE.BridgeState)
+        state.weflow_base_url = "http://127.0.0.1:1"
+        state.weflow_token = "token"
+        state._contacts_cache = None
+        self.assertIsNone(
+            state.resolve_target_names("Azzy", "wxid_s3178hwvzsl922", request_timeout=0.2)
+        )
+
+    def test_state_resolution_uses_the_cached_contact_table(self):
+        state = object.__new__(BRIDGE.BridgeState)
+        state.weflow_base_url = "http://127.0.0.1:1"
+        state.weflow_token = "token"
+        state._contacts_cache = (BRIDGE.time.monotonic(), self.CONTACTS)
+        resolved = state.resolve_target_names("Azzy", "wxid_plain22")
+        self.assertEqual(resolved["rowName"], "Azzy")
+        self.assertEqual(resolved["username"], "wxid_plain22")
+
+
 if __name__ == "__main__":
     unittest.main()

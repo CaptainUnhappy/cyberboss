@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import contextvars
 import ctypes
 from datetime import datetime, timezone
 import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -35,6 +37,8 @@ import uiautomation as automation
 import win32clipboard
 from PIL import Image, UnidentifiedImageError
 
+logger = logging.getLogger("cyberboss.weflow_uia_bridge")
+
 from weflow_window_selection import (
     is_wechat_main_window_identity,
     select_wechat_window_handle,
@@ -50,6 +54,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 MIN_CANARY_DESKTOP_IDLE_SECONDS = 300
+CONTACT_CACHE_TTL_SECONDS = 30.0
 MIN_SEARCH_SELECTION_CONFIRM_SECONDS = 2.0
 # How long to wait for two consecutive identical ordered-search snapshots before
 # deriving a Down count.  This only waits for Weixin's search popup to stop
@@ -332,21 +337,96 @@ def first_name_line(value: Any) -> str:
     return normalize_text(value).splitlines()[0].strip() if normalize_text(value) else ""
 
 
+WECHAT_CONTACT_NAME_KEYS = ("displayName", "remark", "nickname", "alias")
+
+# Names the chat editor (chat_input_field) may legitimately carry for the target
+# of the request currently being dispatched.  Weixin names the session row after
+# the contact's *display name* (the remark whenever one is set) but the editor
+# after the *nickname*, so a remarked contact can never satisfy a single-string
+# proof.  The dispatch fills this in per request; a ContextVar keeps it isolated
+# per request thread (ThreadingHTTPServer) without threading a second name
+# through every selector signature.
+_TARGET_EDITOR_NAMES: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "weflow_uia_target_editor_names",
+    default=(),
+)
+
+
 def chat_input_name_matches_contact(value: Any, contact: str) -> bool:
     """Match the exact chat identity encoded in Weixin's editor Name.
 
     Current Weixin builds append the fixed editor accessibility prompt directly
-    to the contact name without a separator. Keep this allowlist exact so a
-    contact-prefix collision cannot satisfy the target proof.
+    to the contact name without a separator.  The editor may carry either the
+    contact's display name or its nickname, so each accepted name is checked with
+    the same exact-equality proof - a contact-prefix collision still cannot
+    satisfy the target proof.  Keep this allowlist exact.
     """
     observed = first_name_line(value)
-    expected = first_name_line(contact)
-    if not expected:
+    if not observed:
         return False
-    return observed == expected or any(
-        observed == f"{expected}{suffix}"
-        for suffix in WECHAT_CHAT_INPUT_NAME_SUFFIXES
+    candidates: list[str] = []
+    for candidate in (first_name_line(contact), *_TARGET_EDITOR_NAMES.get()):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return any(
+        observed == candidate
+        or any(
+            observed == f"{candidate}{suffix}"
+            for suffix in WECHAT_CHAT_INPUT_NAME_SUFFIXES
+        )
+        for candidate in candidates
     )
+
+
+def resolve_contact_names(
+    contact: str,
+    talker: str,
+    contacts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve the per-surface names Weixin uses for one target contact.
+
+    Weixin's UIA exposes the session row and the search row as
+    ``session_item_<displayName>`` / ``search_item_<displayName>`` while the chat
+    editor carries ``<nickname>``, and ``displayName`` equals the remark whenever
+    one is set.  Matching one caller-supplied string against both surfaces can
+    therefore never succeed for a remarked contact.  Resolution is keyed on the
+    stable ``talker`` (wxid); it returns ``None`` when the contact is unknown so
+    every caller keeps its previous behaviour.
+    """
+    requested = first_name_line(contact)
+    normalized_talker = normalize_text(talker)
+    row: dict[str, Any] | None = None
+    for item in contacts:
+        if normalized_talker and normalize_text(item.get("username")) == normalized_talker:
+            row = item
+            break
+    if row is None and requested:
+        for item in contacts:
+            names = {first_name_line(item.get(key)) for key in WECHAT_CONTACT_NAME_KEYS}
+            if requested in names:
+                row = item
+                break
+    if row is None:
+        return None
+    accepted: list[str] = []
+    for key in WECHAT_CONTACT_NAME_KEYS:
+        value = first_name_line(row.get(key))
+        if value and value not in accepted:
+            accepted.append(value)
+    row_name = (
+        first_name_line(row.get("displayName"))
+        or requested
+        or first_name_line(row.get("nickname"))
+    )
+    editor_name = first_name_line(row.get("nickname")) or row_name
+    if not row_name or not accepted:
+        return None
+    return {
+        "rowName": row_name,
+        "editorName": editor_name,
+        "accepted": accepted,
+        "username": normalize_text(row.get("username")),
+    }
 
 
 def find_controls_by_automation_id(
@@ -1686,6 +1766,7 @@ class BridgeState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.weflow_base_url = args.weflow_base_url.rstrip("/")
         self.weflow_token = args.weflow_token
+        self._contacts_cache: tuple[float, list[dict[str, Any]]] | None = None
         self.state_file = Path(args.state_file)
         self.desktop_input_lease_dir = (
             self.state_file.parent / MODEL_CANARY_LEASE_DIRECTORY
@@ -2058,6 +2139,67 @@ class BridgeState:
                 encoding="utf-8",
             )
             temporary.replace(self.state_file)
+
+    def fetch_contacts(
+        self,
+        request_timeout: float = 3.0,
+    ) -> list[dict[str, Any]]:
+        """Read the contact table (cached briefly - remarks change rarely)."""
+        cached = self._contacts_cache
+        if cached is not None and (time.monotonic() - cached[0]) < CONTACT_CACHE_TTL_SECONDS:
+            return cached[1]
+        request = urllib.request.Request(
+            f"{self.weflow_base_url}/api/v1/contacts",
+            headers={"Authorization": f"Bearer {self.weflow_token}"},
+        )
+        with urllib.request.urlopen(request, timeout=max(0.5, request_timeout)) as response:
+            payload = json.load(response)
+        if isinstance(payload, dict):
+            raw = payload.get("contacts")
+        elif isinstance(payload, list):
+            raw = payload
+        else:
+            raw = None
+        if not isinstance(raw, list):
+            raise ValueError("weflow contacts payload did not contain a contact list")
+        contacts = [item for item in raw if isinstance(item, dict)]
+        self._contacts_cache = (time.monotonic(), contacts)
+        return contacts
+
+    def resolve_target_names(
+        self,
+        contact: str,
+        talker: str,
+        request_timeout: float = 3.0,
+    ) -> dict[str, Any] | None:
+        """Resolve the talker's row/editor names, or None when unresolvable.
+
+        Any failure (network, payload shape, unknown contact) returns None so the
+        caller keeps its previous single-name behaviour instead of degrading.
+        """
+        try:
+            contacts = self.fetch_contacts(request_timeout=request_timeout)
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError) as error:
+            logger.warning("contact resolution skipped: %s", error)
+            return None
+        resolved = resolve_contact_names(contact, talker, contacts)
+        if resolved is None:
+            logger.warning(
+                "contact resolution found no row: requested=%r talker=%r",
+                contact,
+                talker,
+            )
+            return None
+        if resolved["rowName"] != first_name_line(contact) or resolved["editorName"] != first_name_line(contact):
+            logger.info(
+                "contact names resolved: requested=%r talker=%r row=%r editor=%r accepted=%r",
+                contact,
+                talker,
+                resolved["rowName"],
+                resolved["editorName"],
+                resolved["accepted"],
+            )
+        return resolved
 
     def fetch_messages(
         self,
@@ -2749,6 +2891,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     )
                 if not contact or not talker or not text.strip():
                     raise ValueError("contact, talker, and text are required")
+                resolved = self.state.resolve_target_names(contact, talker)
+                editor_names: tuple[str, ...] = ()
+                if resolved is not None:
+                    accepted = resolved["accepted"]
+                    if exact_contact:
+                        # The caller asserts who it believes it is messaging.  With a
+                        # remark set, that assertion may be written in either the
+                        # remark or the nickname, so accept any name the contact
+                        # table lists for this exact talker - and nothing else.
+                        for requested_name, label in (
+                            (contact, "contact"),
+                            (expected_contact, "expectedContact"),
+                        ):
+                            if requested_name not in accepted:
+                                raise TargetNotConfirmedError(
+                                    f"{label} {requested_name!r} is not a name of talker "
+                                    f"{talker!r}: {accepted!r}"
+                                )
+                    # Weixin's session row/search row use the display name (the
+                    # remark when set) while the chat editor carries the nickname.
+                    contact = resolved["rowName"]
+                    expected_contact = resolved["rowName"]
+                    editor_names = tuple(
+                        name
+                        for name in (resolved["editorName"],)
+                        if name and name != contact
+                    )
                 dispatch_kwargs: dict[str, Any] = {
                     "require_desktop_idle_seconds": desktop_idle_requirement,
                     "exact_contact": exact_contact,
@@ -2759,13 +2928,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     dispatch_kwargs["desktop_input_lease_request"] = desktop_input_lease_request
                 if desktop_input_lease is not None:
                     dispatch_kwargs["desktop_input_lease"] = desktop_input_lease
-                self.send_json(200, self.state.dispatch_and_verify(
-                    contact,
-                    talker,
-                    text,
-                    timeout,
-                    **dispatch_kwargs,
-                ))
+                editor_token = _TARGET_EDITOR_NAMES.set(editor_names)
+                try:
+                    self.send_json(200, self.state.dispatch_and_verify(
+                        contact,
+                        talker,
+                        text,
+                        timeout,
+                        **dispatch_kwargs,
+                    ))
+                finally:
+                    _TARGET_EDITOR_NAMES.reset(editor_token)
                 return
             if path == "/api/send-image":
                 contact = normalize_text(payload.get("contact"))
@@ -2775,13 +2948,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 timeout = float(payload.get("timeout", 30))
                 if not contact or not talker or not file_path or not expected_sha256:
                     raise ValueError("contact, talker, filePath, and sha256 are required")
-                self.send_json(200, self.state.dispatch_image_and_verify(
-                    contact,
-                    talker,
-                    file_path,
-                    expected_sha256,
-                    timeout,
-                ))
+                resolved = self.state.resolve_target_names(contact, talker)
+                editor_names: tuple[str, ...] = ()
+                if resolved is not None:
+                    contact = resolved["rowName"]
+                    editor_names = tuple(
+                        name
+                        for name in (resolved["editorName"],)
+                        if name and name != contact
+                    )
+                editor_token = _TARGET_EDITOR_NAMES.set(editor_names)
+                try:
+                    self.send_json(200, self.state.dispatch_image_and_verify(
+                        contact,
+                        talker,
+                        file_path,
+                        expected_sha256,
+                        timeout,
+                    ))
+                finally:
+                    _TARGET_EDITOR_NAMES.reset(editor_token)
                 return
             if path == "/api/command":
                 command = normalize_text(payload.get("command")).lower()
