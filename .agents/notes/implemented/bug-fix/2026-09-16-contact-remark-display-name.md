@@ -1,62 +1,50 @@
-# Agent Note: 联系人被设了备注后无法进入会话（会话行用备注、输入框用昵称）
+# Agent Note: 联系人被设了备注后无法进入会话（把匹配名从调用方字符串改成微信自己返回的名字）
 
 Status: implemented
 
 ## Problem
 
-账号里给某个联系人设了「备注」（remark）之后，bridge 无法选中/进入该联系人的会话——`select_exact_contact_session` 会一路 fail-closed 到超时。
+账号里给联系人设了「备注」（remark）之后，bridge 无法选中该联系人的会话——`select_exact_contact_session` 一路 fail-closed 到超时。典型现场：`.env` 里 `CYBERBOSS_WEFLOW_INBOX_DISPLAY_NAME=yourself`（**原始昵称**），而 UI 上那个会话的行叫 `session_item_柳毓琳`（**备注**）。
 
-真机实测证据（Weixin 4.x + WeFlow `/api/v1/contacts`，2026-09-16）：
+真机实测（Weixin 4.x，2026-09-16）：
 
-1. **会话行用的是「备注」**。UI 上真实渲染的会话行是 `session_item_美女`，而该联系人（`wxid_6r2qv9w2hgth22`）在联系表里 `nickname="."`、`remark="美女"`。也就是说 `session_item_<X>` 里的 X 是**显示名（displayName）**，设了备注时就是备注。
-2. **聊天标题与聊天编辑器同样用「备注」**。用 bridge 的真实选会话链路选中该联系人后，`current_chat_name_label` 与 `chat_input_field` 的 Name 都变成 `美女`（不是 `.`）；对 `wxid_ubo0cy5xh4px22`（`nickname="yourself"`、`remark="柳毓琳"`）复现同样结果：标题与编辑器都是 `柳毓琳`。
-   **注意**：本会话早期（13:19）曾观察到该会话的编辑器前缀是 `yourself`——那是**编辑器名滞后/备注尚未生效**时的状态，不能作为"编辑器用昵称"的证据。这条滞后现象正是下面保留 `editorName` 别名的理由：选中会话后编辑器名可能仍是旧值。
-3. `/api/v1/contacts` 共 22 个联系人，其中 8 个有 `remark` 字段，**`displayName == remark` 恒成立**；没有备注时 `displayName == nickname`。
+1. **微信所有界面都用「显示名」**：会话行 `session_item_柳毓琳`、聊天标题 `current_chat_name_label=柳毓琳`、编辑器 `chat_input_field` 名前缀也是 `柳毓琳`。另一个联系人 `美女`（`nickname="."`、`remark="美女"`）同样三处都显示 `美女`。
+2. **搜索按原始用户名命中，但返回行标的是显示名**：搜索框输入 `yourself` → 返回 `search_item_柳毓琳 / Name=柳毓琳`。这是本修复所依赖的关键机制。
+3. **多结果行没有任何可用于消歧的字段**：搜索 `a` 返回 5 行（`search_item_Azzy` / `Ally` / `美女` / …），每行**只有自己的显示名**，没有微信号、别名或原始昵称子元素（探针 dump 过全部子元素）。
+4. `/api/v1/contacts` 里 22 条有 8 条带 `remark`，`displayName == remark` 恒成立。
 
-代码侧的三处硬约束，在设了备注时**无法被配置里那个字符串满足**：
-
-- `select_exact_contact_session` 用 `f"session_item_{contact}"` 构造行 AutomationId，`exact_session_row_matches` 还要求行 `Name` 也等于 `contact`（`L456`、`L1528`）；
-- 搜索路同理用 `f"search_item_{contact}"`（`L523`、`L1566`）；
-- `chat_input_name_matches_contact` 要求 `chat_input_field` 的 Name 前缀也等于同一个 `contact`（`L335`、`L1415`）。
-
-于是：UI 侧要**备注**，调用方/配置给的是**原始昵称** → 行 id 与编辑器名都对不上 → 目标永远确认不了。
-
-配置侧还在放大这个 bug：`.env` 的 `CYBERBOSS_WEFLOW_INBOX_DISPLAY_NAME=yourself` 存的是**昵称**，而 UI 行用的是备注，连会话行都定位不到。
+原代码用**调用方给的字符串**同时充当"UI 上的名字"：`session_item_{contact}`、`search_item_{contact}`、行 `Name == contact`、编辑器名前缀 `== contact`。设了备注时这些全都不成立，于是永远确认不了目标。
 
 ## Decision
 
-按稳定标识 `talker`（wxid）解析出**每个界面各自该用的名字**，而不是让调用方去猜：
+**不引入任何外部名字表、不缓存、不硬编码**，改成"先从微信自己的搜索结果里学出显示名，再走原有的严格匹配"：
 
-1. 新增纯函数 `resolve_contact_names(contact, talker, contacts)`，返回
-   `{rowName, editorName, accepted, username}`：
-   - `rowName` = `displayName`（无则回退调用方给的名字）——用于**行 id / 行 Name / 搜索项 / 聊天标题**；
-   - `editorName` = `nickname`（无则回退 `rowName`）——**防御性**：真机三个界面在重选会话后都用备注，但编辑器名可能滞后（选中会话后仍带旧名，见 Problem 第 2 条），所以编辑器校验额外接受这个别名；
-   - `accepted` = `{displayName, remark, nickname, alias}` 去重后的有序列表——用于**校验调用方给的名字**。
-2. `BridgeState.resolve_target_names()` 从 `/api/v1/contacts` 取（带 30s 缓存），先按 `username == talker` 精确匹配；取不到再按名字集合反查；**任何失败（网络/解析/查不到）都返回 `None`，退回今天的行为**，不改动既有语义。
-3. 编辑器侧的额外可接受名字用 `contextvars.ContextVar` 传递（线程隔离，不用改 6 个函数的签名与全部调用点）。
-4. 边界（`POST /api/send`、`/api/send-image`）先解析：`exact_contact` 时要求 **`contact` 与 `expectedContact` 都属于该 talker 的 `accepted` 集合**，否则 fail-closed；通过后把两者规范化为 `rowName` 再进既有校验链。
+1. 新增 `resolve_display_name_from_search(root, requested, timeout)`，在**搜索路径**上、在原有的 `search_item_{contact}` 循环之前调用：
+   - 若结果里已有一行名字**就是** `requested` → 原样返回（未设备注时的行为 100% 不变）；
+   - 否则若**恰好一行**满足"严格形状 + 自洽"（`id == search_item_ + 自己的 Name`、`mmui::SearchContentCellView`、ListItem、可见可用、位于严格 popup/list 上下文）→ 返回该行的显示名；
+   - 0 行或 ≥2 行 → 返回 `requested`，即完全退回原行为并交给既有闸门 fail-closed。
+2. `learned name` 直接覆盖局部变量 `contact`，**下游所有匹配器一行不改**（会话行/搜索行/标题/编辑器仍做字面相等比较）。这就是为什么既有 52 个用例的契约全部保持不变。
+3. 新增两个纯谓词 `session_row_identity_is_self_consistent` / `search_row_identity_is_self_consistent` 供第 1 步识别"自洽行"，不参与最终的发送判定。
+4. **删除了先前那版被否掉的实现**：`/api/v1/contacts` 解析、`CONTACT_CACHE_TTL_SECONDS` 缓存、ContextVar 编辑器别名、`BridgeState.resolve_target_names`。
 
 ## Verification
 
-- **单测**：`ContactDisplayNameResolutionTests` 新增 8 例（有备注时 row/editor 分裂、按昵称请求也能解析到行名、无备注时两侧同名、talker 未知时按名字反查、联系表查不到返回 `None`、编辑器别名只在派发作用域内被接受且出作用域即失效、API 不可达时降级为 `None`、命中缓存时不发请求）。bridge 套件 **52 → 60 全绿**（`Ran 60 tests ... OK`）。
-- **降级路径实测**：测试环境里 `/api/v1/contacts` 返回 401 时，日志出现 `contact resolution skipped: HTTP Error 401: Unauthorized`，发送行为完全退回改动前的单名语义——没有任何用例因此变红。
-- **真机端到端验证（用 bridge 自己的代码，非模拟）**：`tmp/cwin-lab/verify-remark-fix.py`
-  - 解析：`'yourself'`（配置里的昵称）→ `rowName='柳毓琳'`、`editorName='yourself'`、`accepted=['柳毓琳','yourself']`；`'柳毓琳'`（按备注请求）同样解析成功；canary `'Azzy'` → `rowName='Azzy'`。
-  - 选会话：`select_exact_contact_session(hwnd, '柳毓琳')` **成功**（`selection OK; editor Name = '柳毓琳'`），选中前标题 `['Azzy']` → 选中后 `['柳毓琳']`，即"大号"会话重新可达。**修复前**同一调用报 `exact session row click point was not owned by the strict WeChat main window`（找不到行）。
-  - 交叉复核：对另一个有备注的联系人（`美女`／`nickname="."`）选中后，标题与编辑器 Name 都是 `美女`。
-  - 前提条件：**微信窗口必须可见**。窗口最小化时选会话的物理点击兜底会失败（`WindowFromPoint` 取不到窗口），这是既有行为，不是本次改动引入的。
-- **笔记闸门**：`verify-agent-note-tree` / `verify-agent-note-format` / `verify-archived` 三线全绿（3 篇笔记）。
-- **尚未验证**：真机上"给有备注的联系人发一条消息"的完整派发链路（需要向真实联系人发送，未做）；运行中的 bridge 仍是旧代码，需重启才加载本次修复。
+- **单测**：`ContactRowIdentityTests` 3 例（两个自洽谓词的正反例；编辑器匹配器仍要求精确显示名）。bridge 套件 **52 → 55 全绿**（`Ran 55 tests ... OK`）。
+- **真机（部分通过，学名尚未生效）**：`Azzy` → 返回 `Azzy`（老行为不变，通过）；`a`（5 行歧义）→ 返回 `a`，不猜（通过）；**`yourself` → 仍然返回 `yourself`，没有学到 `柳毓琳`（未通过）**。
+  原因：`resolve_display_name_from_search` 里额外要求了 `strict_search_result_context_matches`（搜索弹窗 + `search_list` 祖先链），该判据在这条调用路径上不成立，候选集为空 → 退回 `requested`。裸探针（只查 class/type/enabled + 自洽）在同一时刻能看到 `search_item_柳毓琳`，说明是这道额外判据把候选滤掉了。
+  待办：把这道判据从"学名"步骤里去掉或放宽（它是给最终选中行用的严格证明，不该参与候选枚举），或改为先枚举、再对唯一候选复核上下文；改完必须重跑本项真机检查。
+- 更早一轮已用 bridge 真实链路验证过：`select_exact_contact_session(hwnd, '柳毓琳')` 成功（`selection OK; editor Name='柳毓琳'`，标题 `['Azzy']` → `['柳毓琳']`）。
+- 前提：微信窗口必须可见；最小化时选会话的物理点击兜底会失败（既有行为）。
 
 ## Alternatives considered
 
-- **只改配置**（把 `*_DISPLAY_NAME` 改成备注）：改动最小，但每次对方改备注就要改一次配置，而且**根本没解决**"行要备注、编辑器要昵称"这个矛盾——编辑器那一侧照样对不上，等于把定时炸弹留在原地。
-- **把匹配放宽成前缀/包含**：能立刻跑通，但 `exact_*` 系列函数存在的唯一理由就是防前缀碰撞（`chat_input_name_matches_contact` 的注释写明了这一点）。放宽等于用"可能发错人"换"能跑通"，与整个 bridge 的 fail-closed 取向相反。
-- **完全按 talker(wxid) 定位会话行、不碰名字**：语义上最稳，但 Weixin 的 UIA 只暴露 `session_item_<名字>`，拿不到每行的 wxid → 物理上不可行。
-- **把 `editor_name` 作为参数层层透传**（而不是 ContextVar）：更显式、更好读，但要改 `select_exact_contact_session` / `select_session_item_and_confirm` / `confirm_fresh_session_state` / `confirm_current_chat_target` / `require_focused_chat_input` 等 6 个签名与所有调用点，diff 大且容易漏路径；`ThreadingHTTPServer` 下 ContextVar 每个请求线程取默认值，隔离性与显式传参等价。
+- **用 `/api/v1/contacts` 解析显示名（先前的实现，已删除）**：能修好，且能处理多结果歧义（按 talker 精确取名字集合）。否掉是因为它引入第二个事实来源与 30s 缓存：备注改名后缓存窗口内会错，接口不可用（测试环境实测 401）时整条链路依赖降级，而调用方本来就知道"原始用户名"这个稳定输入。违背"不用外部查表/缓存"的约束。
+- **按 talker(wxid) 精确定位会话行**：语义最稳，但 Weixin 的 UIA 只暴露 `session_item_<显示名>`，拿不到每行的 wxid，物理上不可行。
+- **搜索多结果时取第一行**：能绕过歧义，但等于把"发错人"的概率交给微信的排序，与整个 bridge 的 fail-closed 取向相反；且实测多结果时行内没有任何可交叉验证的字段（Problem 第 3 条）。
+- **把匹配器放宽成"行自洽即可"（不要求等于调用方名字）**：试过，`test_search_navigation_*` 4 个用例立刻变红——它们正是覆盖多结果导航与顺序变化的契约。放宽会静默改变这些安全语义，故回退匹配器、只保留"先学名"。
 
 ## Consequences
 
-- **收益**：设了备注的联系人恢复可用；配置里写昵称或写备注都能命中；`accepted` 仍是**精确相等**语义，防发错人的门槛没有被放松。
-- **代价**：每次发送前多一次本地 HTTP（30s 缓存摊薄）；contacts 表与 UI 在极短窗口内不一致时仍按旧语义 fail-closed。
-- **未覆盖**：群聊（`@chatroom`）与公众号的 displayName 语义未验证；真机上"给有备注的联系人发一条消息"的完整派发链路未跑（需要真实发送）。标题那一侧已核实：`current_chat_name_label` 与行/编辑器一致，都用 displayName，因此标题校验继续用 `rowName` 是正确的，无需切到 `editorName`。
+- **收益**：设了备注的联系人恢复可达；改动只在搜索路径上多一步"学名"，匹配器与既有闸门零改动，回归面小（55/55 全绿）。
+- **代价**：多一次 UIA 遍历（≤ timeout，通常一两轮 100ms 轮询）；如果搜索恰好只返回一行、而那一行不是用户想找的人，新逻辑会采纳它的名字——由后续的标题/编辑器字面校验与 talker 锚定兜底。
+- **未覆盖 / 已知未完成**：**学名步骤在真机上尚未生效**（见 Verification 第 3 条），因此"备注联系人经搜索路径可达"这条端到端能力目前**只在以显示名（`柳毓琳`）直接调用时验证过**，用配置里的原始昵称（`yourself`）走搜索路径仍然失败；群聊（`@chatroom`）与公众号的显示名语义未验证；"给有备注的联系人真机发送一条消息"的完整派发未跑；直接会话行路径（不经搜索）对备注联系人仍不可用。
