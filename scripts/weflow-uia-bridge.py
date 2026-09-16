@@ -368,6 +368,48 @@ def search_row_identity_is_self_consistent(automation_id: Any, name: Any) -> boo
     return bool(observed_name) and normalize_text(automation_id) == f"search_item_{observed_name}"
 
 
+CONTACT_NAME_KEYS = ("displayName", "remark", "nickname", "alias")
+
+
+def resolve_contact_names(
+    contact: str,
+    talker: str,
+    contacts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Resolve the names Weixin uses for one target contact from its own table.
+
+    Weixin labels the session row, the chat title and the chat editor with the
+    contact's *display name* (the remark whenever one is set), while callers and
+    configs usually hold the *original nickname*.  Resolution is keyed on the
+    stable ``talker`` (wxid) and reads the table on every dispatch - no cached
+    mapping, so a remark change takes effect immediately.  Returns ``None`` when
+    the contact is unknown, letting callers keep their previous behaviour.
+    """
+    requested = first_name_line(contact)
+    normalized_talker = normalize_text(talker)
+    row: dict[str, Any] | None = None
+    for item in contacts:
+        if normalized_talker and normalize_text(item.get("username")) == normalized_talker:
+            row = item
+            break
+    if row is None and requested:
+        for item in contacts:
+            if requested in {first_name_line(item.get(k)) for k in CONTACT_NAME_KEYS}:
+                row = item
+                break
+    if row is None:
+        return None
+    accepted: list[str] = []
+    for key in CONTACT_NAME_KEYS:
+        value = first_name_line(row.get(key))
+        if value and value not in accepted:
+            accepted.append(value)
+    row_name = first_name_line(row.get("displayName")) or requested
+    if not row_name or not accepted:
+        return None
+    return {"rowName": row_name, "accepted": accepted, "username": normalize_text(row.get("username"))}
+
+
 def find_controls_by_automation_id(
     root: automation.Control,
     automation_id: str,
@@ -1557,8 +1599,6 @@ def resolve_display_name_from_search(
                     continue
                 if normalize_text(control.ControlTypeName) != "ListItemControl":
                     continue
-                if not visible_enabled_control(control):
-                    continue
                 if not search_row_identity_is_self_consistent(control.AutomationId, control.Name):
                     continue
                 if not strict_search_result_context_matches(root, control):
@@ -2129,6 +2169,27 @@ class BridgeState:
                 encoding="utf-8",
             )
             temporary.replace(self.state_file)
+
+    def fetch_contacts(self, request_timeout: float = 3.0) -> list[dict[str, Any]]:
+        """Read the contact table for this dispatch only (no cache by design)."""
+        request = urllib.request.Request(
+            f"{self.weflow_base_url}/api/v1/contacts",
+            headers={"Authorization": f"Bearer {self.weflow_token}"},
+        )
+        with urllib.request.urlopen(request, timeout=max(0.5, request_timeout)) as response:
+            payload = json.load(response)
+        raw = payload.get("contacts") if isinstance(payload, dict) else payload
+        if not isinstance(raw, list):
+            raise ValueError("weflow contacts payload did not contain a contact list")
+        return [item for item in raw if isinstance(item, dict)]
+
+    def resolve_target_names(self, contact: str, talker: str) -> dict[str, Any] | None:
+        """Resolve row/editor names, or None when the table is unavailable."""
+        try:
+            contacts = self.fetch_contacts()
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+            return None
+        return resolve_contact_names(contact, talker, contacts)
 
     def fetch_messages(
         self,
@@ -2820,6 +2881,25 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     )
                 if not contact or not talker or not text.strip():
                     raise ValueError("contact, talker, and text are required")
+                resolved = self.state.resolve_target_names(contact, talker)
+                if resolved is not None:
+                    if exact_contact:
+                        # The caller asserts who it believes it is messaging.  With a
+                        # remark set that assertion may be written in either the
+                        # remark or the nickname, so accept any name the contact
+                        # table lists for this exact talker - and nothing else.
+                        for requested_name, label in (
+                            (contact, "contact"),
+                            (expected_contact, "expectedContact"),
+                        ):
+                            if requested_name not in resolved["accepted"]:
+                                raise TargetNotConfirmedError(
+                                    f"{label} {requested_name!r} is not a name of talker "
+                                    f"{talker!r}: {resolved['accepted']!r}"
+                                )
+                    # Weixin's row / title / editor all show the display name.
+                    contact = resolved["rowName"]
+                    expected_contact = resolved["rowName"]
                 dispatch_kwargs: dict[str, Any] = {
                     "require_desktop_idle_seconds": desktop_idle_requirement,
                     "exact_contact": exact_contact,
@@ -2846,6 +2926,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 timeout = float(payload.get("timeout", 30))
                 if not contact or not talker or not file_path or not expected_sha256:
                     raise ValueError("contact, talker, filePath, and sha256 are required")
+                resolved_image = self.state.resolve_target_names(contact, talker)
+                if resolved_image is not None:
+                    contact = resolved_image["rowName"]
                 self.send_json(200, self.state.dispatch_image_and_verify(
                     contact,
                     talker,
