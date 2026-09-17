@@ -1,0 +1,6 @@
+{
+  "name": "write-notes-like-deepseek-scripts",
+  "private": true,
+  "type": "module",
+  "description": "本地类型声明：让 .agents/skills/write-notes-like-deepseek/scripts/*.ts 以 ESM 解释。宿主仓库根 package.json 是 type=commonjs，不加这一层脚本会被当作 CJS 解析而报 “Cannot use import statement outside a module”。"
+}
