@@ -45,6 +45,13 @@ async function startTurn(streamDelivery, threadId, turnId) {
     type: "runtime.turn.started",
     payload: { threadId, turnId },
   });
+  // The operator's rule puts a 30s quiet window right after 处理中. Most cases here
+  // are about the cadence *after* that window, so the harness starts the turn
+  // "30 seconds ago"; the quiet window itself has its own test below.
+  const state = streamDelivery.stateByRunKey?.get(`${threadId}:${turnId}`);
+  if (state) {
+    state.turnStartedAtMs = Date.now() - 30_000;
+  }
 }
 
 async function toolStarted(streamDelivery, { threadId, turnId, itemId, toolType, command }) {
@@ -58,8 +65,22 @@ function progressMessages(sent) {
   return sent.filter((entry) => entry.messageKind === "progress");
 }
 
-test("a tool call reports progress even when the model wrote no interim text", async () => {
+test("no progress inside the first 30 seconds after 处理中", async () => {
   const { sent, streamDelivery } = createHarness();
+  const threadId = "thread-quiet";
+  const turnId = "turn-quiet";
+  queueTarget(streamDelivery, threadId);
+  await streamDelivery.handleRuntimeEvent({ type: "runtime.turn.started", payload: { threadId, turnId } });
+
+  await toolStarted(streamDelivery, { threadId, turnId, itemId: "call-1", toolType: "pwsh", command: "echo hi" });
+  assert.deepEqual(progressMessages(sent), [], "处理中 must stand alone for 30 seconds");
+
+  streamDelivery.stateByRunKey.get(`${threadId}:${turnId}`).turnStartedAtMs = Date.now() - 30_001;
+  await toolStarted(streamDelivery, { threadId, turnId, itemId: "call-2", toolType: "pwsh", command: "echo hi" });
+  assert.equal(progressMessages(sent).length, 1, "progress resumes once the quiet window has passed");
+});
+
+test("a tool call reports progress even when the model wrote no interim text", async () => {  const { sent, streamDelivery } = createHarness();
   queueTarget(streamDelivery, "thread-1");
   await startTurn(streamDelivery, "thread-1", "turn-1");
 

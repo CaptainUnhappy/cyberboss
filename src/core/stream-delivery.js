@@ -8,6 +8,14 @@ const MAX_MEDIA_DELIVERY_ATTEMPTS = 2;
 // At most one 【进度】 message per turn per window. A multi-step turn can raise a
 // dozen tool events, and relaying each one would flood the chat.
 const TOOL_PROGRESS_THROTTLE_MS = 30_000;
+/**
+ * Quiet window between the inbound acknowledgement (处理中) and the first 进度.
+ *
+ * A tool call usually starts within seconds, so without this the very first
+ * 【进度】 lands right on top of 处理中 and the chat reads as noise. The operator's
+ * rule: nothing for 30 seconds, then at most one every 30 seconds.
+ */
+const TURN_PROGRESS_QUIET_MS = 30_000;
 // Longest command fragment worth putting in a progress line before it stops
 // being a status and starts being a wall of text.
 const TOOL_PROGRESS_COMMAND_MAX = 80;
@@ -143,6 +151,9 @@ class StreamDelivery {
       case "runtime.turn.started": {
         const state = this.ensureRunState(threadId, turnId);
         state.turnId = turnId || state.turnId;
+        // The 处理中 acknowledgement goes out just before the runtime handoff, so
+        // the turn start is the anchor for the progress quiet window.
+        state.turnStartedAtMs = Number(state.turnStartedAtMs) || Date.now();
         this.attachReplyTarget(state);
         return;
       }
@@ -154,9 +165,13 @@ class StreamDelivery {
         // a tool call, so nothing was ever rendered as 【进度】. Tool events are
         // the one genuinely live signal, so progress is derived from them here.
         //
-        // Throttled per run because a multi-step turn raises many of them; the
-        // first tool of a turn always reports, then at most one per window.
+        // Two bounds, both from the operator's rule: nothing inside the first 30
+        // seconds after 处理中, then at most one every 30 seconds.
         const nowMs = Date.now();
+        const turnStartedAtMs = Number(state.turnStartedAtMs) || 0;
+        if (turnStartedAtMs && nowMs - turnStartedAtMs < TURN_PROGRESS_QUIET_MS) {
+          return;
+        }
         const lastProgressAtMs = Number(state.toolProgressAtMs) || 0;
         if (nowMs - lastProgressAtMs < TOOL_PROGRESS_THROTTLE_MS) {
           return;
