@@ -688,9 +688,7 @@ class StreamDelivery {
     if (delivery.messageKind) {
       payload.messageKind = delivery.messageKind;
     }
-    if (state.replyTarget.provider === "weflow-uia") {
-      payload.provider = "weflow-uia";
-    }
+    applyWeFlowReplyRoute(payload, state.replyTarget);
     if (prependDeferredPrefix) {
       payload.preserveBlock = true;
     }
@@ -776,9 +774,7 @@ class StreamDelivery {
       text,
       contextToken: initialTarget.contextToken,
     };
-    if (initialTarget.provider === "weflow-uia") {
-      payload.provider = "weflow-uia";
-    }
+    applyWeFlowReplyRoute(payload, initialTarget);
     await this.sendTextWithRetry(state, payload, { kind: "system_reply" });
   }
 
@@ -846,9 +842,7 @@ class StreamDelivery {
       text: "❌ 图片已经生成，但发送到微信失败；原图已保留，可稍后补发。",
       contextToken: target.contextToken,
     };
-    if (target.provider === "weflow-uia") {
-      payload.provider = "weflow-uia";
-    }
+    applyWeFlowReplyRoute(payload, target);
     await this.channelAdapter.sendText(payload);
   }
 
@@ -870,6 +864,7 @@ class StreamDelivery {
     if (payload.idempotencyKey) {
       retryPayload.idempotencyKey = payload.idempotencyKey;
     }
+    applyWeFlowReplyRoute(retryPayload, payload);
     return retryPayload;
   }
 
@@ -1228,6 +1223,22 @@ function normalizePositiveIntegerText(value) {
   } catch {
     return "";
   }
+}
+
+function applyWeFlowReplyRoute(payload, target) {
+  if (normalizeText(target?.provider) === "weflow-uia") {
+    payload.provider = "weflow-uia";
+  }
+  for (const key of ["weflowContact", "weflowTalker"]) {
+    const value = normalizeText(target?.[key]);
+    if (value) {
+      payload[key] = value;
+    }
+  }
+  if (target?.weflowExactContact === true) {
+    payload.weflowExactContact = true;
+  }
+  return payload;
 }
 
 function normalizeReplyTarget(target) {

@@ -237,11 +237,45 @@ class WeFlowInboxSource {
     }
   }
 
+  inboundChatScope() {
+    const configured = Array.isArray(this.config.weflowInboxChats) && this.config.weflowInboxChats.length
+      ? this.config.weflowInboxChats
+      : [this.config.weflowInboxChat];
+    const scope = [];
+    for (const item of configured) {
+      const chat = normalizeText(item);
+      if (chat && !scope.includes(chat)) {
+        scope.push(chat);
+      }
+    }
+    return scope;
+  }
+
   async pollOutgoingMessagesOnce({ signal } = {}) {
-    const chat = normalizeText(this.config.weflowInboxChat);
-    if (!chat) {
+    const scope = this.inboundChatScope();
+    if (!scope.length) {
       return { status: "disabled", fetched: 0, queued: 0, processed: 0 };
     }
+    let aggregate = null;
+    for (const chat of scope) {
+      const result = await this.pollOutgoingMessagesOnceForChat(chat, { signal });
+      if (!aggregate) {
+        aggregate = result;
+        continue;
+      }
+      aggregate = {
+        ...result,
+        fetched: (aggregate.fetched || 0) + (result.fetched || 0),
+        queued: (aggregate.queued || 0) + (result.queued || 0),
+        processed: (aggregate.processed || 0) + (result.processed || 0),
+        requestCount: (aggregate.requestCount || 0) + (result.requestCount || 0),
+        backlog: Boolean(aggregate.backlog || result.backlog),
+      };
+    }
+    return aggregate;
+  }
+
+  async pollOutgoingMessagesOnceForChat(chat, { signal } = {}) {
     if (this.pendingEvents.size >= MAX_PENDING_EVENTS) {
       const pendingResult = await this.drainPendingEvents();
       if (this.pendingEvents.size >= MAX_PENDING_EVENTS) {

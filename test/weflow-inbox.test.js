@@ -3779,6 +3779,156 @@ test("Cyberboss maps a WeFlow item onto the existing ClawBot reply binding", asy
   assert.deepEqual(received[0].options, { allowCommands: false });
 });
 
+test("Cyberboss routes a WeFlow UIA reply back to the chat that sent the message", async () => {
+  const received = [];
+  const appLike = {
+    activeAccountId: "account-1",
+    config: {
+      stateDir: createTempDir(),
+      workspaceId: "default",
+      weflowInboxChat: "wxid_main",
+      weflowInboxDisplayName: "yourself",
+    },
+    resolveWeFlowInboxReplyTarget() {
+      return { userId: "bot-user", contextToken: "ctx-1", provider: "weixin" };
+    },
+    async resolveWeFlowReplySource() {
+      return "azzy";
+    },
+    async handlePreparedMessage(normalized, options) {
+      received.push({ normalized, options });
+    },
+  };
+
+  const accepted = await CyberbossApp.prototype.handleWeFlowInboxMessage.call(
+    appLike,
+    normalizeWeFlowMessage(detail({ content: "在吗", parsedContent: "在吗" })),
+    { chat: "Azzy", chatUsername: "wxid_azzy" }
+  );
+  assert.equal(accepted, true);
+  assert.equal(received[0].normalized.provider, "weflow-uia");
+  // The chat's own wxid is the route: the bridge resolves the displayed name from
+  // the talker on every dispatch. It rides chatId, which every prepared-message hop
+  // already carries, and never the canary's replyWeflow* fields, which
+  // stripModelCanaryPreparedFields removes from ordinary turns.
+  assert.equal(received[0].normalized.chatId, "weflow:wxid_azzy");
+  assert.equal(received[0].normalized.replyWeflowTalker, undefined);
+});
+
+test("Cyberboss leaves the bot route without a per-chat UIA target", async () => {
+  const received = [];
+  const appLike = {
+    activeAccountId: "account-1",
+    config: {
+      stateDir: createTempDir(),
+      workspaceId: "default",
+      weflowInboxChat: "wxid_main",
+      weflowInboxDisplayName: "yourself",
+    },
+    resolveWeFlowInboxReplyTarget() {
+      return { userId: "bot-user", contextToken: "ctx-1", provider: "weixin" };
+    },
+    async resolveWeFlowReplySource() {
+      return "bot";
+    },
+    async handlePreparedMessage(normalized, options) {
+      received.push({ normalized, options });
+    },
+  };
+
+  const accepted = await CyberbossApp.prototype.handleWeFlowInboxMessage.call(
+    appLike,
+    normalizeWeFlowMessage(detail({ content: "在吗", parsedContent: "在吗" })),
+    { chat: "Azzy", chatUsername: "wxid_azzy" }
+  );
+  assert.equal(accepted, true);
+  assert.equal(received[0].normalized.provider, "weixin");
+  assert.equal(received[0].normalized.chatId, "weflow:wxid_azzy");
+  assert.equal(received[0].normalized.weflowReplyChat, undefined);
+});
+
+test("Cyberboss routes an ordinary WeFlow UIA turn to the chat in its chatId", async () => {
+  const targets = [];
+  const appLike = {
+    runtimeAdapter: {
+      getSessionStore() {
+        return { buildBindingKey() { return "binding-per-chat"; } };
+      },
+    },
+    streamDelivery: {
+      setReplyTarget(bindingKey, target) {
+        targets.push({ bindingKey, target });
+      },
+    },
+    resolveWorkspaceRoot() {
+      return "D:/fixture-workspace";
+    },
+    async prepareIncomingMessageForRuntime(message) {
+      return { ...message, originalText: message.text, attachments: [], attachmentFailures: [] };
+    },
+    async routePreparedInbound() {},
+  };
+
+  await CyberbossApp.prototype.handlePreparedMessage.call(appLike, {
+    provider: "weflow-uia",
+    workspaceId: "default",
+    accountId: "account-1",
+    senderId: "bot-user",
+    chatId: "weflow:wxid_azzy",
+    contextToken: "",
+    text: "在吗",
+  }, { allowCommands: false });
+
+  assert.equal(targets[0].target.weflowContact, "wxid_azzy");
+  assert.equal(targets[0].target.weflowTalker, "wxid_azzy");
+});
+
+test("Cyberboss acknowledges a WeFlow UIA inbound into the chat that sent it", async () => {
+  const sent = [];
+  const appLike = {
+    channelAdapter: {
+      async sendText(payload) {
+        sent.push(payload);
+      },
+    },
+  };
+
+  const acknowledged = await CyberbossApp.prototype.acknowledgeWeFlowUiaInbound.call(appLike, {
+    provider: "weflow-uia",
+    senderId: "bot-user",
+    contextToken: "",
+    chatId: "weflow:wxid_azzy",
+    messageId: "weflow:3456127970914337180",
+  });
+
+  assert.equal(acknowledged, true);
+  assert.equal(sent[0].messageKind, "inbound_ack");
+  assert.equal(sent[0].weflowContact, "wxid_azzy");
+  assert.equal(sent[0].weflowTalker, "wxid_azzy");
+});
+
+test("Cyberboss acknowledges without a route when the turn has no reply chat", async () => {
+  const sent = [];
+  const appLike = {
+    channelAdapter: {
+      async sendText(payload) {
+        sent.push(payload);
+      },
+    },
+  };
+
+  const acknowledged = await CyberbossApp.prototype.acknowledgeWeFlowUiaInbound.call(appLike, {
+    provider: "weflow-uia",
+    senderId: "bot-user",
+    contextToken: "",
+    messageId: "weflow:1",
+  });
+
+  assert.equal(acknowledged, true);
+  assert.equal(sent[0].weflowContact, undefined);
+  assert.equal(sent[0].weflowTalker, undefined);
+});
+
 test("Cyberboss consumes a ledger-owned outgoing WeFlow row without creating another turn", async () => {
   const classified = [];
   let routed = false;

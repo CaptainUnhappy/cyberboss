@@ -1074,6 +1074,11 @@ class CyberbossApp {
     }
     const sharedContent = isSharedInboxContentMessage(enrichedMessage);
     const explicitPrompt = isExplicitInboxPromptMessage(enrichedMessage);
+    // The reply must return to the chat this message came from. The UIA bridge
+    // resolves the displayed name from the talker, so the chat's own wxid is the
+    // route; it rides chatId ("weflow:<talker>"), which every prepared-message hop
+    // already carries. It deliberately does not reuse the canary's replyWeflow*
+    // fields - stripModelCanaryPreparedFields removes those from ordinary turns.
     const normalized = {
       provider: sendSource === "azzy" ? "weflow-uia" : "weixin",
       accountId: this.activeAccountId,
@@ -2070,13 +2075,13 @@ class CyberbossApp {
     if (!shouldAcknowledgeInbound(prepared)) {
       return false;
     }
-    const payload = {
+    const payload = applyWeFlowInboundReplyRoute({
       userId: prepared.senderId,
       text: isReminderRequest ? REMINDER_INBOUND_ACK_TEXT : WEFLOW_UIA_INBOUND_ACK_TEXT,
       contextToken: prepared.contextToken,
       provider: prepared.provider,
       messageKind: isReminderRequest ? "reminder_ack" : "inbound_ack",
-    };
+    }, prepared);
     try {
       await this.channelAdapter.sendText(payload);
       console.log(`[cyberboss] inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
@@ -3916,6 +3921,14 @@ function buildReplyTargetFromPrepared(prepared = {}) {
   };
   const deliveryPolicy = normalizeText(prepared.deliveryPolicy);
   if (deliveryPolicy) target.deliveryPolicy = deliveryPolicy;
+  // Per-chat reply routing: an inbound turn answers the chat it came from, so the
+  // UIA route carries that chat's own wxid as both contact and talker. The bridge
+  // resolves the displayed name from the talker on every dispatch.
+  const perChatUiaRoute = resolveWeFlowUiaReplyChat(prepared);
+  if (perChatUiaRoute) {
+    target.weflowContact = perChatUiaRoute;
+    target.weflowTalker = perChatUiaRoute;
+  }
   if (modelCanary) {
     target.modelCanaryExecutionPolicy = normalizeText(prepared.modelCanaryExecutionPolicy);
     target.modelCanaryRunId = normalizeText(prepared.modelCanaryRunId);
@@ -3930,6 +3943,23 @@ function buildReplyTargetFromPrepared(prepared = {}) {
     target.desktopInputLease = normalizeDesktopInputLease(prepared.replyDesktopInputLease);
   }
   return target;
+}
+
+function resolveWeFlowUiaReplyChat(source = {}) {
+  if (normalizeText(source.provider) !== "weflow-uia") {
+    return "";
+  }
+  const match = /^weflow:(.+)$/.exec(normalizeText(source.chatId));
+  return match ? normalizeText(match[1]) : "";
+}
+
+function applyWeFlowInboundReplyRoute(payload, source = {}) {
+  const chat = resolveWeFlowUiaReplyChat(source);
+  if (chat) {
+    payload.weflowContact = chat;
+    payload.weflowTalker = chat;
+  }
+  return payload;
 }
 
 function stripModelCanaryPreparedFields(prepared = {}) {

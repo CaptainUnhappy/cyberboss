@@ -666,6 +666,33 @@ test("WeFlow UIA reply target is forwarded as the exclusive outbound provider", 
   }]);
 });
 
+test("WeFlow UIA reply carries the per-chat contact and talker of its target", async () => {
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-weflow-per-chat", {
+    userId: "wxid_azzy",
+    contextToken: "",
+    provider: "weflow-uia",
+    weflowContact: "wxid_azzy",
+    weflowTalker: "wxid_azzy",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-weflow-per-chat",
+    turnId: "turn-weflow-per-chat",
+    itemId: "item-weflow-per-chat",
+    text: "per chat route",
+  });
+
+  assert.deepEqual(sent, [{
+    userId: "wxid_azzy",
+    text: "per chat route",
+    contextToken: "",
+    provider: "weflow-uia",
+    weflowContact: "wxid_azzy",
+    weflowTalker: "wxid_azzy",
+  }]);
+});
+
 test("certain WeFlow UIA pre-dispatch failure durably defers one plain reply", async () => {
   const attempts = [];
   const deferred = [];
