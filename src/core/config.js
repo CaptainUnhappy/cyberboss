@@ -6,6 +6,11 @@ function readConfig() {
   const mode = argv[0] || "";
   const stateDir = process.env.CYBERBOSS_STATE_DIR || path.join(os.homedir(), ".cyberboss");
   const weflowInboxChat = readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT");
+  // Inbound scope: one or more chats. Falls back to the legacy single var.
+  const weflowInboxChats = (readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHATS") || weflowInboxChat)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
   const weflowCanaryChat = readTextEnv("CYBERBOSS_WEFLOW_CANARY_CHAT");
   const weflowCanaryDisplayName = readTextEnv("CYBERBOSS_WEFLOW_CANARY_DISPLAY_NAME");
   assertWeFlowCanaryTalkerIsolation({ weflowInboxChat, weflowCanaryChat });
@@ -64,6 +69,7 @@ function readConfig() {
     weflowBridgeTimeoutMs: readIntEnv("CYBERBOSS_WEFLOW_BRIDGE_TIMEOUT_MS") || 30_000,
     weflowToken: readTextEnv("CYBERBOSS_WEFLOW_TOKEN"),
     weflowInboxChat,
+    weflowInboxChats,
     weflowInboxDisplayName: readTextEnv("CYBERBOSS_WEFLOW_INBOX_DISPLAY_NAME") || "yourself",
     weflowInboxReplyUserId: readTextEnv("CYBERBOSS_WEFLOW_REPLY_USER_ID"),
     weflowInboxCursorFile: path.join(stateDir, "weflow-inbox-cursor.json"),

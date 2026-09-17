@@ -60,7 +60,9 @@ class WeFlowInboxSource {
           const chat = normalizeText(item?.push?.sessionId || item?.push?.talker || item?.push?.chatUsername);
           return item?.key
             && !this.eventTombstones.has(item.key)
-            && chat === normalizeText(this.config.weflowInboxChat);
+            && (Array.isArray(this.config.weflowInboxChats) && this.config.weflowInboxChats.length
+              ? this.config.weflowInboxChats.includes(chat)
+              : chat === normalizeText(this.config.weflowInboxChat));
         })
         .map((item) => {
           const pairing = normalizePendingPairing(item.pairing, {
@@ -388,7 +390,7 @@ class WeFlowInboxSource {
     }
     const push = normalizePushData(event?.data);
     const chat = normalizeText(push.sessionId || push.talker || push.chatUsername);
-    if (!chat || chat !== normalizeText(this.config.weflowInboxChat)) {
+    if (!chat || !(Array.isArray(this.config.weflowInboxChats) && this.config.weflowInboxChats.length ? this.config.weflowInboxChats.includes(chat) : chat === normalizeText(this.config.weflowInboxChat))) {
       return { status: "ignored_chat" };
     }
     const key = buildEventKey(eventType, push);
