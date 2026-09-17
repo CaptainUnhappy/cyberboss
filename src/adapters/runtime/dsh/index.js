@@ -426,6 +426,13 @@ function createDshRuntimeAdapter(config = {}) {
        * agree on one through this rendezvous.
        */
       turnStartWaiters: new Map(),
+      /**
+       * Sessions this process created or resumed. A stored id that is not in here
+       * belongs to an earlier process and cannot be prompted directly (DSH
+       * refuses to create an id that already exists), so the id is only reusable
+       * when the process either created it or re-attached to it.
+       */
+      liveSessions: new Set(),
     };
 
     client.onNotification((method, params) => {
@@ -645,14 +652,32 @@ function createDshRuntimeAdapter(config = {}) {
       // process cannot be resumed (resume takes a persisted *inactive* session),
       // which is why a failed resume on a stored id stays "not opening" rather
       // than re-sending the persona into a conversation that already has history.
-      const resumed = await resumePersistedSession(runtime, threadId, workspaceRoot);
+      const wasLive = runtime.liveSessions?.has(threadId) === true;
+      const resumed = wasLive ? false : await resumePersistedSession(runtime, threadId, workspaceRoot);
+      if (threadId && !resumed && !wasLive && runtime.sessionResumeUnsupported) {
+        // This surface cannot re-attach to a persisted session, and prompting the
+        // id directly would fail with `already exists`. Keep the id stable per
+        // process instead: mint one and remember it, so the conversation is
+        // usable for the rest of this process rather than opening a session per
+        // turn.
+        console.warn(
+          `[cyberboss] dsh session ${threadId} cannot be re-attached on this runtime; `
+          + "opening this window's session for this process",
+        );
+        threadId = "";
+      }
       if (!threadId) {
         // DSH session ids are client-chosen and an unknown id lazily creates the
         // agent+session pair, so a fresh id is how a conversation starts.
         threadId = `dsh-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
       }
       rememberThread(threadId);
-      const openingTurn = !resumed && !storedThreadId;
+      // The persona belongs to a session with no history. That is true when the
+      // conversation had no stored id, and when the stored id had to be replaced
+      // (an unusable session on a surface without resume); it is false whenever
+      // the turn continues on the id the conversation already had - whether it
+      // was resumed or is simply still live in this process.
+      const openingTurn = !resumed && (!storedThreadId || threadId !== storedThreadId);
 
       // The Cyberboss persona travels inside the opening user message, exactly as
       // the Codex and Claude Code adapters do it. Without this a fresh DSH
@@ -680,6 +705,7 @@ function createDshRuntimeAdapter(config = {}) {
 
       try {
         await runtime.client.prompt(threadId, contentBlocks);
+        runtime.liveSessions?.add(threadId);
       } catch (error) {
         runtime.turnStartWaiters.delete(threadId);
         runtime.activeTurnBySession.delete(threadId);
@@ -731,6 +757,7 @@ function createDshRuntimeAdapter(config = {}) {
         runtime.turnStartWaiters.set(threadId, settleTurnStart);
         try {
           await runtime.client.prompt(threadId, retryBlocks);
+          runtime.liveSessions?.add(threadId);
         } catch (retryError) {
           runtime.turnStartWaiters.delete(threadId);
           runtime.activeTurnBySession.delete(threadId);
