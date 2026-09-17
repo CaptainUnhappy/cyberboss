@@ -343,6 +343,7 @@ function clonePreparedInboundMessage(prepared) {
     attachments: Array.isArray(prepared.attachments) ? prepared.attachments : [],
     attachmentFailures: Array.isArray(prepared.attachmentFailures) ? prepared.attachmentFailures : [],
     receivedAt: prepared.receivedAt,
+    sessionScope: normalizeText(prepared.sessionScope),
     contentKind: normalizeSharedContentKind(prepared.contentKind),
     contentTitle: normalizeText(prepared.contentTitle),
     contentText: normalizeText(prepared.contentText),

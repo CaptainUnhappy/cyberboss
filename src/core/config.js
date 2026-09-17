@@ -13,6 +13,10 @@ function readConfig() {
     .filter(Boolean);
   const weflowCanaryChat = readTextEnv("CYBERBOSS_WEFLOW_CANARY_CHAT");
   const weflowCanaryDisplayName = readTextEnv("CYBERBOSS_WEFLOW_CANARY_DISPLAY_NAME");
+  // Display name per chat window, used to name that window's DSH session:
+  // `talker=名字` pairs, comma separated. Only the operator knows which accounts
+  // are 大号 and which are 小号, so the labels are configuration, not inference.
+  const weflowWindowLabels = parseWindowLabels(readTextEnv("CYBERBOSS_WEFLOW_WINDOW_LABELS"));
   assertWeFlowCanaryTalkerIsolation({ weflowInboxChat, weflowCanaryChat });
 
   return {
@@ -70,6 +74,7 @@ function readConfig() {
     weflowToken: readTextEnv("CYBERBOSS_WEFLOW_TOKEN"),
     weflowInboxChat,
     weflowInboxChats,
+    weflowWindowLabels,
     weflowInboxDisplayName: readTextEnv("CYBERBOSS_WEFLOW_INBOX_DISPLAY_NAME") || "yourself",
     weflowInboxReplyUserId: readTextEnv("CYBERBOSS_WEFLOW_REPLY_USER_ID"),
     weflowInboxCursorFile: path.join(stateDir, "weflow-inbox-cursor.json"),
@@ -262,6 +267,30 @@ function parseKnownPlacesJson(value) {
   } catch {
     return [];
   }
+}
+
+/**
+ * `talker=名字` pairs, comma separated. Malformed pairs are skipped rather than
+ * failing the boot: a missing label only costs a session its display name.
+ */
+function parseWindowLabels(value) {
+  const labels = {};
+  for (const part of String(value || "").split(",")) {
+    const entry = part.trim();
+    if (!entry) {
+      continue;
+    }
+    const separator = entry.indexOf("=");
+    if (separator <= 0) {
+      continue;
+    }
+    const talker = entry.slice(0, separator).trim();
+    const label = entry.slice(separator + 1).trim();
+    if (talker && label) {
+      labels[talker] = label;
+    }
+  }
+  return labels;
 }
 
 function parseKnownPlaceCenter(tag, value) {

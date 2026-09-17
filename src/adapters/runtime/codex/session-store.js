@@ -112,8 +112,59 @@ class SessionStore {
     return this.updateBinding(bindingKey, nextBinding);
   }
 
-  getRuntimeParamsForWorkspace(bindingKey, workspaceRoot) {
+  /**
+   * Conversation-scoped thread ids.
+   *
+   * One binding can carry several conversations (for Cyberboss, one WeChat chat
+   * window each). They must not share the single thread slot above, or the last
+   * window to speak would overwrite every other window's session.
+   */
+  getThreadIdForConversation(bindingKey, workspaceRoot, conversationKey, runtimeId = this.runtimeId) {
     const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    const normalizedConversation = normalizeValue(conversationKey);
+    if (!normalizedWorkspaceRoot || !normalizedConversation) {
+      return "";
+    }
+    const binding = this.getBinding(bindingKey) || {};
+    const scoped = getConversationThreadMapForRuntime(binding, runtimeId)[normalizedConversation];
+    return scoped && typeof scoped === "object"
+      ? normalizeValue(scoped[normalizedWorkspaceRoot])
+      : "";
+  }
+
+  setThreadIdForConversation(
+    bindingKey,
+    workspaceRoot,
+    conversationKey,
+    threadId,
+    extra = {},
+    runtimeId = this.runtimeId
+  ) {
+    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
+    const normalizedConversation = normalizeValue(conversationKey);
+    if (!normalizedWorkspaceRoot || !normalizedConversation) {
+      return this.getBinding(bindingKey);
+    }
+    const current = this.getBinding(bindingKey) || {};
+    const normalizedRuntimeId = normalizeValue(runtimeId);
+    const currentConversations = getConversationThreadMapForRuntime(current, normalizedRuntimeId);
+    const threadIdByConversationByRuntime = {
+      ...getConversationThreadRuntimeMap(current),
+      [normalizedRuntimeId || "default"]: {
+        ...currentConversations,
+        [normalizedConversation]: {
+          ...(currentConversations[normalizedConversation] || {}),
+          [normalizedWorkspaceRoot]: normalizeThreadValue(threadId),
+        },
+      },
+    };
+    return this.updateBinding(bindingKey, {
+      ...extra,
+      threadIdByConversationByRuntime,
+    });
+  }
+
+  getRuntimeParamsForWorkspace(bindingKey, workspaceRoot) {    const normalizedWorkspaceRoot = normalizeValue(workspaceRoot);
     if (!normalizedWorkspaceRoot) {
       return { model: "", modelProvider: "" };
     }
@@ -224,6 +275,22 @@ class SessionStore {
             bindingKey,
             workspaceRoot: normalizeValue(workspaceRoot),
           };
+        }
+      }
+      for (const [conversationKey, scoped] of Object.entries(
+        getConversationThreadMapForRuntime(binding, normalizedRuntimeId)
+      )) {
+        if (!scoped || typeof scoped !== "object") {
+          continue;
+        }
+        for (const [workspaceRoot, candidateThreadId] of Object.entries(scoped)) {
+          if (normalizeValue(candidateThreadId) === normalizedThreadId) {
+            return {
+              bindingKey,
+              workspaceRoot: normalizeValue(workspaceRoot),
+              conversationKey: normalizeValue(conversationKey),
+            };
+          }
         }
       }
     }
@@ -384,8 +451,22 @@ function getThreadMapForRuntime(binding, runtimeId) {
   return scoped && typeof scoped === "object" ? scoped : {};
 }
 
-function getCodexParamsMap(binding) {
-  return binding?.codexParamsByWorkspaceRoot && typeof binding.codexParamsByWorkspaceRoot === "object"
+function getConversationThreadRuntimeMap(binding) {
+  return binding?.threadIdByConversationByRuntime && typeof binding.threadIdByConversationByRuntime === "object"
+    ? binding.threadIdByConversationByRuntime
+    : {};
+}
+
+function getConversationThreadMapForRuntime(binding, runtimeId) {
+  const normalizedRuntimeId = normalizeValue(runtimeId);
+  if (!normalizedRuntimeId) {
+    return {};
+  }
+  const scoped = getConversationThreadRuntimeMap(binding)[normalizedRuntimeId];
+  return scoped && typeof scoped === "object" ? scoped : {};
+}
+
+function getCodexParamsMap(binding) {  return binding?.codexParamsByWorkspaceRoot && typeof binding.codexParamsByWorkspaceRoot === "object"
     ? binding.codexParamsByWorkspaceRoot
     : {};
 }

@@ -20,6 +20,8 @@
 
 const path = require("node:path");
 const fs = require("node:fs");
+const os = require("node:os");
+const crypto = require("node:crypto");
 
 const { DshRpcClient, defaultDshBin } = require("./rpc-client");
 const { mapDshSessionEvent } = require("./events");
@@ -55,6 +57,95 @@ function isSessionConflictError(error) {
   if (code === "SESSION_ALREADY_EXISTS") return true;
   const message = normalizeText(error?.message);
   return /^session ".+" already exists$/u.test(message);
+}
+
+/**
+ * Is this session already persisted on disk?
+ *
+ * `session/resume` is only worth attempting for an id that exists: a prompt is
+ * what creates one, and a resume against an unknown id costs a round trip (and
+ * would never settle against a transport that does not answer unknown methods).
+ * The check reads DSH's own session store, so a layout change degrades to "not
+ * persisted" - the prompt path still creates the session, and the
+ * `already exists` conflict path is the safety net for the opposite mistake.
+ */
+function isSessionPersisted(sessionId) {
+  const normalizedSessionId = normalizeText(sessionId);
+  if (!normalizedSessionId) {
+    return false;
+  }
+  const dshHome = normalizeText(process.env.DSH_HOME) || path.join(os.homedir(), ".dsh");
+  try {
+    for (const project of fs.readdirSync(path.join(dshHome, "sessions"))) {
+      if (fs.existsSync(path.join(dshHome, "sessions", project, normalizedSessionId))) {
+        return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * The session id one chat window owns, derived instead of minted.
+ *
+ * A random id per runtime process is what piled up sessions in the sidebar: every
+ * restart (and every `/stop`, which respawns the runtime) opened another one.
+ * Deriving the id from the conversation identity makes the same window ask for
+ * the same session on every process, so a respawn can resume it instead of
+ * opening a new one.
+ */
+function buildConversationSessionId({ bindingKey, workspaceRoot, conversationKey } = {}) {
+  const material = [bindingKey, workspaceRoot, conversationKey].map(normalizeText).join("\n");
+  if (!material.replace(/\n/gu, "")) {
+    return "";
+  }
+  return `cbw-${crypto.createHash("sha256").update(material, "utf8").digest("hex").slice(0, 16)}`;
+}
+
+/**
+ * Re-attach to a session that a previous process left behind.
+ *
+ * Returns false for "this id has never been persisted" and for any other refusal
+ * (wrong workspace, unsupported capability), because the caller's next step -
+ * prompting the id to create it - is the same in every such case.
+ */
+async function resumePersistedSession(runtime, threadId, workspaceRoot) {
+  const normalizedThread = normalizeText(threadId);
+  const normalizedRoot = normalizeText(workspaceRoot);
+  if (!normalizedThread || !normalizedRoot || typeof runtime?.client?.resumeSession !== "function") {
+    return false;
+  }
+  if (runtime.sessionResumeUnsupported) {
+    return false;
+  }
+  if (!isSessionPersisted(normalizedThread)) {
+    return false;
+  }
+  try {
+    await runtime.client.resumeSession(normalizedThread, { cwd: normalizedRoot });
+    return true;
+  } catch (error) {
+    const message = normalizeText(error?.message);
+    if (/unknown .*method: session\/resume/iu.test(message)) {
+      // The installed SDK surface (dsh-sdk-app) serves initialize/session/prompt/
+      // shutdown only; `session/resume` exists in the ACP app, not here. Record
+      // the verdict once instead of warning on every turn.
+      runtime.sessionResumeUnsupported = true;
+      console.warn(
+        "[cyberboss] this DSH runtime does not implement session/resume; "
+        + "a restarted runtime will open a new session for the same window",
+      );
+      return false;
+    }
+    // Staying silent here is what made an earlier failure invisible: the caller
+    // simply opened another session and the only trace was a lost context.
+    console.warn(
+      `[cyberboss] dsh session ${normalizedThread} could not be resumed: ${message || error}`,
+    );
+    return false;
+  }
 }
 
 // The only raster types DSH admits inline (SdkEncodedImageBlock.mimeType).
@@ -278,6 +369,16 @@ function createDshRuntimeAdapter(config = {}) {
    */
   function ensureRuntime(workspaceRoot) {
     const normalizedRoot = normalizeText(workspaceRoot) || config.workspaceRoot || process.cwd();
+    // The child is spawned with this directory as its cwd, and Windows reports a
+    // missing cwd as `spawn <node> ENOENT` - an error that reads like a missing
+    // binary and would take the whole service down. Create it instead.
+    try {
+      fs.mkdirSync(normalizedRoot, { recursive: true });
+    } catch (error) {
+      console.warn(
+        `[cyberboss] dsh workspace root could not be created (${normalizedRoot}): ${error?.message || error}`,
+      );
+    }
     let record = runtimes.get(normalizedRoot);
     if (record && record.client.isRunning()) {
       return record;
@@ -510,28 +611,58 @@ function createDshRuntimeAdapter(config = {}) {
       const runtime = ensureRuntime(workspaceRoot);
       await runtime.client.initialize();
 
-      let threadId = bindingKey
-        ? sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot)
+      const conversationKey = normalizeText(metadata?.conversationKey);
+      const sessionName = normalizeText(metadata?.sessionName);
+      const rememberThread = (id) => {
+        if (!bindingKey) {
+          return;
+        }
+        const extra = {
+          model: normalizeText(model) || configuredModel,
+          modelProvider: configuredProvider,
+          ...metadata,
+        };
+        if (conversationKey) {
+          sessionStore.setThreadIdForConversation(bindingKey, workspaceRoot, conversationKey, id, extra);
+        } else {
+          sessionStore.setThreadIdForWorkspace(bindingKey, workspaceRoot, id, extra);
+        }
+      };
+
+      const storedThreadId = bindingKey
+        ? (conversationKey
+          ? sessionStore.getThreadIdForConversation(bindingKey, workspaceRoot, conversationKey)
+          : sessionStore.getThreadIdForWorkspace(bindingKey, workspaceRoot))
         : "";
-      const openingTurn = !threadId;
+      // A conversation keeps its id even before anything is stored, so the first
+      // process to speak and every later process agree on one session.
+      const derivedThreadId = !storedThreadId && conversationKey
+        ? buildConversationSessionId({ bindingKey, workspaceRoot, conversationKey })
+        : "";
+      let threadId = storedThreadId || derivedThreadId;
+      // A respawned runtime holds no session in memory, so `session/resume` is
+      // what carries a conversation across restarts. A live session in this very
+      // process cannot be resumed (resume takes a persisted *inactive* session),
+      // which is why a failed resume on a stored id stays "not opening" rather
+      // than re-sending the persona into a conversation that already has history.
+      const resumed = await resumePersistedSession(runtime, threadId, workspaceRoot);
       if (!threadId) {
         // DSH session ids are client-chosen and an unknown id lazily creates the
         // agent+session pair, so a fresh id is how a conversation starts.
         threadId = `dsh-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-        if (bindingKey) {
-          sessionStore.setThreadIdForWorkspace(bindingKey, workspaceRoot, threadId, {
-            model: normalizeText(model) || configuredModel,
-            modelProvider: configuredProvider,
-            ...metadata,
-          });
-        }
       }
+      rememberThread(threadId);
+      const openingTurn = !resumed && !storedThreadId;
 
       // The Cyberboss persona travels inside the opening user message, exactly as
       // the Codex and Claude Code adapters do it. Without this a fresh DSH
       // session runs on DSH's own generic coding-agent system prompt alone, so
-      // the WeChat persona never applies to the first turn.
-      const turnText = openingTurn ? buildOpeningTurnText(config, text) : text;
+      // the WeChat persona never applies to the first turn. The window's own name
+      // opens that message so the session is recognizable in the client list.
+      const openingText = buildOpeningTurnText(config, text);
+      const turnText = openingTurn
+        ? (sessionName ? `${sessionName}\n\n${openingText}` : openingText)
+        : text;
       const contentBlocks = buildContentBlocks({ text: turnText, attachments });
       if (contentBlocks.length === 0) {
         throw new Error("dsh turn requires text or an attachment");
@@ -557,33 +688,43 @@ function createDshRuntimeAdapter(config = {}) {
         }
         // The SDK server resolves a `session/prompt` for an id it does not hold
         // in memory by *creating* it, and `dsh-session` refuses to create an id
-        // that already exists in its durable store. The protocol has no resume
-        // method (only initialize/session/prompt/shutdown), so a session created
-        // by an earlier process can never be prompted again: every runtime
-        // restart - and every `/stop`, which respawns the runtime - would fail
-        // the next message with `session "..." already exists`.
-        //
-        // Recovery is to continue the conversation on a new session. That costs
-        // the model's context for this thread, which is worth stating plainly
-        // rather than surfacing as a hard request failure.
-        const replacedThreadId = threadId;
-        threadId = `dsh-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
-        if (bindingKey) {
-          sessionStore.setThreadIdForWorkspace(bindingKey, workspaceRoot, threadId, {
-            model: normalizeText(model) || configuredModel,
-            modelProvider: configuredProvider,
-            ...metadata,
-          });
+        // that already exists in its durable store. The error therefore means
+        // "this id is already on disk", which `session/resume` can now attach to.
+        const conflictedThreadId = threadId;
+        const recovered = await resumePersistedSession(runtime, conflictedThreadId, workspaceRoot);
+        let retryBlocks;
+        if (recovered) {
+          console.warn(
+            `[cyberboss] dsh session ${conflictedThreadId} already existed; resumed it instead of `
+            + "opening another session (context preserved)",
+          );
+          retryBlocks = buildContentBlocks({ text, attachments });
+        } else {
+          // Resume is unavailable for this session, so the conversation continues
+          // on a new one. That costs the model's context for this thread, which
+          // is worth stating plainly rather than surfacing as a hard failure.
+          threadId = `dsh-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+          if (conversationKey) {
+            // Never overwrite the conversation's own id with this random one: the
+            // whole point is that the window owns one session, and a later restart
+            // must try that session again rather than inherit the fallback.
+            if (bindingKey) {
+              sessionStore.setThreadIdForWorkspace(bindingKey, workspaceRoot, threadId, {
+                model: normalizeText(model) || configuredModel,
+                modelProvider: configuredProvider,
+                ...metadata,
+              });
+            }
+          } else {
+            rememberThread(threadId);
+          }
+          console.warn(
+            `[cyberboss] dsh session ${conflictedThreadId} could not be resumed; `
+            + `continuing on a fresh session ${threadId} (this thread's context was reset)`,
+          );
+          // A fresh session has no history, so the persona has to be re-sent.
+          retryBlocks = buildContentBlocks({ text: openingText, attachments });
         }
-        console.warn(
-          `[cyberboss] dsh session ${replacedThreadId} is not resumable in a new runtime process; `
-          + `continuing on a fresh session ${threadId} (this thread's context was reset)`,
-        );
-        // A fresh session has no history, so the persona has to be re-sent.
-        const retryBlocks = buildContentBlocks({
-          text: buildOpeningTurnText(config, text),
-          attachments,
-        });
         turnStarted = new Promise((resolve) => {
           settleTurnStart = resolve;
         });

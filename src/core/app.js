@@ -1088,6 +1088,7 @@ class CyberbossApp {
       messageId: `weflow:${enrichedMessage.id}`,
       sourceMessageIds: normalizeSourceMessageIds(enrichedMessage.sourceMessageIds),
       contextToken: target.contextToken,
+      sessionScope: isTestSessionRequest(enrichedMessage.text) ? TEST_SESSION_KEY : "",
       text: buildWeFlowInboxTurnText(enrichedMessage, snapshot, this.config),
       quotedContexts: Array.isArray(enrichedMessage.quotedContexts) ? enrichedMessage.quotedContexts : [],
       attachments: [],
@@ -1935,6 +1936,11 @@ class CyberbossApp {
           senderId: prepared.senderId,
           modelCanaryDenySideEffects:
             normalizeText(prepared.modelCanaryExecutionPolicy) === MODEL_CANARY_EXECUTION_POLICY,
+          // One DSH session per chat window: the window travels as an explicit
+          // conversation key so the runtime can keep (and resume) one session per
+          // conversation instead of minting a new id per process.
+          conversationKey: resolveConversationKeyForPrepared(prepared),
+          sessionName: resolveSessionNameForPrepared(this.config, prepared),
         },
       });
       this.runtimeContextStore?.setActiveContext?.({
@@ -3953,8 +3959,52 @@ function resolveWeFlowUiaReplyChat(source = {}) {
   return match ? normalizeText(match[1]) : "";
 }
 
-function applyWeFlowInboundReplyRoute(payload, source = {}) {
-  const chat = resolveWeFlowUiaReplyChat(source);
+const TEST_SESSION_KEY = "test-session";
+
+/**
+ * A `[test]` marker moves one turn into the reserved test session.
+ *
+ * Testing a real window would otherwise write fabricated messages into that
+ * conversation's context, so the marker is the operator's way of saying "this
+ * turn is a drill".
+ */
+function isTestSessionRequest(text) {
+  return /\[test\]/iu.test(normalizeText(text));
+}
+
+/**
+ * Which DSH conversation this turn belongs to.
+ *
+ * The chat window (one WeChat conversation) is the unit a session is kept for;
+ * `test-session` is the reserved window used by `[test]` messages so a test run
+ * never mixes into a real conversation's context.
+ */
+function resolveConversationKeyForPrepared(prepared = {}) {
+  const scope = normalizeText(prepared.sessionScope);
+  if (scope) {
+    return scope;
+  }
+  return normalizeText(prepared.chatId);
+}
+
+function resolveSessionNameForPrepared(config = {}, prepared = {}) {
+  const scope = normalizeText(prepared.sessionScope);
+  if (scope) {
+    return scope;
+  }
+  const match = /^weflow:(.+)$/u.exec(normalizeText(prepared.chatId));
+  const talker = match ? normalizeText(match[1]) : "";
+  if (!talker) {
+    return "";
+  }
+  // The operator names each window explicitly (大-/小-/收-/发-), because only they
+  // know which accounts are 大号 and which are 小号.
+  const labels = config?.weflowWindowLabels;
+  const label = labels && typeof labels === "object" ? normalizeText(labels[talker]) : "";
+  return label || talker;
+}
+
+function applyWeFlowInboundReplyRoute(payload, source = {}) {  const chat = resolveWeFlowUiaReplyChat(source);
   if (chat) {
     payload.weflowContact = chat;
     payload.weflowTalker = chat;

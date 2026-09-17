@@ -14,9 +14,14 @@
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const path = require("node:path");
-
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 120_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+/**
+ * `session/resume` is a read of persisted state, not a turn: bound it so a
+ * transport that never answers cannot hold a reply hostage. The caller falls
+ * back to creating the session.
+ */
+const RESUME_SESSION_TIMEOUT_MS = 30_000;
 const EXPECTED_SERVER_NAME = "deepseek-harness-sdk-runtime";
 
 class DshProtocolError extends Error {
@@ -291,6 +296,32 @@ class DshRpcClient {
       sessionId: normalizedSessionId,
       contentBlocks,
     });
+  }
+
+  /**
+   * Re-attach to a persisted session instead of creating another one.
+   *
+   * DSH's ACP surface advertises `session/resume`: it loads an inactive session
+   * whose canonical workspace matches, restores its log, and replays no old
+   * updates. A client-chosen id that already exists on disk can therefore be
+   * continued after a runtime respawn - which is what keeps one conversation on
+   * one session instead of opening a new one per restart.
+   */
+  async resumeSession(sessionId, { cwd = "" } = {}) {
+    const normalizedSessionId = normalizeText(sessionId);
+    if (!normalizedSessionId) {
+      throw new DshProtocolError("session/resume requires a sessionId");
+    }
+    const normalizedCwd = normalizeText(cwd);
+    if (!normalizedCwd) {
+      throw new DshProtocolError("session/resume requires a cwd");
+    }
+    await this.initialize();
+    return this.request("session/resume", {
+      sessionId: normalizedSessionId,
+      cwd: normalizedCwd,
+      mcpServers: [],
+    }, { timeoutMs: RESUME_SESSION_TIMEOUT_MS });
   }
 
   async shutdown() {

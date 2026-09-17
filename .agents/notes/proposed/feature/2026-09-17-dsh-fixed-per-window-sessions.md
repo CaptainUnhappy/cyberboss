@@ -15,8 +15,20 @@ Status: proposed
 
 （用户已确认的方向）
 
-1. **会话 id 确定化**：不再随机 `dsh-<时间戳>-<随机>`，改为由"窗口身份"派生的稳定 id，例如 `cbw-<sha256(talker)[:16]>`；窗口与 id 的映射写进 `dsh-sessions.json`，可读可查。
-2. **重生时续接而不是新建**：适配器的 rpc-client 增加 ACP `session/resume` 调用；启动/重生时若该 id 在 DSH 会话库中已存在 → resume，不存在 → 用该 id 建新会话（幂等）。`session "..." already exists` 那条恢复分支随之退役。
+1. **会话 id 确定化**（已落地）：不再随机 `dsh-<时间戳>-<随机>`，改为由"窗口身份"派生的稳定 id
+   `cbw-<sha256(binding + 工作区 + 会话键)[:16]>`；窗口与 id 的映射写进 `dsh-sessions.json`，可读可查。
+   同一次改造把会话查找按"窗口"分维度（`weflow:<talker>` 作为会话键），并让 `[test]` 的轮次走保留的
+   `test-session`，工作区固定为 `D:\Projects\cyberboss\user\cyberboss`。
+2. **重生时续接**（受阻，见下）：适配器的 rpc-client 已加 ACP `session/resume` 调用、适配器也按
+   "先探测磁盘上是否已持久化，再尝试 resume，失败才回退新建"的顺序接线；但**本机装的 sdk profile
+   不实现该方法**（实测报错 `unknown DeepSeek Harness SDK runtime method: session/resume`）；
+   判定结果现在会缓存，只警告一次，不再每轮重试。
+   因此"重启后复用同一段上下文"在当前 DSH build 上做不到，三个可选路线：
+   - **A. 一个窗口一行（重启清空该行历史）**：新建会话前删掉该窗口的旧会话，侧栏永远只有一个窗口一行，
+     代价是重启丢掉历史。改动最小。
+   - **B. 换 ACP 面**：让 sdk profile 改挂 `@deepseek-ai/dsh-acp`（它真的有 resume/list），
+     适配器的协议层（方法名、参数、事件映射）需要跟着重写。收益是既保留上下文、又能读会话标题。
+   - **C. 维持现状**：保留确定化 id 与按窗口隔离，但每次重启多一行（上下文重置）。
 3. **按窗口隔离**：会话查找键加上"窗口"这一维（weflow 用 `chatId`，形如 `weflow:<talker>`）。不改 `senderId`（bot 通道回复要用它当官方 openid），而是在 dsh 适配器的会话查找上引入会话作用域，避免动到回复路由与 canary 判定。
 4. **固定工作区**：机器人所有对话的 cwd 改成 `D:\Projects\cyberboss\user\cyberboss`（用户选定），不再按联系人名建 `user\<昵称>` 目录。
 5. **分组**：在 `~/.dsh/storages/workspace.json` 注册一个新 workspace，title `cyberboss 对话`、path 即上面的 cwd，并把机器人的会话 id 收进它的 `sessionIds`；仓库自己的 `cyberboss`（`D:\Projects\cyberboss`）分组不动。
@@ -45,8 +57,15 @@ Status: proposed
 
 ## Risks
 
-- **`session/resume` 真机可用性未验证**：只读了 `@deepseek-ai/dsh-acp` 的 README（声明支持"恢复已持久化且非活跃的会话"），没有实跑。若该 profile 下不可用，回退方案是"新建 + 由 GUI 收拢"，本方案的收益（不堆积）会打折。
-- **会话作用域是新增的隐式状态**：id 由窗口派生、又写回 `dsh-sessions.json`，中间态（映射存在但 DSH 库里没有该会话）必须由 resume 分支兜住，否则会出现"以为有历史、实际是空会话"。
-- **迁移期侧栏仍乱**：旧会话要等用户逐条确认后清理，期间新旧混排；`workspace.json` 是我们写 GUI 的持久化文件，写错会让分组异常（可回滚：备份后重写）。
-- **人工改名一次**：标题由 LLM 从首条消息生成、补丁关不掉，用户需在每个窗口各改一次；改完会被"钉住"，但若之后误触 `refresh()` 之类动作，名字可能重新生成。
-- **回滚条件**：若 resume 不可用或出现上下文串台（不同窗口共享历史），整体回退到"随机 id + 不隔离"，并只保留 cwd/分组/命名三项低风险改动。
+- **`session/resume` 在本机 DSH build 上不存在**（已实测）：文档描述的 ACP 面属于 `dsh-acp`，
+  而 sdk profile 挂的是 `dsh-sdk-app`，只服务 initialize/session/prompt/shutdown。因此"重生续接"
+  要么换成 ACP 面（路线 B），要么接受"重启即新会话"（路线 A/C）。
+- **会话作用域是新增的隐式状态**：id 由窗口派生、又写回 `dsh-sessions.json`，中间态（映射指向一个
+  已存在的会话）必须由 resume/回退分支兜住；回退**不得覆盖窗口的固定 id**（第一版覆盖过，已修）。
+- **硬杀进程会留下孤儿运行时**：`Stop-Process -Force` 杀掉 app 后，它的 dsh 子进程仍持有会话；
+  这既让 resume 必然被拒，也会让下一次启动的探测失真。重启要走服务脚本的优雅停止。
+- **迁移期侧栏仍乱**：旧会话要等用户逐条确认后清理；`workspace.json` 是 GUI 的持久化文件，
+  写错会让分组异常（可回滚：备份后重写）。
+- **人工改名一次**：标题由 LLM 从首条消息生成、补丁关不掉，用户需在每个窗口各改一次。
+- **回滚条件**：若"确定化 id"出现上下文串台或会话找不到，回退到随机 id（改动集中在 dsh 适配器与
+  session store 的会话作用域两个文件）。
