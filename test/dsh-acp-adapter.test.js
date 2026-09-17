@@ -391,6 +391,26 @@ test("prompt blocks carry text and only inline images", () => {
   );
 });
 
+test("an image on disk is inlined and anything else keeps its path visible", () => {
+  const state = makeState();
+  const pngPath = path.join(state.dir, "shot.png");
+  fs.writeFileSync(pngPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  const pdfPath = path.join(state.dir, "report.pdf");
+  fs.writeFileSync(pdfPath, "pdf");
+
+  assert.deepEqual(
+    buildAcpContentBlocks({
+      text: "看这张",
+      attachments: [{ absolutePath: pngPath }, { absolutePath: pdfPath }],
+    }),
+    [
+      { type: "text", text: "看这张" },
+      { type: "image", data: Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64"), mimeType: "image/png" },
+      { type: "text", text: `[attachment] ${pdfPath}` },
+    ],
+  );
+});
+
 test("the approval policy follows the configured access mode", () => {
   assert.equal(resolveAcpPermissionMode({ codexAccessMode: "full-access" }), "danger-full-access");
   assert.equal(resolveAcpPermissionMode({ codexAccessMode: "workspace-write" }), "workspace-write");

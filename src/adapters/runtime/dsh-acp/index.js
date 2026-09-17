@@ -32,7 +32,7 @@ const {
 } = require("./events");
 const { SessionStore } = require("../codex/session-store");
 const { buildOpeningTurnText, buildInstructionRefreshText } = require("../shared-instructions");
-const { resolveDshBin } = require("../dsh");
+const { resolveDshBin, isSupportedImageMime, imageMimeForPath } = require("../dsh");
 const {
   MODEL_CANARY_EXECUTION_POLICY,
 } = require("../../../integrations/weflow-model-canary");
@@ -221,6 +221,9 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
       try {
         await record.client.resumeSession(stored, { cwd: workspaceRoot });
         record.liveSessions.add(stored);
+        // Positive evidence matters here: a silent resume and a silent re-create
+        // look identical in the transcript until someone notices the lost history.
+        console.log(`[cyberboss] dsh-acp resumed session ${stored} for window ${conversationKey}`);
         return { sessionId: stored, resumed: true, opening: false };
       } catch (error) {
         console.warn(
@@ -462,22 +465,51 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
 }
 
 /**
- * ACP prompt blocks. Text is always a `text` block; an image becomes an `image`
- * block only when the caller supplied inline base64, because the client offers no
- * filesystem surface for the agent to read a path itself.
+ * ACP prompt blocks.
+ *
+ * Mirrors the sdk surface's admission rules so the ACP path loses nothing: an
+ * inline image becomes an `image` block, an image on disk is read and inlined
+ * (the client offers the agent no filesystem surface, so the agent could not read
+ * it itself), and anything else degrades to a text block naming the path rather
+ * than disappearing from the turn.
  */
-function buildAcpContentBlocks({ text = "", attachments = [] } = {}) {
+function buildAcpContentBlocks({ text = "", attachments = [], readFileSync = fs.readFileSync } = {}) {
   const blocks = [];
   const body = String(text || "");
   if (body.trim()) {
     blocks.push({ type: "text", text: body });
   }
   for (const attachment of Array.isArray(attachments) ? attachments : []) {
-    const data = normalizeText(attachment?.base64 || attachment?.data);
-    const mimeType = normalizeText(attachment?.mimeType || attachment?.contentType);
-    if (data && mimeType.startsWith("image/")) {
-      blocks.push({ type: "image", data, mimeType });
+    const absolutePath = normalizeText(attachment?.absolutePath || attachment?.filePath);
+    const declaredMime = normalizeText(attachment?.mimeType || attachment?.contentType).toLowerCase();
+    const inlineData = normalizeText(attachment?.data || attachment?.base64);
+
+    if (inlineData && isSupportedImageMime(declaredMime)) {
+      blocks.push({ type: "image", data: inlineData, mimeType: declaredMime });
+      continue;
     }
+    if (!absolutePath) {
+      continue;
+    }
+    const mime = isSupportedImageMime(declaredMime) ? declaredMime : imageMimeForPath(absolutePath);
+    if (isSupportedImageMime(mime)) {
+      let encoded = "";
+      try {
+        encoded = readFileSync(absolutePath).toString("base64");
+      } catch (error) {
+        // An unreadable image must not abort the turn: the text still has to reach
+        // the model, and the failure has to be visible.
+        console.error(
+          `[cyberboss] dsh-acp could not read image attachment ${absolutePath}: ${error?.message || error}`,
+        );
+        continue;
+      }
+      if (encoded) {
+        blocks.push({ type: "image", data: encoded, mimeType: mime });
+        continue;
+      }
+    }
+    blocks.push({ type: "text", text: `[attachment] ${absolutePath}` });
   }
   return blocks;
 }
