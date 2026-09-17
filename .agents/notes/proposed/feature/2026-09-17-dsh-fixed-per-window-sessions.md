@@ -26,9 +26,35 @@ Status: proposed
    因此"重启后复用同一段上下文"在当前 DSH build 上做不到，三个可选路线：
    - **A. 一个窗口一行（重启清空该行历史）**：新建会话前删掉该窗口的旧会话，侧栏永远只有一个窗口一行，
      代价是重启丢掉历史。改动最小。
-   - **B. 换 ACP 面**：让 sdk profile 改挂 `@deepseek-ai/dsh-acp`（它真的有 resume/list），
-     适配器的协议层（方法名、参数、事件映射）需要跟着重写。收益是既保留上下文、又能读会话标题。
+   - **B. 换 ACP 面（用户选定：彻底重构）**：让运行时改用 DSH 自带的 `acp` profile
+     （`@deepseek-ai/dsh-acp`）。**可行性已用探针验证**（`tmp/acp-probe.js`）：
+     `initialize` 返回 `sessionCapabilities {close, list, resume}`；`session/new` 由
+     **服务端**分配 id；**换进程 `session/resume` 后模型仍记得上一轮的内容**
+     （相位一让它记 4711，相位二在新进程里它复述出了那条消息）；会话持久化落在同一个
+     `~/.dsh/sessions`（侧栏共享）；profile 里也挂了 `session-title`（可读标题）。
    - **C. 维持现状**：保留确定化 id 与按窗口隔离，但每次重启多一行（上下文重置）。
+
+### B 的施工方案（零停机切换）
+
+1. **新适配器，不原地改**：新增 `src/adapters/runtime/dsh-acp/`，用 `CYBERBOSS_RUNTIME=dsh-acp`
+   选择；现有 `dsh/`（sdk 面）保持可用，直到新面通过真机验证再切默认值。旧面的测试全部保持绿。
+2. **协议层**（新 `rpc-client`）：`initialize`（protocolVersion + clientCapabilities + clientInfo）
+   → `session/new {cwd, mcpServers}` / `session/resume {sessionId, cwd}` / `session/prompt
+   {sessionId, prompt: ContentBlock[]}` / `session/list` / `session/close`；同时**应答 agent→client
+   的请求**（`session/request_permission`、fs/terminal），不能像探针那样一律拒绝。
+3. **id 与窗口的映射**：ACP 的 id 由服务端分配（uuid），所以"每窗口一个会话"靠既有的
+   `threadIdByConversationByRuntime` 记住（`getThreadIdForConversation` / `setThreadIdForConversation`
+   已经落地）；重生时先 `session/resume` 该 id，失败（会话不存在）才 `session/new` 并记住新 id。
+4. **事件映射**：ACP 的 `session/update`（`agent_message_chunk` / `agent_thought_chunk` /
+   `tool_call` / `tool_call_update` / `usage_update`）映射成 Cyberboss 既有的运行时事件；
+   ACP 没有 turn id，适配器按每次 prompt 自铸一个 turn id 并把它贴到该轮的所有事件上。
+5. **审批**：sdk 面用 HTTP approval endpoint，ACP 面是协议内的 `session/request_permission` ——
+   改由适配器在 stdio 上应答，复用同一个 `decideApprovalWithHelper` 与微信审批话术。
+6. **会话名**：`session/new` 之前无法命名（ACP 没有 rename），沿用"窗口名放进首条消息"的做法；
+   `session/list` 让我们可以**读**标题，用于核对与排查（用户仍可在 GUI 里改一次钉住）。
+7. **测试**：新增面自己的 rpc-client/events/adapter 套件；现有 `dsh-*` 测试不动（旧面保留）。
+8. **切换与回滚**：真机验证（两轮对话、重启后 resume 保留上下文、审批、图片、语音）通过后，
+   把 `CYBERBOSS_RUNTIME` 默认值切到 `dsh-acp`；出问题一条环境变量回退。
 3. **按窗口隔离**：会话查找键加上"窗口"这一维（weflow 用 `chatId`，形如 `weflow:<talker>`）。不改 `senderId`（bot 通道回复要用它当官方 openid），而是在 dsh 适配器的会话查找上引入会话作用域，避免动到回复路由与 canary 判定。
 4. **固定工作区**：机器人所有对话的 cwd 改成 `D:\Projects\cyberboss\user\cyberboss`（用户选定），不再按联系人名建 `user\<昵称>` 目录。
 5. **分组**：在 `~/.dsh/storages/workspace.json` 注册一个新 workspace，title `cyberboss 对话`、path 即上面的 cwd，并把机器人的会话 id 收进它的 `sessionIds`；仓库自己的 `cyberboss`（`D:\Projects\cyberboss`）分组不动。
