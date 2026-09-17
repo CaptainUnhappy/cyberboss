@@ -124,6 +124,32 @@ Status: proposed
 
 ## Risks
 
+### 切到 ACP 后真机发现的两处缺陷（已修）
+
+1. **长任务被客户端 60s 超时掐断**：ACP 的 `session/prompt` **在整轮结束时才返回**（响应里带
+   stopReason），而客户端默认 `requestTimeoutMs = 60s`，任何真任务都会超时；超时后在途的回复
+   永远不会送达。真机证据：Azzy 会话 12:19:24 的长任务（执行 skill）只发出 `处理中` 与
+   `【进度】`，12:20:49 出现 `❌ Request failed dsh request timed out: session/prompt`。
+   修法：`AcpRpcClient.prompt()` 用独立的 `promptTimeoutMs`（默认 30 分钟）。
+2. **同会话并发 prompt 被拒 → 整条消息没有回复**：ACP 一次只允许一个 prompt，
+   而后续消息（含重试）会撞上 `Invalid params: a prompt is already in flight for this session`，
+   应用侧重试到 `reply obligations reached no-reply timeout` 后放弃。
+   修法：适配器按会话串行化（`withSessionLock`），后来的轮次**排队等待**而不是失败；
+   turn 的注册与 `runtime.turn.started` 也放进锁内，避免排队的那一轮抢走事件路由。
+3. **失败通知发错会话**：handoff 失败的 `❌ Request failed` 通知只带 `provider`，没有会话路由，
+   于是回落到配置里的主会话（柳毓琳）。修法：复用既有的 `applyWeFlowInboundReplyRoute`，
+   让它跟随 `chatId` 回到出事的那个窗口。
+
+### 消息检查表（防自我回环）现状
+
+- 出站每条都在台账里（`ack`/`progress`/`final_reply`/canary 各有 kind），轮询观察到时按
+  `localId` 优先、`contentHash` 兜底匹配并消费；日志里 `echo consumed` 即该动作。
+- 实查当天全部服务日志：`echo consumed` 209 次、被判为人工输入的 outgoing **0 次** ——
+  没有发生"把自己的消息当输入"。
+- 残余风险：发送在客户端超时/结果不确定时（例如缺陷 1 的场景），localId 可能拿不到，
+  此时**只能**靠 contentHash 兜底；若同一内容在窗口内出现多次，匹配会退化为按时间候选。
+  加固方向（未做）：给超时发送记录"疑似已送达"的指纹并在观察窗口内优先消费。
+
 - **`session/resume` 在本机 DSH build 上不存在**（已实测）：文档描述的 ACP 面属于 `dsh-acp`，
   而 sdk profile 挂的是 `dsh-sdk-app`，只服务 initialize/session/prompt/shutdown。因此"重生续接"
   要么换成 ACP 面（路线 B），要么接受"重启即新会话"（路线 A/C）。

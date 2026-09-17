@@ -22,6 +22,13 @@ const {
 } = require("../dsh/rpc-client");
 
 const ACP_PROTOCOL_VERSION = 1;
+/**
+ * A `session/prompt` response arrives when the *turn* ends, not when it starts, so
+ * the default 60s request timeout would kill any real task. Turns are long by
+ * nature (a search or a skill run takes minutes), and the server refuses a second
+ * prompt for a session that is busy, so aborting early loses the answer entirely.
+ */
+const DEFAULT_PROMPT_TIMEOUT_MS = 30 * 60_000;
 /** The ACP server identifies itself by this name; there is no version negotiation. */
 const EXPECTED_AGENT_NAME = "deepseek-harness-acp";
 const DEFAULT_CLIENT_INFO = Object.freeze({ name: "cyberboss", version: "0.1.0" });
@@ -45,6 +52,7 @@ class AcpRpcClient extends DshRpcClient {
       : DEFAULT_CLIENT_INFO;
     this.agentCapabilities = null;
     this.agentInfo = null;
+    this.promptTimeoutMs = Number(options.promptTimeoutMs) || DEFAULT_PROMPT_TIMEOUT_MS;
   }
 
   async initialize() {
@@ -160,7 +168,7 @@ class AcpRpcClient extends DshRpcClient {
     return this.request("session/prompt", {
       sessionId: normalizedSessionId,
       prompt: promptBlocks,
-    });
+    }, { timeoutMs: this.promptTimeoutMs });
   }
 
   /**

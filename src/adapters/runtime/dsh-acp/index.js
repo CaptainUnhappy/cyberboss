@@ -133,6 +133,8 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
       /** requestId -> resolver waiting for the human's decision. */
       pendingApprovals: new Map(),
       pendingToolCalls: new Map(),
+      /** sessionId -> tail of that session's prompt chain (ACP allows one at a time). */
+      promptChainBySession: new Map(),
     };
 
     client.onNotification((method, params) => {
@@ -161,6 +163,34 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
 
     runtimes.set(normalizedRoot, record);
     return record;
+  }
+
+  /**
+   * Run one prompt per session at a time.
+   *
+   * ACP refuses a second concurrent prompt for the same session (`Invalid params:
+   * a prompt is already in flight for this session`), and the app's retry loop
+   * turns that refusal into "no reply at all" once the reply obligation times out.
+   * Waiting behind the running turn keeps the answered order and delivers every
+   * message instead of dropping the ones that arrived during a long task.
+   */
+  async function withSessionLock(record, sessionId, task) {
+    const previous = record.promptChainBySession.get(sessionId) || Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const entry = previous.then(() => gate, () => gate);
+    record.promptChainBySession.set(sessionId, entry);
+    try {
+      await previous.catch(() => {});
+      return await task();
+    } finally {
+      release();
+      if (record.promptChainBySession.get(sessionId) === entry) {
+        record.promptChainBySession.delete(sessionId);
+      }
+    }
   }
 
   /**
@@ -348,8 +378,6 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
         turnId,
         pendingToolCalls: record.pendingToolCalls,
       });
-      record.activeTurnBySession.set(sessionId, { turnId, mapper });
-      emit({ type: "runtime.turn.started", payload: { threadId: sessionId, turnId } });
 
       const body = opening
         // A brand-new session has no history, so the persona travels in the
@@ -361,12 +389,17 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
         : text;
       const blocks = buildAcpContentBlocks({ text: body, attachments });
       if (blocks.length === 0) {
-        record.activeTurnBySession.delete(sessionId);
         throw new Error("dsh-acp turn requires text or an attachment");
       }
 
       try {
-        await record.client.prompt(sessionId, blocks);
+        // The turn is announced and registered only once it owns the session, so a
+        // queued turn cannot steal the running turn's event routing.
+        await withSessionLock(record, sessionId, async () => {
+          record.activeTurnBySession.set(sessionId, { turnId, mapper });
+          emit({ type: "runtime.turn.started", payload: { threadId: sessionId, turnId } });
+          await record.client.prompt(sessionId, blocks);
+        });
       } catch (error) {
         record.activeTurnBySession.delete(sessionId);
         emitAll(mapper.finish({ failed: true, reason: error?.message || String(error) }));

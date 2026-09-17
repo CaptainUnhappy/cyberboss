@@ -349,8 +349,7 @@ test("cancelTurn cancels the session instead of killing the runtime", async () =
   assert.deepEqual(cancel.params, { sessionId: "srv-1" });
 });
 
-test("startFreshThreadDraft forgets the window's session so the next turn creates one", async () => {
-  const state = makeState();
+test("startFreshThreadDraft forgets the window's session so the next turn creates one", async () => {  const state = makeState();
   const fake = makeFakeClient();
   const adapter = makeAdapter(state, fake);
   const bindingKey = bindingKeyOf(adapter);
@@ -415,6 +414,38 @@ test("the approval policy follows the configured access mode", () => {
   assert.equal(resolveAcpPermissionMode({ codexAccessMode: "full-access" }), "danger-full-access");
   assert.equal(resolveAcpPermissionMode({ codexAccessMode: "workspace-write" }), "workspace-write");
   assert.equal(resolveAcpPermissionMode({}), "workspace-write");
+});
+
+test("a second turn for the same session waits instead of racing the server", async () => {
+  const state = makeState();
+  const fake = makeFakeClient();
+  const adapter = makeAdapter(state, fake);
+  const bindingKey = bindingKeyOf(adapter);
+  const metadata = { conversationKey: "weflow:azzy" };
+
+  const order = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  fake.client.prompt = async (sessionId, blocks) => {
+    order.push(`start:${blocks[0].text}`);
+    if (order.length === 1) {
+      await firstGate;
+    }
+    order.push(`end:${blocks[0].text}`);
+    return { stopReason: "end_turn" };
+  };
+
+  const first = adapter.sendTurn({ bindingKey, workspaceRoot: state.workspace, text: "第一条", metadata });
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = adapter.sendTurn({ bindingKey, workspaceRoot: state.workspace, text: "第二条", metadata });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(order, ["start:第一条"], "ACP refuses a concurrent prompt, so the second must wait");
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ["start:第一条", "end:第一条", "start:第二条", "end:第二条"]);
 });
 
 test("describe() reports the ACP surface honestly", () => {

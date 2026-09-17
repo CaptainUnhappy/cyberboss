@@ -2013,12 +2013,12 @@ class CyberbossApp {
         console.error(`[cyberboss] repeated runtime handoff failure reply suppressed: ${messageText}`);
         return false;
       }
-      await this.channelAdapter.sendText({
+      await this.channelAdapter.sendText(applyWeFlowInboundReplyRoute({
         userId: prepared.senderId,
         text: `❌ Request failed\n${messageText}`,
         contextToken: prepared.contextToken,
         provider: prepared.provider,
-      }).catch(() => {});
+      }, prepared)).catch(() => {});
       return false;
     }
   }
