@@ -51,6 +51,17 @@ Status: proposed
   -32601、处理器抛错回 -32603、shutdown 不发 shutdown 请求。加上原 sdk 面 16 例，共 27 例全绿。
 - 真机（`tmp/acp-client-check.js`）：新进程建会话 `c443a1ee-…` → 模型回"已记住"；
   **换进程 `session/resume` 后问同一个问题，模型回 `8102` 并打印 `CONTEXT PRESERVED`（exit 0）**。
+- 事件映射 `src/adapters/runtime/dsh-acp/events.js`：ACP 只有 chunk、没有"消息完成"事件，
+  所以用一个有状态的 `AcpTurnMapper` 在边界处聚合——工具调用前的文本按 `commentary` 冲刷
+  （sdk 面同样用"这条消息还带工具调用就不可能是终答"的判据），轮末冲刷为 `final_answer`
+  并补 `runtime.turn.completed`（失败则 `runtime.turn.failed` + 原因）；`agent_thought_chunk`／
+  `usage_update`／`tool_call_update` 丢弃；`session_info_update.title` 映射为
+  `runtime.context.updated`（这就是"可读标题"的入口）。审批侧：`mapPermissionRequest` 把 ACP 的
+  权限请求翻成既有的审批载荷，`selectPermissionOption` **按 kind 而不是按位置**选选项
+  （allow_once 优先于 allow_always），拿不到可用选项时回 `cancelled` 而不是假装已决定。
+- 测试 `test/dsh-acp-events.test.js`（12 例）：聚合与去重、工具调用前的 interim、itemId 稳定、
+  忽略项、标题映射、失败轮、空轮、权限请求翻译、按 kind 选选项、无选项即取消、决定载荷。
+  ACP 面合计 23 例，`npm run check` 已纳入两个新文件。
 
 1. **新适配器，不原地改**：新增 `src/adapters/runtime/dsh-acp/`，用 `CYBERBOSS_RUNTIME=dsh-acp`
    选择；现有 `dsh/`（sdk 面）保持可用，直到新面通过真机验证再切默认值。旧面的测试全部保持绿。
