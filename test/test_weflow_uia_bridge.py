@@ -2403,6 +2403,112 @@ class WeFlowUiaImageBridgeTests(unittest.TestCase):
 
         self.assertEqual(lifecycle, ["initialize", "uninitialize"])
 
+    def test_text_dispatch_returns_the_foreground_around_the_gui_work(self) -> None:
+        events: list[str] = []
+        self.state.fetch_messages = mock.Mock(return_value=[])
+        self.state._dispatch_text = mock.Mock(side_effect=RuntimeError("fixture UIA failure"))
+
+        @contextmanager
+        def recording_return():
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        with mock.patch.object(BRIDGE, "foreground_return", recording_return):
+            with self.assertRaisesRegex(RuntimeError, "fixture UIA failure"):
+                self.state.dispatch_and_verify(
+                    "fixture-contact",
+                    "fixture-talker",
+                    "fixture-text",
+                    1,
+                )
+
+        # The window goes back even when the dispatch raises: a failed reply must
+        # not leave Weixin holding the user's focus either.
+        self.assertEqual(events, ["enter", "exit"])
+
+    def test_image_dispatch_returns_the_foreground_around_the_gui_work(self) -> None:
+        target, _payload, digest = self.make_png()
+        events: list[str] = []
+        self.state.fetch_messages = mock.Mock(return_value=[])
+        self.state._dispatch_image = mock.Mock(side_effect=RuntimeError("fixture image failure"))
+
+        @contextmanager
+        def recording_return():
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        with mock.patch.object(BRIDGE, "foreground_return", recording_return):
+            with self.assertRaisesRegex(RuntimeError, "fixture image failure"):
+                self.state.dispatch_image_and_verify(
+                    "fixture-contact",
+                    "fixture-talker",
+                    str(target),
+                    digest,
+                    1,
+                )
+
+        self.assertEqual(events, ["enter", "exit"])
+
+
+class ForegroundReturnTests(unittest.TestCase):
+    """A reply must give the desktop back to whoever was using it."""
+
+    def test_restore_skips_an_empty_or_unchanged_foreground(self) -> None:
+        user32 = BRIDGE.ctypes.windll.user32
+        with mock.patch.object(user32, "GetForegroundWindow", return_value=99), \
+                mock.patch.object(user32, "SetForegroundWindow") as set_foreground:
+            self.assertFalse(BRIDGE.restore_foreground_window(0))
+            self.assertFalse(BRIDGE.restore_foreground_window(99))
+
+        set_foreground.assert_not_called()
+
+    def test_restore_skips_a_window_that_is_gone(self) -> None:
+        user32 = BRIDGE.ctypes.windll.user32
+        with mock.patch.object(user32, "GetForegroundWindow", return_value=7), \
+                mock.patch.object(user32, "IsWindow", return_value=False), \
+                mock.patch.object(user32, "SetForegroundWindow") as set_foreground:
+            self.assertFalse(BRIDGE.restore_foreground_window(42))
+
+        set_foreground.assert_not_called()
+
+    def test_restore_reactivates_the_previous_window(self) -> None:
+        user32 = BRIDGE.ctypes.windll.user32
+        with mock.patch.object(user32, "IsWindow", return_value=True), \
+                mock.patch.object(user32, "IsIconic", return_value=True), \
+                mock.patch.object(user32, "GetForegroundWindow", side_effect=[7, 42, 42]), \
+                mock.patch.object(user32, "GetWindowThreadProcessId", return_value=0), \
+                mock.patch.object(user32, "ShowWindow") as show, \
+                mock.patch.object(user32, "SetForegroundWindow") as set_foreground:
+            self.assertTrue(BRIDGE.restore_foreground_window(42))
+
+        show.assert_called_once_with(42, BRIDGE.SW_RESTORE)
+        set_foreground.assert_called_once_with(42)
+
+    def test_restore_never_raises_when_windows_refuses_it(self) -> None:
+        user32 = BRIDGE.ctypes.windll.user32
+        with mock.patch.object(user32, "IsWindow", side_effect=OSError("fixture failure")):
+            self.assertFalse(BRIDGE.restore_foreground_window(42))
+
+    def test_foreground_return_restores_after_a_failed_dispatch(self) -> None:
+        restored: list[int] = []
+        with mock.patch.object(BRIDGE, "current_foreground_window", return_value=1234), \
+                mock.patch.object(
+                    BRIDGE,
+                    "restore_foreground_window",
+                    side_effect=lambda handle: restored.append(handle) or True,
+                ):
+            with self.assertRaisesRegex(BRIDGE.TargetNotConfirmedError, "no proof"):
+                with BRIDGE.foreground_return():
+                    raise BRIDGE.TargetNotConfirmedError("no proof")
+
+        self.assertEqual(restored, [1234])
+
 
 class ContactRowIdentityTests(unittest.TestCase):
     """Weixin labels rows with the display name (the remark whenever one is set),

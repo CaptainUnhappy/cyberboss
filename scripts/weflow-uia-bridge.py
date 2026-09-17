@@ -317,6 +317,60 @@ def activate_window(handle: int) -> None:
             user32.AttachThreadInput(current_thread, foreground_thread, False)
 
 
+def current_foreground_window() -> int:
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return 0
+
+
+def restore_foreground_window(handle: int) -> bool:
+    """Hand the foreground back to the window the user was working in.
+
+    Driving Weixin means activating it, and it stays in front afterwards - that
+    stolen focus is the one side effect a reply should not leave behind.  The
+    restore is best effort: Windows may refuse SetForegroundWindow for a process
+    that does not own the current foreground, the previous window may be gone,
+    and neither may fail a reply that already reached the chat.
+    """
+    if not handle:
+        return False
+    user32 = ctypes.windll.user32
+    try:
+        if not user32.IsWindow(handle) or user32.GetForegroundWindow() == handle:
+            return False
+        foreground = user32.GetForegroundWindow()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+        current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+        attached = bool(foreground_thread and foreground_thread != current_thread)
+        if attached:
+            user32.AttachThreadInput(current_thread, foreground_thread, True)
+        try:
+            if user32.IsIconic(handle):
+                user32.ShowWindow(handle, SW_RESTORE)
+            user32.SetForegroundWindow(handle)
+            return user32.GetForegroundWindow() == handle
+        finally:
+            if attached:
+                user32.AttachThreadInput(current_thread, foreground_thread, False)
+    except Exception:
+        return False
+
+
+@contextmanager
+def foreground_return():
+    """Restore the pre-dispatch foreground once the GUI work is done.
+
+    Verification only reads WeFlow's local API, so the window is given back
+    before the (possibly multi-second) confirmation poll rather than after it.
+    """
+    previous = current_foreground_window()
+    try:
+        yield
+    finally:
+        restore_foreground_window(previous)
+
+
 def normalize_text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
@@ -2355,7 +2409,7 @@ class BridgeState:
                 baseline_available = False
                 before = set()
             dispatched_after = int(time.time()) - 2
-            with uia_com_apartment():
+            with foreground_return(), uia_com_apartment():
                 if desktop_input_lease_request is not None or desktop_input_lease is not None:
                     target = self._dispatch_text(
                         contact,
@@ -2516,7 +2570,7 @@ class BridgeState:
                 before = set()
 
             dispatched_after = int(time.time()) - 2
-            with uia_com_apartment():
+            with foreground_return(), uia_com_apartment():
                 self._dispatch_image(contact, image_bytes)
             deadline = time.monotonic() + max(1.0, timeout)
             last_error = ""
