@@ -36,6 +36,22 @@ Status: proposed
 
 ### B 的施工方案（零停机切换）
 
+**进度（本轮）**：第 1 步"协议层"已完成并真机验证。
+
+- 新增 `src/adapters/runtime/dsh-acp/rpc-client.js`：`AcpRpcClient extends DshRpcClient`，
+  只换方法语义（`initialize` 带 protocolVersion/clientCapabilities/clientInfo 并校验
+  `agentInfo.name === deepseek-harness-acp`；`session/new` 取服务端分配的 id；
+  `session/resume`；`session/list`（收敛为 sessionId/cwd/title/updatedAt）；`session/close`；
+  `prompt` 用 ACP 的 `prompt` 参数名；`shutdown` 改为关闭 stdin，因为 ACP 没有 shutdown 方法）。
+- 父类补上"agent→client 请求"通道（`onRequest` / `respond` / `handleIncomingRequest`）：
+  ACP 的 `session/request_permission` 必须有应答，未注册的方法回 `-32601` 而不是沉默
+  （沉默会让 agent 一直等）。
+- 测试 `test/dsh-acp-rpc-client.test.js`（11 例）：握手参数与身份校验、服务端分配 id、
+  prompt 参数名、resume 参数、list 收敛、agent 请求到达处理器并被应答、未注册方法回
+  -32601、处理器抛错回 -32603、shutdown 不发 shutdown 请求。加上原 sdk 面 16 例，共 27 例全绿。
+- 真机（`tmp/acp-client-check.js`）：新进程建会话 `c443a1ee-…` → 模型回"已记住"；
+  **换进程 `session/resume` 后问同一个问题，模型回 `8102` 并打印 `CONTEXT PRESERVED`（exit 0）**。
+
 1. **新适配器，不原地改**：新增 `src/adapters/runtime/dsh-acp/`，用 `CYBERBOSS_RUNTIME=dsh-acp`
    选择；现有 `dsh/`（sdk 面）保持可用，直到新面通过真机验证再切默认值。旧面的测试全部保持绿。
 2. **协议层**（新 `rpc-client`）：`initialize`（protocolVersion + clientCapabilities + clientInfo）

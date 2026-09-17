@@ -94,6 +94,8 @@ class DshRpcClient {
     this.nextRequestId = 1;
     this.pending = new Map();
     this.notificationListeners = new Set();
+    /** method -> handler for requests the agent sends to this client. */
+    this.requestHandlers = new Map();
     this.exitListeners = new Set();
     this.stdoutBuffer = "";
     this.stderrTail = "";
@@ -215,6 +217,12 @@ class DshRpcClient {
       }
       return;
     }
+    if (frame && frame.id != null && frame.method) {
+      // The agent calling *us*: ACP clients must answer (a permission prompt left
+      // unanswered hangs the turn). The sdk surface never sends these.
+      this.handleIncomingRequest(frame);
+      return;
+    }
     if (frame && frame.method) {
       for (const listener of this.notificationListeners) {
         try {
@@ -224,6 +232,58 @@ class DshRpcClient {
         }
       }
     }
+  }
+
+  /**
+   * Answer an agent -> client request.
+   *
+   * An unhandled method is answered with `-32601` rather than silence: silence is
+   * indistinguishable from a slow client and would stall the agent.
+   */
+  handleIncomingRequest(frame) {
+    const handler = this.requestHandlers.get(frame.method);
+    if (typeof handler !== "function") {
+      this.respond(frame.id, {
+        error: { code: -32601, message: `client does not implement ${frame.method}` },
+      });
+      return;
+    }
+    Promise.resolve()
+      .then(() => handler(frame.params || {}))
+      .then((result) => this.respond(frame.id, { result: result === undefined ? null : result }))
+      .catch((error) => this.respond(frame.id, {
+        error: {
+          code: Number.isInteger(error?.code) ? error.code : -32603,
+          message: String(error?.message || error),
+        },
+      }));
+  }
+
+  respond(id, { result, error } = {}) {
+    if (!this.isRunning()) {
+      return false;
+    }
+    const frame = { jsonrpc: "2.0", id };
+    if (error) {
+      frame.error = error;
+    } else {
+      frame.result = result === undefined ? null : result;
+    }
+    try {
+      this.child.stdin.write(`${JSON.stringify(frame)}\n`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  onRequest(method, handler) {
+    const name = normalizeText(method);
+    if (!name || typeof handler !== "function") {
+      return () => {};
+    }
+    this.requestHandlers.set(name, handler);
+    return () => this.requestHandlers.delete(name);
   }
 
   rejectAllPending(error) {
