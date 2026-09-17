@@ -259,6 +259,27 @@ class DshRpcClient {
       }));
   }
 
+  /**
+   * Send a JSON-RPC notification (no id, no reply). ACP uses these for
+   * `session/cancel`, where waiting for a response would be wrong.
+   */
+  notify(method, params) {
+    const name = normalizeText(method);
+    if (!name || !this.isRunning()) {
+      return false;
+    }
+    const frame = { jsonrpc: "2.0", method: name };
+    if (params !== undefined) {
+      frame.params = params;
+    }
+    try {
+      this.child.stdin.write(`${JSON.stringify(frame)}\n`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   respond(id, { result, error } = {}) {
     if (!this.isRunning()) {
       return false;

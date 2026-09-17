@@ -8,6 +8,7 @@ const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin
 const { createCodexRuntimeAdapter } = require("../adapters/runtime/codex");
 const { createClaudeCodeRuntimeAdapter } = require("../adapters/runtime/claudecode");
 const { createDshRuntimeAdapter } = require("../adapters/runtime/dsh");
+const { createDshAcpRuntimeAdapter } = require("../adapters/runtime/dsh-acp");
 const { findModelByQuery } = require("../adapters/runtime/codex/model-catalog");
 const { createTimelineIntegration } = require("../integrations/timeline");
 const {
@@ -102,6 +103,11 @@ const SILENT_DELIVERY_POLICY = "silent";
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
     return createClaudeCodeRuntimeAdapter(config);
+  }
+  if (config.runtime === "dsh-acp") {
+    // The ACP surface keeps one resumable session per chat window; the legacy
+    // `dsh` surface stays available for a one-variable rollback.
+    return createDshAcpRuntimeAdapter(config);
   }
   if (config.runtime === "dsh") {
     return createDshRuntimeAdapter(config);

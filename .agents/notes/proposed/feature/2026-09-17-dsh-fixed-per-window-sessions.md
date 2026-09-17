@@ -36,7 +36,21 @@ Status: proposed
 
 ### B 的施工方案（零停机切换）
 
-**进度（本轮）**：第 1 步"协议层"已完成并真机验证。
+**进度**：第 1 步"协议层"（真机验证 `CONTEXT PRESERVED`）、第 2 步"事件映射"、第 3 步"适配器主体"
+已完成；`CYBERBOSS_RUNTIME=dsh-acp` 已接线，真机端到端与切默认值待第 5 步。
+
+适配器（`src/adapters/runtime/dsh-acp/index.js`）与 sdk 面的三处行为差异：
+- **每窗口一个可 resume 的会话**：会话 id 由 ACP 服务端分配，存进既有的窗口级槽位
+  （`getThreadIdForConversation`）；下一轮先查"本进程是否已活跃"（活跃会话不能被 resume，
+  也不该新建），否则 `session/resume`，失败才 `session/new` 并把新 id 写回该窗口。
+- **审批走协议内请求**：`session/request_permission` 由适配器应答（sdk 面只能回 `false`）；
+  决定经 `respondApproval` 解析，选项**按 kind 选**，超时或拿不到选项一律 `cancelled`（fail closed）。
+- **取消只取消该轮**：发 `session/cancel` 通知，而不是杀掉整个工作区运行时（sdk 面会连带
+  放弃同工作区的其它轮）。
+另：`createClient` 可注入（测试缝），审批策略按访问模式映射（`full-access` → `never`）。
+测试 `test/dsh-acp-adapter.test.js` 14 例：首轮建会话并按窗口记住、同进程复用且不重发 persona、
+换进程 resume 而不是新建、resume 失败则新建并更新窗口 id、两窗口互不串、更新映射带 turn id、
+失败轮、审批往返、未知审批请求、cancel 发通知、draft 清空窗口 id、prompt 块、策略映射、describe。
 
 - 新增 `src/adapters/runtime/dsh-acp/rpc-client.js`：`AcpRpcClient extends DshRpcClient`，
   只换方法语义（`initialize` 带 protocolVersion/clientCapabilities/clientInfo 并校验
