@@ -30,7 +30,9 @@ async function main() {
   const runId = `${formatCompactUtc(new Date())}-${crypto.randomBytes(5).toString("hex")}`;
   const marker = `E2E_OK_${runId}`;
   const triggerText = [
-    `Cyberboss 同号人工控制消息端到端测试 ${runId}。`,
+    // Development and debugging traffic must land in the reserved `test-session`,
+    // never in a real window's conversation: the marker is what routes it there.
+    `[test] Cyberboss 同号人工控制消息端到端测试 ${runId}。`,
     `请简短回复，并确保最终回复原样包含唯一标记：${marker}`,
   ].join(" ");
 

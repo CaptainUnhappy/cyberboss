@@ -3986,6 +3986,13 @@ function isTestSessionRequest(text) {
  * never mixes into a real conversation's context.
  */
 function resolveConversationKeyForPrepared(prepared = {}) {
+  // Derived from the message content, not from a parallel field: the inbound
+  // travels through several strict field lists (pending queue, prepared clone)
+  // that silently drop anything not on their list, while the text itself always
+  // survives. A `[test]` marker therefore cannot be lost on the way.
+  if (preparedRequestsTestSession(prepared)) {
+    return TEST_SESSION_KEY;
+  }
   const scope = normalizeText(prepared.sessionScope);
   if (scope) {
     return scope;
@@ -3993,7 +4000,17 @@ function resolveConversationKeyForPrepared(prepared = {}) {
   return normalizeText(prepared.chatId);
 }
 
+function preparedRequestsTestSession(prepared = {}) {
+  return isTestSessionRequest(prepared.contentText)
+    || isTestSessionRequest(prepared.originalText)
+    || isTestSessionRequest(prepared.text)
+    || normalizeText(prepared.sessionScope) === TEST_SESSION_KEY;
+}
+
 function resolveSessionNameForPrepared(config = {}, prepared = {}) {
+  if (preparedRequestsTestSession(prepared)) {
+    return TEST_SESSION_KEY;
+  }
   const scope = normalizeText(prepared.sessionScope);
   if (scope) {
     return scope;

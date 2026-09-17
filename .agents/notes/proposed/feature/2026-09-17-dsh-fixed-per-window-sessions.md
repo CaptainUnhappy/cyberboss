@@ -124,6 +124,22 @@ Status: proposed
 
 ## Risks
 
+### 开发调试必须走 test-session（标记从内容判定，不靠并行字段）
+
+规则：任何开发/调试流量（含自动化 E2E 脚本）都要带 `[test]` 标记，那一轮进保留的
+`test-session`，真实窗口的会话不被污染。
+
+实现上踩过一次坑：第一版把判定结果放在 `normalized.sessionScope` 这个并行字段上，真机却发现
+它到不了运行时 —— 入站要穿过**多处严格字段表**（待处理队列的重建、prepared 的 clone），
+任何不在表里的字段都被静默丢掉（连我临时加的哨兵字段也一样消失）。查证过程：
+`pending-inbound-store` 的字段表补了 `sessionScope` 仍然无效，最后用哨兵字段证明"丢的是所有
+未登记字段"。
+所以判定改为**从消息内容派生**：`preparedRequestsTestSession()` 看
+`contentText`/`originalText`/`text` 里的 `[test]`（文本是唯一一定会活到终点的东西），
+`resolveConversationKeyForPrepared` 与 `resolveSessionNameForPrepared` 都用它。
+真机验证：发 `[test] …` 后绑定出现 `test-session -> 984d9210-…`，窗口键
+`weflow:wxid_s3178hwvzsl922` 仍指向原会话，未被覆盖。
+
 ### 切到 ACP 后真机发现的两处缺陷（已修）
 
 1. **长任务被客户端 60s 超时掐断**：ACP 的 `session/prompt` **在整轮结束时才返回**（响应里带

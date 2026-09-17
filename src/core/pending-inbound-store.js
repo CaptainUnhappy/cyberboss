@@ -754,6 +754,10 @@ function normalizeMessage(raw, { scopeKey = "", nowMs = Date.now() } = {}) {
     sourceMessageIds: normalizeSourceMessageIds(raw.sourceMessageIds),
     contextToken: normalizeText(raw.contextToken),
     provider,
+    // Which session the turn belongs to (`test-session` for `[test]` traffic).
+    // The queue rebuilds every inbound through this list, so a field missing here
+    // is a field the runtime never sees - regardless of who set it upstream.
+    sessionScope: normalizeText(raw.sessionScope),
     deliveryPolicy: normalizeText(raw.deliveryPolicy),
     originalText,
     text,
