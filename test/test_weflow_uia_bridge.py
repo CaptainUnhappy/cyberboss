@@ -2431,5 +2431,30 @@ class ContactRowIdentityTests(unittest.TestCase):
         self.assertFalse(BRIDGE.chat_input_name_matches_contact('yourself', '柳毓琳'))
 
 
+class SendWhitelistTests(unittest.TestCase):
+    """Only whitelisted talkers may be dispatched to; empty whitelist = unrestricted."""
+
+    def test_parse_splits_on_commas_semicolons_and_whitespace(self):
+        parsed = BRIDGE.parse_allowed_talkers("wxid_a,wxid_b; wxid_c\nwxid_d")
+        self.assertEqual(parsed, ("wxid_a", "wxid_b", "wxid_c", "wxid_d"))
+
+    def test_parse_dedupes_and_drops_blanks(self):
+        self.assertEqual(BRIDGE.parse_allowed_talkers(" wxid_a , ,wxid_a, wxid_b "), ("wxid_a", "wxid_b"))
+
+    def test_non_string_input_yields_empty_whitelist(self):
+        self.assertEqual(BRIDGE.parse_allowed_talkers(None), ())
+        self.assertEqual(BRIDGE.parse_allowed_talkers(42), ())
+
+    def test_empty_whitelist_allows_everything(self):
+        self.assertTrue(BRIDGE.talker_is_allowed((), "wxid_anything"))
+
+    def test_non_empty_whitelist_is_exact_match(self):
+        allowed = ("wxid_ubo0cy5xh4px22", "wxid_s3178hwvzsl922")
+        self.assertTrue(BRIDGE.talker_is_allowed(allowed, "wxid_ubo0cy5xh4px22"))
+        self.assertFalse(BRIDGE.talker_is_allowed(allowed, "wxid_ty69l7hjiqt012"))
+        self.assertFalse(BRIDGE.talker_is_allowed(allowed, ""))
+        self.assertFalse(BRIDGE.talker_is_allowed(allowed, "wxid_ubo0cy5xh4px22extra"))
+
+
 if __name__ == "__main__":
     unittest.main()

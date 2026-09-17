@@ -328,6 +328,25 @@ def env_truthy(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def parse_allowed_talkers(value: Any) -> tuple[str, ...]:
+    """Parse the send whitelist (comma / semicolon / whitespace separated)."""
+    if not isinstance(value, str):
+        return ()
+    parsed: list[str] = []
+    for chunk in re.split(r"[,;\s]+", value):
+        item = chunk.strip()
+        if item and item not in parsed:
+            parsed.append(item)
+    return tuple(parsed)
+
+
+def talker_is_allowed(allowed: tuple[str, ...], talker: str) -> bool:
+    """Empty whitelist means unrestricted (previous behaviour); else exact match."""
+    if not allowed:
+        return True
+    return normalize_text(talker) in allowed
+
+
 def first_name_line(value: Any) -> str:
     return normalize_text(value).splitlines()[0].strip() if normalize_text(value) else ""
 
@@ -1797,6 +1816,9 @@ class BridgeState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.weflow_base_url = args.weflow_base_url.rstrip("/")
         self.weflow_token = args.weflow_token
+        self.allowed_talkers = parse_allowed_talkers(
+            getattr(args, "allowed_talkers", "")
+        )
         self.state_file = Path(args.state_file)
         self.desktop_input_lease_dir = (
             self.state_file.parent / MODEL_CANARY_LEASE_DIRECTORY
@@ -2881,6 +2903,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     )
                 if not contact or not talker or not text.strip():
                     raise ValueError("contact, talker, and text are required")
+                if not talker_is_allowed(self.state.allowed_talkers, talker):
+                    self.send_json(403, {
+                        "dispatched": False,
+                        "code": "TALKER_NOT_ALLOWED",
+                        "error": f"talker {talker!r} is not in the configured send whitelist",
+                        "allowedTalkerCount": len(self.state.allowed_talkers),
+                    })
+                    return
                 resolved = self.state.resolve_target_names(contact, talker)
                 if resolved is not None:
                     if exact_contact:
@@ -2926,6 +2956,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 timeout = float(payload.get("timeout", 30))
                 if not contact or not talker or not file_path or not expected_sha256:
                     raise ValueError("contact, talker, filePath, and sha256 are required")
+                if not talker_is_allowed(self.state.allowed_talkers, talker):
+                    self.send_json(403, {
+                        "dispatched": False,
+                        "code": "TALKER_NOT_ALLOWED",
+                        "error": f"talker {talker!r} is not in the configured send whitelist",
+                        "allowedTalkerCount": len(self.state.allowed_talkers),
+                    })
+                    return
                 resolved_image = self.state.resolve_target_names(contact, talker)
                 if resolved_image is not None:
                     contact = resolved_image["rowName"]
@@ -3002,6 +3040,11 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("CYBERBOSS_WEFLOW_BASE_URL", "http://127.0.0.1:5031"),
     )
     parser.add_argument("--weflow-token", default=os.environ.get("CYBERBOSS_WEFLOW_TOKEN", ""))
+    parser.add_argument(
+        "--allowed-talkers",
+        default=os.environ.get("CYBERBOSS_WEFLOW_ALLOWED_TALKERS", ""),
+        help="comma separated talker (wxid) whitelist; empty means unrestricted",
+    )
     parser.add_argument(
         "--state-file",
         default=str(state_dir / "weflow-send-source.json"),
