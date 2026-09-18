@@ -2,6 +2,52 @@
 
 夸克桌面客户端**没有 CLI、没有本地 HTTP API、也没有"打开网盘路径"的 URL 协议**（它注册的处理器只会把分享链接丢进内置浏览器）。想自动化就只能驱动它的窗口。这个工具把这件事包成一条 CLI，并且**每一步都自证**（打印机器可读的状态行），所以失败时能直接看出是哪一层没生效。
 
+## 已验证可用的两条驱动通道（2026-09-18）
+
+| 通道 | 适用对象 | 做法 | 状态 |
+|---|---|---|---|
+| **CDP（首选）** | 客户端的**网页层**：主窗口 `index.html`、分享对话框 `share-link-window`、设置窗、收银台 | 客户端以 `--remote-debugging-port=9222` 启动后，用 `cdp-ops.js` 读 DOM、勾选、点按钮；点击用 **`Input.dispatchMouseEvent`（真实输入事件）**，不是 `element.click()` | ✅ 已成 CLI |
+| **窗口消息/真鼠标（备选）** | **原生层**：窗口、保存目录对话框「选择文件」、Flutter 播放器 | `quarkctl.py` 的 `windows` / `clickwin` / `click` / `picker`；**坐标必须是"窗口客户区坐标"**（`client_origin` 不等于 (0,0) 时尤其注意） | ✅ 已成 CLI |
+
+> **踩坑记录（两条最贵的）**
+> 1. **坐标语义搞错**：`clickwin --x/--y` 是**客户区坐标**。分享窗 `rect=(190,66,1090,686)`、保存按钮 DOM 在 `client (777,568,103x32)` ⇒ 应传 **client (829,584)**，而不是屏幕 (1019,650) 或别的估计值。修正后一击命中。
+> 2. **页面里"点元素"不等于"用户点击"**：`el.click()` 对 Quark 的 React 组件**无效**（保存按钮实测无反应）；必须走 CDP `Input.dispatchMouseEvent` 或窗口级真实鼠标事件。
+
+## 快速开始（CDP 通道）
+
+```bash
+cd /d D:\Projects\cyberboss\tools\quark-cli
+
+node cdp-ops.js list-targets                 # 有哪些页面
+node cdp-ops.js share-info                   # 分享窗：分享者/文件列表/保存按钮/AX 提示
+node cdp-ops.js share-enter --name 跨境电商    # 双击进入分享里的文件夹
+node cdp-ops.js share-select --name .pdf --only   # 只勾选 PDF（--only 会取消其它勾选）
+node cdp-ops.js share-save                   # 点「保存」并回报按钮状态与提示
+node cdp-ops.js main-open-saveas             # 主页面切到「转存的内容」
+node cdp-ops.js main-refresh                 # 点列表刷新控件，再读回列表长度
+node cdp-ops.js main-list --filter 夸克网盘免费  # 在转存内容里找条目（含文本命中）
+node cdp-ops.js main-click-button --text 下载   # 点工具栏按钮（按文字定位，不靠坐标）
+```
+
+辅助脚本：`cdp-drive.js`（`list/frames/dom/text/click/eval/ax/axclick`）、`cdp-ax-click.js`（按**无障碍名**定位并派发真实鼠标事件，支持 `dbl` 双击）、`cdp-eval-file.js`（把 JS 文件注入页面执行，避免 shell 转义把 `\s` 之类吃掉）。
+
+## 端到端配方（分享链接 → 只要其中一个 PDF）
+
+```
+1) 隔离会话里带调试端口启动客户端（从 session 1 启动；会话内 schtasks 会被拒）
+   Stop-Process -Name quark_cloud_drive -Force
+   Start-Process 'D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe' -ArgumentList '--remote-debugging-port=9222','<分享链接>'
+2) node cdp-ops.js share-info                    # 看列表：条数是"当前目录"的条目
+3) node cdp-ops.js share-enter --name <文件夹名>  # 若列表里是文件夹，先双击进去
+4) node cdp-ops.js share-select --name .pdf --only
+5) node cdp-ops.js share-save                    # 成功判据：转存内容里出现该条目
+6) node cdp-ops.js main-open-saveas && node cdp-ops.js main-refresh
+7) node cdp-ops.js main-list --filter <关键字>     # 确认条目已在网盘
+```
+
+**重要**：`保存` 成功后**分享窗不一定关闭**，必须在 `转存的内容` 里**点刷新**再核对列表——这是机主确认过的判据。
+
+
 ## 为什么需要它
 
 - 隔离会话（session 4）里跑着机器人；日常要在这里"把某个分享链接的文件下下来"时，没有可脚本化的入口。

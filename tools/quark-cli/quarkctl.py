@@ -998,6 +998,73 @@ def cmd_clickwin(args):
     return 0
 
 
+def cmd_restart(args):
+    """Restart the client, optionally with a Chromium DevTools port.
+
+    Rationale: synthetic input (mouse messages, PostMessage, keyboard, UIA) does
+    not reach the client's in-page controls on this machine, but the client *is*
+    Chromium. Launching it with --remote-debugging-port exposes the page to CDP,
+    which lets us drive it by evaluating JavaScript instead of faking input.
+    """
+    exe = args.exe
+    if not os.path.isfile(exe):
+        log("restart", ok=False, error="client executable not found: %s" % exe)
+        return 2
+    # back up preference.json before touching the client
+    pref = os.path.join(user_data_dir(), "preference.json")
+    if os.path.isfile(pref):
+        backup = pref + ".quarkctl.bak"
+        if not os.path.exists(backup):
+            try:
+                with open(pref, "r", encoding="utf-8") as src, open(backup, "w", encoding="utf-8") as dst:
+                    dst.write(src.read())
+                log("restart", preference_backup=backup)
+            except OSError as exc:
+                log("restart", warn="preference backup failed: %s" % exc)
+
+    killed = []
+    rc = os.popen('tasklist /fi "imagename eq quark_cloud_drive.exe" /fo csv /nh').read()
+    for line in rc.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[1].isdigit():
+            killed.append(int(parts[1]))
+    for pid in killed:
+        os.system("taskkill /pid %d /f >nul 2>&1" % pid)
+    log("restart", killed=killed)
+    time.sleep(4)
+
+    argv = [exe]
+    if args.debug_port:
+        argv.append("--remote-debugging-port=%d" % args.debug_port)
+    if args.url:
+        argv.append(args.url)
+    os.spawnl(os.P_NOWAIT, exe, *argv)
+    log("restart", launched=exe, extra=argv[1:])
+    time.sleep(args.wait)
+    pid, hwnd = main_window()
+    log("restart", client_pid=pid, main_hwnd=hex(hwnd) if hwnd else None)
+    return 0
+
+
+def cmd_cdp(args):
+    """Probe the Chromium DevTools endpoint and list page targets."""
+    import json as _json
+    import urllib.request
+
+    url = "http://127.0.0.1:%d/json" % args.port
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            targets = _json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        log("cdp", ok=False, port=args.port, error=str(exc))
+        return 3
+    log("cdp", ok=True, port=args.port, targets=len(targets))
+    for t in targets:
+        log("target", type=t.get("type"), title=(t.get("title") or "")[:40],
+            url=(t.get("url") or "")[:60], ws=bool(t.get("webSocketDebuggerUrl")))
+    return 0
+
+
 def cmd_verify(args):
     db = download_db_path()
     if db:
@@ -1141,6 +1208,17 @@ def build_parser():
     s.add_argument("--y", type=int, default=400)
     s.add_argument("--shot", default=None)
     s.set_defaults(func=cmd_wheel)
+
+    s = sub.add_parser("restart", help="restart the client, optionally with a DevTools port")
+    s.add_argument("--exe", default=r"D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe")
+    s.add_argument("--debug-port", type=int, default=0)
+    s.add_argument("--url", default=None)
+    s.add_argument("--wait", type=float, default=25.0)
+    s.set_defaults(func=cmd_restart)
+
+    s = sub.add_parser("cdp", help="probe the Chromium DevTools endpoint")
+    s.add_argument("--port", type=int, default=9222)
+    s.set_defaults(func=cmd_cdp)
 
     s = sub.add_parser("verify", help="download dir + client task table state")
     s.set_defaults(func=cmd_verify)
