@@ -68,6 +68,14 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 
 暂停文件是 `C:\ProgramData\cwin-probe\rdp-client-hold.txt`：存在期间保活只探针、不挪窗口（但仍会把最小化的客户端恢复回来）。给微信账号扫码登录等"必须看着会话桌面"的操作，先 `-show`，做完 `-hide`。
 
+**在隔离会话内重启 WeFlow 读侧（5051）**：把 `scripts/isolated-session/weflow-restart.ps1` 丢进 `C:\ProgramData\cwin-probe\s4\in`。
+
+- **失败签名**：`/api/v1/health` 返回 200，但 `/api/v1/messages` 一律 **HTTP 500** → 机器人读不到任何新消息（`WeFlow outgoing poll failed ... HTTP 500` 刷屏），**能收不能答**。2026-09-18 实测持续约 2 小时（14:40–16:55），期间用户消息全被漏看。
+- **恢复判据不能只看端口**：必须用真实 token 打一次 `/api/v1/messages` 并拿到 200；脚本已内置这一步（`READER OK = ...`，写入 `s4\weflow-restart-report.txt`）。
+- 重启只是杀 `WeFlow.exe`（会话 4）再 `Start-Process C:\ProgramData\cwin-probe\WeFlow\WeFlow.exe`；配置在应用侧，不需要额外参数。
+
+**一个桌面只能有一个自动化**：机器人的出站要激活微信窗口，而同一个隔离桌面里还有别的 agent 在跑 UIA 自动化（实测对方 `q74-real.ps1` / `q75-uia.ps1` 运行时，桥返回 **502 `WeChat main window could not be activated`**）。此时机器人把回复转成 `deferred_durable` 存进 `deferred-system-replies.json`，**在同一位发件人的下一条入站消息时一并补发**（`app.js` 的 `drainForSender`）—— 所以排队不等于丢失，但也不会自己重试。要立刻拿到回复：让对方停一下桌面自动化，或在微信里再发一句。
+
 **回滚**：`Copy-Item .env.bak-<日期> .env -Force` 后 `Start-ScheduledTask cwin-s1-restack`。
 
 ## Alternatives considered
