@@ -101,6 +101,34 @@ D:\Projects\cyberboss\tools\quark-cli\cmd\quarkctl.cmd verify
 | 保存对话框（`#32770`，标题「选择文件」） | ⚠️ 能弹出、能转储子控件；但"点确认按钮"无效，用剪贴板粘贴路径 + 回车可以关闭对话框 |
 | 客户端任务表 | ❌ 全程 `download.db` 零任务行（唯一一次变化是 SQLite 自己建 `sqlite_stat1/stat4` 统计表 + `DownloadManager` 启动检查点，**不是任务**） |
 
+## 已确认的分层边界（2026-09-18 同日人工对照实验）
+
+### 输入前必须前置目标窗口（本轮实测新增，最重要）
+
+同一台机器上 **WeChat（`Qt51514QWindowIcon`）经常占着前台**，导致喂给客户端的键盘输入被它吃掉——实测表现是"搜索框输入没反应"，而 `document.hasFocus()` 返回 **false**。修复方式（两条都要）：
+
+```bash
+# 1) OS 层：把目标窗口提到前台并验证它真的拿到了前台
+python quarkctl.py focus                 # 主窗口；也可 --title/--hwnd
+python quarkctl.py move --cls Qt51514QWindowIcon --x -32000 --y -32000   # 把抢焦点的窗口挪到屏幕外（不关闭）
+# 2) 渲染层：让页面自身置顶（CDP 官方接口），随后 hasFocus 会变 true
+node cdp-ops.js bring-front                          # 主页面
+node cdp-ops.js bring-front --page share-link-window # 分享窗
+node cdp-ops.js window-state                         # 查 visibilityState / hasFocus / activeElement
+```
+
+**实测**：未置顶时 `hasFocus=false`、搜索无结果；`Page.bringToFront` 之后 `hasFocus=true`，**同一个 `pdf` 搜索立刻返回 1 项结果**。所以任何会输入的命令（搜索、勾选、快捷键）前面都要先 `bring-front`。
+
+### 其它实测修正
+
+| 现象 | 结论 |
+|---|---|
+| 从别的会话 `Stop-Process` 杀客户端 | ❌ 静默失败（Access denied）；必须 `taskkill /im quark_cloud_drive.exe /f` |
+| CLI 里 spawn `tasklist` 之类控制台子进程 | ❌ 在隔离会话里会让 worker 300 秒超时；`restart` 已改为只调 `taskkill` |
+| 分享页搜索 | ✅ 可用，但**必须先置顶**；结果行会显示完整路径（`文件夹名 / 文件名`） |
+| 分享里的文件列表 | 常是**一层层文件夹**：`share-info` 只显示当前目录的条目，要 `share-enter` 逐层进 |
+| 账号状态 | 该账号实测提示 `账号涉嫌违规已被封禁，暂时无法使用该功能`，`保存/下载` 会被服务端拒绝 |
+
 ### 两个先把人骗过的坑（都已用 CLI 防住）
 
 1. **`WeFlow` 全屏窗口盖在客户端上**（`pid=11016`，`rect=(-8,0,1288,760)`）：z-order 实测发现动作栏落点下方是它，点击全被它吃掉——表现就是"点了没反应"。`click`/`download` 现在会先 `ensure_front` 验明正身，盖住时直接拒绝点击（可用 `--force` 强制）。

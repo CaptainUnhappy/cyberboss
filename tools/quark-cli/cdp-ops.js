@@ -387,31 +387,85 @@ async function cmdMainSelectItem(name, only) {
   return { ok: true, item: t, buttonsAfter: after.buttons, breadcrumb: after.breadcrumb };
 }
 
-async function cmdMainClickControl(text) {
-  // Click any element (button, svg, div) whose text or title matches, by real
+async function cmdMainClickControl(text, skip) {
+  // Click any element (button, svg, div) whose own text or title matches, by real
   // input events - works for controls that are not <button> elements.
+  // --skip <substr> excludes elements whose text contains it (e.g. tree rows).
   const s = await sessionFor(MAIN);
   const found = await s.eval(`(() => {
     const t = ${JSON.stringify(text)};
+    const skip = ${JSON.stringify(skip || '')};
     const cands = Array.from(document.querySelectorAll('button, [role=button], a, div, span, svg, i'));
+    const hits = [];
     for (const el of cands) {
-      const own = ((el.innerText || '') + ' ' + (el.getAttribute && (el.getAttribute('title') || el.getAttribute('aria-label') || '') || '')).trim();
-      if (!own || !own.includes(t)) continue;
+      const own = ((el.innerText || '') + ' ' +
+        (el.getAttribute && (el.getAttribute('title') || el.getAttribute('aria-label') || '') || '')).trim();
+      if (own !== t && own.indexOf(t) < 0) continue;
+      if (skip && own.indexOf(skip) >= 0) continue;
       if (el.children.length > 6) continue;              // skip big containers
       const r = el.getBoundingClientRect();
       if (r.width < 4 || r.height < 4) continue;
-      el.setAttribute('data-quarkctl-ctl', '1');
-      return JSON.stringify({ tag: el.tagName, cls: String(el.className || '').slice(0, 40),
-                              rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] });
+      hits.push({ el: el, r: r, own: own });
     }
-    return null;
+    if (!hits.length) return null;
+    // prefer the smallest matching element (the button itself, not a wrapper)
+    hits.sort((a, b) => (a.r.width * a.r.height) - (b.r.width * b.r.height));
+    const chosen = hits[0];
+    chosen.el.setAttribute('data-quarkctl-ctl', '1');
+    return JSON.stringify({ tag: chosen.el.tagName, cls: String(chosen.el.className || '').slice(0, 40),
+                            text: chosen.own.slice(0, 30), candidates: hits.length,
+                            rect: [Math.round(chosen.r.left), Math.round(chosen.r.top), Math.round(chosen.r.width), Math.round(chosen.r.height)] });
   })()`);
   if (!found) { s.close(); return { ok: false, reason: 'control not found: ' + text }; }
   const click = await s.clickSelector('[data-quarkctl-ctl="1"]');
-  await new Promise((r) => setTimeout(r, 2000));
+  await new Promise((r) => setTimeout(r, 2500));
   const after = JSON.parse(await s.eval(MAIN_LIST_JS('')));
   s.close();
-  return { ok: true, control: JSON.parse(found), click, buttonsAfter: after.buttons };
+  return { ok: true, control: JSON.parse(found), click, buttonsAfter: after.buttons, breadcrumb: after.breadcrumb };
+}
+
+// ---------------------------------------------------------------- focus handling
+
+/**
+ * CDP input events reach the renderer regardless of OS focus, but the client's
+ * in-page keyboard handling (search boxes / shortcuts) needs the page focused,
+ * and a competing top-level window (WeChat, in practice) can own the OS
+ * foreground and swallow input. Use `quarkctl.py focus` to raise the real window
+ * before driving input; this command only reports the page-level focus state.
+ */
+async function cmdWindowState() {
+  const s = await sessionFor(MAIN);
+  const state = await s.eval(`JSON.stringify({
+    visibilityState: document.visibilityState,
+    hasFocus: document.hasFocus(),
+    activeTag: document.activeElement ? document.activeElement.tagName : null,
+    activeCls: document.activeElement ? String(document.activeElement.className || '').slice(0, 40) : null
+  })`);
+  s.close();
+  return JSON.parse(state);
+}
+
+async function cmdFocus(needle) {
+  // Two-layer focus: ask the renderer to raise its own window (Page.bringToFront)
+  // and then report the resulting focus state. Pair this with
+  // `quarkctl.py focus` (Win32 SetForegroundWindow) when a competing window owns
+  // the OS foreground.
+  const s = await sessionFor(needle || MAIN);
+  let bring = null;
+  try {
+    await s.send('Page.bringToFront');
+    bring = 'ok';
+  } catch (e) {
+    bring = 'failed: ' + e.message;
+  }
+  await new Promise((r) => setTimeout(r, 600));
+  const state = JSON.parse(await s.eval(`JSON.stringify({
+    title: document.title,
+    hasFocus: document.hasFocus(),
+    visibilityState: document.visibilityState
+  })`));
+  s.close();
+  return { bringToFront: bring, state };
 }
 
 async function main() {
@@ -432,8 +486,10 @@ async function main() {
     case 'main-refresh': out = await cmdMainRefresh(); break;
     case 'main-select': out = await cmdMainSelect(arg('name'), !!arg('only', false)); break;
     case 'main-select-item': out = await cmdMainSelectItem(arg('name'), !!arg('only', false)); break;
-    case 'main-click-control': out = await cmdMainClickControl(arg('text')); break;
+    case 'main-click-control': out = await cmdMainClickControl(arg('text'), arg('skip', '')); break;
     case 'main-click-button': out = await cmdMainClickButton(arg('text')); break;
+    case 'window-state': out = await cmdWindowState(); break;
+    case 'bring-front': out = await cmdFocus(arg('page', MAIN)); break;
     default:
       console.error('usage: cdp-ops.js <list-targets|share-info|share-enter|share-select|share-save|main-open-saveas|main-list|main-refresh|main-select|main-select-item|main-click-control|main-click-button> [--name X] [--only] [--filter X] [--text X]');
       process.exit(2);

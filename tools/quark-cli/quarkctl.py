@@ -57,6 +57,7 @@ import argparse
 import ctypes
 import json
 import os
+import subprocess
 import sys
 import time
 from ctypes import wintypes
@@ -1001,16 +1002,21 @@ def cmd_clickwin(args):
 def cmd_restart(args):
     """Restart the client, optionally with a Chromium DevTools port.
 
-    Rationale: synthetic input (mouse messages, PostMessage, keyboard, UIA) does
-    not reach the client's in-page controls on this machine, but the client *is*
-    Chromium. Launching it with --remote-debugging-port exposes the page to CDP,
-    which lets us drive it by evaluating JavaScript instead of faking input.
+    Rationale: synthetic input does not reach the client's canvas-rendered list,
+    but the client *is* Chromium, so launching it with --remote-debugging-port
+    exposes the pages to CDP (see cdp-ops.js).
+
+    Two hard-won constraints:
+      * `Stop-Process` does NOT kill this app when issued from another session
+        (Access denied, silently); `taskkill /im` does. Use it.
+      * do NOT spawn console subprocesses here (no tasklist/os.popen): this
+        helper also runs inside the isolated session, where a console child
+        makes the worker time out after 300 s.
     """
     exe = args.exe
     if not os.path.isfile(exe):
         log("restart", ok=False, error="client executable not found: %s" % exe)
         return 2
-    # back up preference.json before touching the client
     pref = os.path.join(user_data_dir(), "preference.json")
     if os.path.isfile(pref):
         backup = pref + ".quarkctl.bak"
@@ -1022,15 +1028,9 @@ def cmd_restart(args):
             except OSError as exc:
                 log("restart", warn="preference backup failed: %s" % exc)
 
-    killed = []
-    rc = os.popen('tasklist /fi "imagename eq quark_cloud_drive.exe" /fo csv /nh').read()
-    for line in rc.splitlines():
-        parts = [p.strip('"') for p in line.split('","')]
-        if len(parts) >= 2 and parts[1].isdigit():
-            killed.append(int(parts[1]))
-    for pid in killed:
-        os.system("taskkill /pid %d /f >nul 2>&1" % pid)
-    log("restart", killed=killed)
+    subprocess.run(["taskkill", "/im", os.path.basename(exe), "/f"],
+                   capture_output=True, text=True,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
     time.sleep(4)
 
     argv = [exe]
@@ -1038,7 +1038,12 @@ def cmd_restart(args):
         argv.append("--remote-debugging-port=%d" % args.debug_port)
     if args.url:
         argv.append(args.url)
-    os.spawnl(os.P_NOWAIT, exe, *argv)
+    try:
+        subprocess.Popen(argv, close_fds=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    except OSError as exc:
+        log("restart", ok=False, error="launch failed: %s" % exc)
+        return 3
     log("restart", launched=exe, extra=argv[1:])
     time.sleep(args.wait)
     pid, hwnd = main_window()
@@ -1062,6 +1067,66 @@ def cmd_cdp(args):
     for t in targets:
         log("target", type=t.get("type"), title=(t.get("title") or "")[:40],
             url=(t.get("url") or "")[:60], ws=bool(t.get("webSocketDebuggerUrl")))
+    return 0
+
+
+def cmd_move(args):
+    """Move a window to a screen position (default: park it off-screen).
+
+    Used to get a competing window (WeChat, in practice) out of the way without
+    closing it: an off-screen window cannot take the foreground, so it stops
+    swallowing the input we send to the client.
+    """
+    hwnd = None
+    if args.hwnd:
+        hwnd = int(args.hwnd, 16) if args.hwnd.lower().startswith("0x") else int(args.hwnd)
+    elif args.cls or args.title:
+        for h in top_level_windows():
+            if not is_visible(h):
+                continue
+            if args.cls and args.cls.lower() not in class_name(h).lower():
+                continue
+            if args.title and args.title not in window_text(h):
+                continue
+            hwnd = h
+            break
+    if not hwnd or not user32.IsWindow(hwnd):
+        log("move", ok=False, error="no matching window")
+        return 2
+    l, t, r, b = window_rect(hwnd)
+    w, h = max(1, r - l), max(1, b - t)
+    ok = user32.SetWindowPos(hwnd, 0, args.x, args.y, w, h, 0x0010 | 0x0040)  # NOACTIVATE|SHOWWINDOW
+    log("move", hwnd=hex(hwnd), cls=class_name(hwnd), title=window_text(hwnd)[:30],
+        from_rect=(l, t, r, b), to=(args.x, args.y), ok=bool(ok))
+    return 0 if ok else 3
+
+
+def cmd_focus(args):
+    """Raise the client window (or a named window) to the foreground and verify.
+
+    Rationale: CDP input events reach the renderer, but in-page keyboard handling
+    needs real focus, and this desktop regularly has WeChat on top swallowing
+    input. Every input-driving step should call this first.
+    """
+    hwnd = None
+    if args.hwnd:
+        hwnd = int(args.hwnd, 16) if args.hwnd.lower().startswith("0x") else int(args.hwnd)
+    elif args.title:
+        hwnd = find_window_by_title(args.title)
+    else:
+        pid, hwnd = main_window()
+    if not hwnd or not user32.IsWindow(hwnd):
+        log("focus", ok=False, error="target window not found")
+        return 2
+    activate(hwnd)
+    time.sleep(0.4)
+    fg = user32.GetForegroundWindow()
+    ok = fg == hwnd
+    log("focus", hwnd=hex(hwnd), title=window_text(hwnd)[:40], ok=ok,
+        foreground=hex(fg) if fg else None, foreground_title=window_text(fg)[:40] if fg else "")
+    if not ok:
+        log("focus", hint="another window took the foreground; try 'move' on it or 'close'")
+        return 6
     return 0
 
 
@@ -1219,6 +1284,19 @@ def build_parser():
     s = sub.add_parser("cdp", help="probe the Chromium DevTools endpoint")
     s.add_argument("--port", type=int, default=9222)
     s.set_defaults(func=cmd_cdp)
+
+    s = sub.add_parser("focus", help="raise the client window to the foreground and verify it got there")
+    s.add_argument("--hwnd", default=None)
+    s.add_argument("--title", default=None)
+    s.set_defaults(func=cmd_focus)
+
+    s = sub.add_parser("move", help="move a window (e.g. park a competing window off-screen)")
+    s.add_argument("--hwnd", default=None)
+    s.add_argument("--cls", default=None)
+    s.add_argument("--title", default=None)
+    s.add_argument("--x", type=int, default=-32000)
+    s.add_argument("--y", type=int, default=-32000)
+    s.set_defaults(func=cmd_move)
 
     s = sub.add_parser("verify", help="download dir + client task table state")
     s.set_defaults(func=cmd_verify)
