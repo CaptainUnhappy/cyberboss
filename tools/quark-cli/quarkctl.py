@@ -558,17 +558,95 @@ def cmd_row(args):
     return 0
 
 
+def region_hash(bytes_blob, width, height, region):
+    """Cheap content hash of a rectangular region of a raw BGRA frame."""
+    import hashlib
+    left, top, right, bottom = region
+    h = hashlib.sha256()
+    for y in range(max(0, top), min(height, bottom)):
+        row = bytes_blob[y * width * 4:(y + 1) * width * 4]
+        h.update(row[max(0, left) * 4:min(width, right) * 4])
+    return h.hexdigest()[:16]
+
+
+def grab_screen():
+    """Raw BGRA frame of the session desktop plus its size."""
+    from ctypes import windll
+    gdi32 = windll.gdi32
+    width = user32.GetSystemMetrics(0)
+    height = user32.GetSystemMetrics(1)
+    hdc = user32.GetDC(0)
+    mem = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, width, height)
+    gdi32.SelectObject(mem, bmp)
+    gdi32.BitBlt(mem, 0, 0, width, height, hdc, 0, 0, 0x00CC0020)
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long),
+                    ("biHeight", ctypes.c_long), ("biPlanes", wintypes.WORD),
+                    ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                    ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", ctypes.c_long),
+                    ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", wintypes.DWORD),
+                    ("biClrImportant", wintypes.DWORD)]
+
+    bi = BITMAPINFOHEADER()
+    bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bi.biWidth = width
+    bi.biHeight = -height
+    bi.biPlanes = 1
+    bi.biBitCount = 32
+    bi.biCompression = 0
+    stride = width * 4
+    buf = ctypes.create_string_buffer(stride * height)
+    gdi32.GetDIBits(mem, bmp, 0, height, buf, ctypes.byref(bi), 0)
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(0, hdc)
+    return buf.raw, width, height
+
+
+def ensure_front(hwnd, tries=3):
+    """Make sure `hwnd` owns the foreground before synthesizing a click.
+
+    A synthesized click lands on whatever window is on top at that point. In
+    this session a full-screen WeFlow window regularly sits above the client and
+    silently swallows every click, which reads as "the app ignores my clicks".
+    So: activate, verify, and only then click.
+    """
+    for i in range(1, tries + 1):
+        fg = user32.GetForegroundWindow()
+        if fg == hwnd:
+            return True, "already-front", i
+        activate(hwnd)
+        time.sleep(0.3)
+        if user32.GetForegroundWindow() == hwnd:
+            return True, "activated", i
+    top = window_under(*client_origin(hwnd))
+    return False, "could not take the foreground; top window under the client origin is %s (%s)" % (
+        hex(top) if top else None, class_name(top) if top else "?"), tries
+
+
 def cmd_click(args):
     pid, hwnd = main_window()
     if not hwnd:
         log("click", ok=False, error="client window not found")
         return 2
-    activate(hwnd)
+    ok, how, tries = ensure_front(hwnd)
+    log("front", ok=ok, how=how, tries=tries)
+    if not ok and not args.force:
+        log("click", ok=False, error="client is covered; refusing to click blind "
+                                     "(pass --force to click anyway)")
+        return 6
     cx, cy = client_origin(hwnd)
     sx, sy = cx + args.x, cy + args.y
     child = window_under(sx, sy)
     log("click", client=(args.x, args.y), screen=(sx, sy), hwnd=hex(hwnd),
         under=hex(child) if child else None, under_cls=class_name(child) if child else None)
+    before = None
+    if args.region:
+        frame, w, h = grab_screen()
+        before = region_hash(frame, w, h, tuple(args.region))
+        log("click", region=args.region, hash_before=before)
     if args.hover:
         set_cursor(sx, sy)
         time.sleep(args.settle)
@@ -581,6 +659,10 @@ def cmd_click(args):
             user32.ScreenToClient(child, ctypes.byref(p))
             post_click(child, p.x, p.y)
             time.sleep(args.settle)
+    if args.region:
+        frame, w, h = grab_screen()
+        after = region_hash(frame, w, h, tuple(args.region))
+        log("click", hash_after=after, region_changed=(after != before))
     dlg = find_dialog("选择文件")
     log("click", done=True, picker=bool(dlg), picker_hwnd=hex(dlg) if dlg else None,
         foreground=foreground()[3][:40])
@@ -591,6 +673,10 @@ def cmd_click(args):
 
 
 def click_toolbar_download(hwnd, args, label):
+    ok, how, tries = ensure_front(hwnd)
+    log("front", label=label, ok=ok, how=how, tries=tries)
+    if not ok and not args.force:
+        return "covered", None
     cx, cy = client_origin(hwnd)
     sx, sy = cx + args.dl_x, cy + args.dl_y
     child = window_under(sx, sy)
@@ -629,6 +715,10 @@ def cmd_download(args):
     before = os.stat(db).st_mtime if db else 0
     result, dlg = click_toolbar_download(hwnd, args, "attempt-1")
     log("download", attempt=1, result=result)
+    if result == "covered":
+        log("download", ok=False, error="the client is covered by another window; "
+                                        "close it (see 'windows') or pass --force")
+        return 6
     if result != "picker" and args.hard:
         result, dlg = click_toolbar_download(hwnd, args, "attempt-2")
         log("download", attempt=2, result=result)
@@ -753,6 +843,41 @@ def cmd_picker(args):
     return 0
 
 
+def cmd_desktop(args):
+    """Is the session desktop actually rendering?
+
+    Background: the isolation keepalive probes GetForegroundWindow +
+    SetCursorPos, and both can keep reporting healthy while the desktop renders
+    nothing (client minimized). Any GUI automation on such a desktop is a no-op
+    against a black screen, so every drive step should check this first.
+    """
+    frame, w, h = grab_screen()
+    step = args.step
+    total = 0
+    bright = 0
+    seen = set()
+    for y in range(0, h, step):
+        base = y * w * 4
+        for x in range(0, w, step):
+            off = base + x * 4
+            b, g, r = frame[off], frame[off + 1], frame[off + 2]
+            lum = (r * 299 + g * 587 + b * 114) // 1000
+            total += 1
+            if lum > args.threshold:
+                bright += 1
+            seen.add((r >> 4, g >> 4, b >> 4))
+    ratio = bright / total if total else 0.0
+    fg_hwnd, fg_pid, fg_cls, fg_title = foreground()
+    log("desktop", size=(w, h), sampled=total, bright_ratio=round(ratio, 4),
+        distinct_colors=len(seen), threshold=args.threshold)
+    log("desktop", rendering=ratio > args.min_ratio,
+        foreground=fg_title[:40] or "(none)", fg_cls=fg_cls)
+    if args.out:
+        screenshot(args.out)
+        log("shot", path=args.out)
+    return 0 if ratio > args.min_ratio else 5
+
+
 def cmd_verify(args):
     db = download_db_path()
     if db:
@@ -812,6 +937,9 @@ def build_parser():
     s.add_argument("--hover", action="store_true")
     s.add_argument("--mode", choices=["mouse", "message", "both"], default="mouse")
     s.add_argument("--settle", type=float, default=2.5)
+    s.add_argument("--region", type=int, nargs=4, metavar=("L", "T", "R", "B"),
+                   help="screen region to hash before/after; use it to prove a click had an effect")
+    s.add_argument("--force", action="store_true", help="click even if the client is covered")
     s.add_argument("--shot", default=None)
     s.set_defaults(func=cmd_click)
 
@@ -821,6 +949,7 @@ def build_parser():
     s.add_argument("--settle", type=float, default=3.0)
     s.add_argument("--mode", choices=["mouse", "message", "both"], default="mouse")
     s.add_argument("--hard", action="store_true", help="retry once with the other layer")
+    s.add_argument("--force", action="store_true", help="click even if the client is covered")
     s.add_argument("--ignore-covers", action="store_true")
     s.set_defaults(func=cmd_download)
 
@@ -842,6 +971,13 @@ def build_parser():
     s.add_argument("--dir", default=None)
     s.add_argument("--enter", action="store_true")
     s.set_defaults(func=cmd_picker)
+
+    s = sub.add_parser("desktop", help="check whether the session desktop renders (black-screen guard)")
+    s.add_argument("--step", type=int, default=16)
+    s.add_argument("--threshold", type=int, default=24)
+    s.add_argument("--min-ratio", type=float, default=0.02)
+    s.add_argument("--out", default=None)
+    s.set_defaults(func=cmd_desktop)
 
     s = sub.add_parser("verify", help="download dir + client task table state")
     s.set_defaults(func=cmd_verify)

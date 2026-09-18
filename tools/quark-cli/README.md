@@ -51,26 +51,24 @@ D:\Projects\cyberboss\tools\quark-cli\cmd\quarkctl.cmd verify
 | 层 | 结果 |
 |---|---|
 | 驱动客户端**文件列表** | ✅ 有效：按坐标点复选框能选中，右键能出菜单（`row` / `click`） |
-| 驱动客户端**顶部动作栏**（选中文件后出现的 `下载/分享/复制…`） | ❌ **无效**：真鼠标（`SetCursorPos`+`mouse_event`）、窗口消息（`PostMessage`）、悬停、以及 10 个候选快捷键全部无反应 |
+| 驱动客户端**顶部动作栏**（选中文件后出现的 `下载/分享/复制…`） | ❌ **无效**：真鼠标（`SetCursorPos`+`mouse_event`）、窗口消息（`PostMessage`）、悬停、Tab 走焦、10 个候选快捷键、以及**剪贴板下载**（`clipboardForDownloadEnable`）全部无反应 |
 | 保存对话框（`#32770`，标题「选择文件」） | ⚠️ 能弹出、能转储子控件；但"点确认按钮"无效，用剪贴板粘贴路径 + 回车可以关闭对话框 |
-| 客户端任务表 | ❌ 全程 `download.db` 零任务行——即"从未真正开始下载"的机器可读证据 |
+| 客户端任务表 | ❌ 全程 `download.db` 零任务行（唯一一次变化是 SQLite 自己建 `sqlite_stat1/stat4` 统计表 + `DownloadManager` 启动检查点，**不是任务**） |
 
-结论：**卡在"按下动作栏按钮"这一步**，不是账号权益（VIP 弹窗只属于"在线解压"那条产品线，点「下载」时不出现）。
+### 两个先把人骗过的坑（都已用 CLI 防住）
 
-`windows` 子命令在会话内实测抓到了这层遮挡的现场：
+1. **`WeFlow` 全屏窗口盖在客户端上**（`pid=11016`，`rect=(-8,0,1288,760)`）：z-order 实测发现动作栏落点下方是它，点击全被它吃掉——表现就是"点了没反应"。`click`/`download` 现在会先 `ensure_front` 验明正身，盖住时直接拒绝点击（可用 `--force` 强制）。
+2. **桌面变黑**：RDP 客户端被最小化后会话桌面不再渲染（截图全黑、区域哈希三次相同），此时任何点击都是空转。保活探针只查 `GetForegroundWindow` + `SetCursorPos`，**在这个状态下仍报 healthy**（实测 16:40–16:48 一直报健康，而截图是黑的）。`desktop` 子命令用亮度采样做这个自检。
 
-```
-flag=CLIENT  hwnd=0x70940 pid=25692 rect=(-8,-8,1288,760)  title=首页 - 夸克网盘
-flag=COVER   hwnd=0x3e0814 pid=25692 rect=(420,26,860,726)  title=详情信息        <-- 同一进程的面板
-flag=COVER   hwnd=0x130b7a pid=29584 rect=(40,38,1240,713)  title=…073…mp4        <-- 内置播放器
-flag=COVER   hwnd=0x20100 pid=15892 rect=(-8,-8,1288,760)   title=WeFlow - 文件资源管理器
-```
+## 结论与下一步
 
-## 下一步（按优先级）
+结论：**卡在"按下动作栏按钮"这一步**——不是账号权益（VIP 弹窗只属于"在线解压"那条产品线，点「下载」时不出现），也不是遮挡或黑屏（两者都已排除后仍无效）。
 
-1. **Chromium 无障碍树 + UIA `Invoke`**：给客户端启动加 `--force-renderer-accessibility`，让动作栏按钮在 UIA 里现身，用 `InvokePattern` 绕开指针合成。这是最可能一次打通的方案。
-2. **人工按一次 + CLI 接手**：人工点下「下载」，之后 `picker --dir` / `verify` 由 CLI 完成。
-3. **换会话内注入器**（cwin 类分层工具），或在客户端配置里预置下载目录（`pref`）以彻底跳过保存对话框。
+下一步只剩"绕过指针合成"这一条路：
+
+1. **Chromium 无障碍树 + UIA `Invoke`**：已实测 `--force-renderer-accessibility` 重启后，UIA 里**依然没有动作栏元素**（主窗口 `descendants=2`，只有 `Chrome Legacy Window`），而且带参数启动会弹「发生个人资料错误」、页面变空白——这条路本机走不通，除非客户端有其它开启无障碍的方式。
+2. **真实指针输入**：人工点一次按钮，之后交给 `picker` / `verify`；或从 RDP 客户端所在会话（session 1）注入真实鼠标事件，让 RDP 通道把它送进 session 4。
+3. **彻底绕开客户端**：走网页版/后端接口下载（需要该账号的 cookie，客户端 cookie 加密，成本较高）。
 
 ## 相关笔记
 
