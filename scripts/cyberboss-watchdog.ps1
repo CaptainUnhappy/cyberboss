@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [ValidateSet("Once", "Status")]
   [string]$Mode = "Once",
@@ -4429,6 +4429,46 @@ try {
   }
 
   Ensure-WeixinStarted
+
+  # Hand the confirmed fault to the fixed repair session (维修工) as well as running
+  # the mechanical controller below. Process restarts cannot fix every fault class -
+  # a third-party reader such as WeFlow kept answering HTTP 500 on its message API
+  # across four restarts on 2026-09-18 and exhausted the daily repair budget - so a
+  # session that can read the repo, the notes and the raw evidence gets the same
+  # fault report. The dispatch runs detached and holds its own lock file, so this
+  # heartbeat is never blocked by a repair worker's turn.
+  if ((Get-ProjectEnvValue -Name "CYBERBOSS_REPAIR_ENABLED") -match "^(?i:1|true|yes|on)$") {
+    try {
+      $repairDispatchScript = Join-Path $ProjectRoot "scripts\repair-dispatch.js"
+      if (Test-Path -LiteralPath $repairDispatchScript) {
+        $repairRequestFile = Join-Path $StateDir "cyberboss-repair-request.json"
+        [ordered]@{
+          at = (Get-Date).ToUniversalTime().ToString("o")
+          faultFingerprint = [string]$failureFingerprint
+          components = @($failed)
+          plannedRepair = $repairMode
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $repairRequestFile -Encoding UTF8
+        $dispatchOut = Join-Path $StateDir "cyberboss-repair-dispatch.out.log"
+        $dispatchErr = Join-Path $StateDir "cyberboss-repair-dispatch.err.log"
+        Start-Process -FilePath "node.exe" `
+          -ArgumentList @(
+            $repairDispatchScript,
+            "--fault", $repairRequestFile,
+            "--reason", "watchdog ${repairMode}: $($failed -join ',')"
+          ) `
+          -WorkingDirectory $ProjectRoot `
+          -WindowStyle Hidden `
+          -RedirectStandardOutput $dispatchOut `
+          -RedirectStandardError $dispatchErr | Out-Null
+        Write-WatchdogLog "repair session dispatched components=$($failed -join ',') mode=$repairMode"
+      } else {
+        Write-WatchdogLog "repair dispatch script missing: $repairDispatchScript"
+      }
+    } catch {
+      Write-WatchdogLog "repair dispatch failed: $($_.Exception.Message)"
+    }
+  }
+
   $repairStdout = Join-Path $StateDir "cyberboss-watchdog-repair.out.log"
   $repairStderr = Join-Path $StateDir "cyberboss-watchdog-repair.err.log"
   Remove-Item -LiteralPath $repairStdout, $repairStderr -Force -ErrorAction SilentlyContinue
