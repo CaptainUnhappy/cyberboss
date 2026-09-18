@@ -28,6 +28,8 @@ Status: implemented
 **必须遵守的运行约束**
 
 1. **必须存在一个"已连接且未最小化/未隐藏"的 RDP 客户端**。客户端一断、一最小化或一隐藏，隔离会话就失去输入桌面（`GetForegroundWindow()=0`、`SetCursorPos` 返回 False）→ 桥报 `WeChat main window could not be activated` → **回复发不出去**（收消息仍正常，因为读侧只是文件/HTTP）。客户端被别的窗口挡住是可以的。
+   **不想看见它时，把它挪到屏幕外（如 `x=1930`，屏幕宽 1920），不要最小化、不要隐藏** —— 屏幕外同样保持"已连接 + 可注入"（实测 `setCursorPos=True`）。
+   **为什么必须让它不可见**：隔离会话里的 **WeFlow 自己每约 30 秒起一次 `powershell.exe` + `conhost.exe`**（进程创建实测），也就是每 30 秒在会话桌面上生成一个控制台窗口；会话桌面正渲染在 RDP 客户端窗口里，于是用户看到"一直在弹 cmd 窗口"。这来自 WeFlow 自身，与应用侧代码无关，只能靠让客户端不可见来消除观感。
 2. **机器人栈必须由计划任务启动，不能从 agent 会话里 `Start-Process`**：那样会继承 agent 沙箱（AppContainer），窗口激活与注入全部失效。运维命令是 `Start-ScheduledTask -TaskName cwin-s1-restack`。
 3. **RDP 客户端必须正常显示启动**：`rdp-autologin.py` 原来用 `STARTF_USESHOWWINDOW` + 默认 `wShowWindow=0`（SW_HIDE）启动 mstsc，等于把会话置于不可注入状态；已改为 `SW_SHOWNORMAL`。
 4. **同号人工输入与回声归因**：账本是唯一权威 —— 账本认领的发出消息按回声吞掉，未认领的按 `self_manual` 路由（见 [归因笔记](../bug-fix/2026-09-18-weflow-self-echo-attribution.md)）。
@@ -35,7 +37,16 @@ Status: implemented
 
 **保活与静默**
 
-`cwin-s1-rdp-keepalive` 每 5 分钟在**隔离会话内**探针一次（`GetForegroundWindow` + `SetCursorPos`，只影响 session 4），失效则触发 `cwin-s1-rdp-reconnect` 重连并显式还原客户端窗口（不抢用户焦点）。两者都用 **`pythonw.exe`** 执行以彻底避免控制台窗口闪现 —— `-WindowStyle Hidden` 挡不住计划任务那一瞬的窗口创建，`-LogonType S4U` 在本机被拒（需要"作为批处理作业登录"权限）。
+`cwin-s1-rdp-keepalive` 每 5 分钟在**隔离会话内**探针一次（`GetForegroundWindow` + `SetCursorPos`，只影响 session 4），失效则触发 `cwin-s1-rdp-reconnect` 重连并显式还原客户端窗口（不抢用户焦点）。每次运行还会把客户端**停靠到屏幕外**（幂等），避免重连把窗口带回屏幕上、让 WeFlow 的控制台闪现重新可见。两者都用 **`pythonw.exe`** 执行以彻底避免控制台窗口闪现 —— `-WindowStyle Hidden` 挡不住计划任务那一瞬的窗口创建，`-LogonType S4U` 在本机被拒（需要"作为批处理作业登录"权限）。
+
+**操作员查看/操作会话桌面时的开关**（保活会持续把窗口挪走，所以需要显式暂停）：
+
+```powershell
+Start-ScheduledTask -TaskName cwin-s1-rdp-show   # 客户端挪回 (0,0) + 放置暂停文件
+Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠回 (1930,0)
+```
+
+暂停文件是 `C:\ProgramData\cwin-probe\rdp-client-hold.txt`：存在期间保活只探针、不挪窗口。给微信账号扫码登录等"必须看着会话桌面"的操作，先 `-show`，做完 `-hide`。
 
 **回滚**：`Copy-Item .env.bak-<日期> .env -Force` 后 `Start-ScheduledTask cwin-s1-restack`。
 
