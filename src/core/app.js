@@ -1043,21 +1043,11 @@ class CyberbossApp {
       return true;
     }
     if (message?.direction === "outgoing") {
-      // The driven account observes its own replies as outgoing rows. A reply
-      // the ledger could not match - for example one polled after the match
-      // window, or one whose status is no longer matchable - must never be
-      // routed back as operator input, otherwise the bot answers itself and
-      // the conversation runs away. Only an explicit operator test marker may
-      // travel the "same-account manual" path; everything else is our own echo.
-      if (!isTestSessionRequest(message?.text)) {
-        console.log(
-          `[cyberboss] WeFlow self echo suppressed`
-          + ` localId=${message?.localId || "(unknown)"}`
-          + ` matchedBy=${classification?.matchedBy || classification?.origin || "ledger"}`
-          + ` marker=[test] missing`
-        );
-        return true;
-      }
+      // Same-account manual input stays supported: an outgoing row only reaches
+      // this point when the ledger did NOT attribute it to us, so it is the
+      // operator typing in the bot's own account rather than our own echo.
+      // Echoes are suppressed above by the ledger's own attribution - see
+      // .agents/notes/implemented/bug-fix/2026-09-18-weflow-self-echo-attribution.md
       effectiveMessage = { ...message, origin: "self_manual" };
     }
     this.markPipelineUserInbound?.(message?.receivedAt);

@@ -698,13 +698,14 @@ function resolveEntryMatchWindowMs(entry, {
   if (entry.expectedDirection === "incoming") {
     return nativeMatchWindowMs;
   }
-  // A UIA transport/verification timeout may still have pressed Enter. Allow a
-  // bounded offline catch-up window, but keep it much shorter than retention so
-  // a later human message with identical outgoing text is unlikely to be eaten.
-  if (entry.status === "failed_uncertain") {
-    return uncertainMatchWindowMs;
-  }
-  return matchWindowMs;
+  // A UIA transport/verification timeout may still have pressed Enter, and the
+  // strict confirmation policy can take minutes before it does - so the echo row
+  // is routinely observed well after the 2-minute normal window. Every outgoing
+  // entry that is still unverified therefore gets the bounded catch-up window;
+  // an already verified entry is excluded by MATCHABLE_STATUSES, so this cannot
+  // eat a later human message except in the narrow "never observed + identical
+  // outgoing text" case the uncertain window already accepts.
+  return uncertainMatchWindowMs;
 }
 
 function parseTimeMs(value, fallbackMs) {

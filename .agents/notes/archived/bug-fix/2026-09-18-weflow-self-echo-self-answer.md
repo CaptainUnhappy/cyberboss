@@ -1,6 +1,7 @@
 # Agent Note: WeFlow 自回声不再被当成人工输入（修掉"自问自答"）
 
 Status: implemented
+Archived: 2026-09-18
 
 ## Problem
 
