@@ -38,12 +38,24 @@ Status: implemented
 
 **保活与静默**
 
-代码在 `scripts/isolated-session/`（**已入库**，计划任务指向仓库路径）：`rdp-keepalive.py`（保活）、`rdp-autologin.py`（重连 + 点掉证书框）、`rdp-client.ps1`（查看开关）、`hidden-run.vbs`（无窗口跑 PS）。`cwin-s1-rdp-keepalive` / `-reconnect` 用 `pythonw.exe` 执行，`-show` / `-hide` 用 `wscript.exe //B //NoLogo hidden-run.vbs` 执行 —— 两者都不产生可见控制台。
+代码在 `scripts/isolated-session/`（**已入库**，计划任务指向仓库路径）：`rdp-keepalive.py`（保活）、`rdp-autologin.py`（重连 + 点掉证书框）、`rdp-client.ps1`（查看开关）、`hidden-run.vbs`（无窗口跑 PS）、`bridge-restart.ps1`（在隔离会话内重启 8776 桥）。`cwin-s1-rdp-keepalive` / `-reconnect` 用 `pythonw.exe` 执行，`-show` / `-hide` 用 `wscript.exe //B //NoLogo hidden-run.vbs` 执行 —— 两者都不产生可见控制台。
 
-`cwin-s1-rdp-keepalive` 每 5 分钟在**隔离会话内**探针一次（`GetForegroundWindow` + `SetCursorPos`，只影响 session 4），探针经会话内文件队列 `C:\ProgramData\cwin-probe\s4\in` 投递。两条 2026-09-18 实测出来的判定规则：
+**探针通道**：保活优先走 **HTTP** `GET http://127.0.0.1:8776/api/probe`（桥就在隔离会话内，进程内直接回答"输入桌面还在不在"，即时返回），失败才退回会话内文件队列。之所以要这条专用通道：文件队列是共享的，另一个 workload 连续占用时会排队数分钟，旧实现因此把正常会话误判成故障。
+
+- `/api/probe`（只读，不碰鼠标）：`{"ok", "foreground", "className", "movedCursor": null, "cursor": null}`，`ok = foreground != 0`。健康一拍**零扰动**。
+- `/api/probe?move=1`（强校验，会 `SetCursorPos(300,300)`）：额外的 `movedCursor`。只在只读判定为"坏"时才请求。
+- 实测：客户端被最小化 → `{"ok": false, "foreground": 0}`；恢复后 → `{"ok": true, "foreground": 1115708}`。
+- **两路都拿不到测量 ⇒ 不重连**（`exit 2`）：桥挂了或队列忙，重连都修不好，只会白丢两分钟自动化。
+
+`cwin-s1-rdp-keepalive` 每 5 分钟探一次（只影响 session 4）。两条 2026-09-18 实测出来的判定规则：
 
 - **先摆正窗口，再考虑重连**。探针失败时先把客户端窗口重新摆正（**最小化就恢复**，即使暂停文件存在也恢复：暂停文件只决定摆回 `(0,0)` 还是停靠 `(1930,0)`），再复探一次，只有仍然失败才触发 `cwin-s1-rdp-reconnect`。早先版本在暂停文件存在时直接跳过摆正，于是"客户端被最小化 → 探针必然失败 → 每 5 分钟重连一次"，而每次重连都带一串弹窗：**用户看到的"反复弹窗"其实是这条循环**。
 - **探针没回音 ≠ 会话坏了**。会话内队列是共享的（实测另一个 workload 的 `q1..q10` 脚本连续占用数分钟），`(no probe output)` 只说明 worker 忙，此时**不重连**，直接 `exit 2` 等下一拍。没有这条，队列一忙就会误杀 RDP 连接。
+
+**在隔离会话内重启 8776 桥**（把 `scripts/isolated-session/bridge-restart.ps1` 丢进 `C:\ProgramData\cwin-probe\s4\in`，worker 会取走执行）：
+
+1. 桥的进程必须活在**会话 4**（它驱动那个桌面），所以不能在 session 1 起。
+2. 脚本必须自己从 `.env` 读 `CYBERBOSS_WEFLOW_TOKEN` / `ALLOWED_TALKERS` 并设 `CYBERBOSS_WEFLOW_BASE_URL=127.0.0.1:5051`、`DEFAULT_SEND_SOURCE=azzy`、`STATE_DIR=C:\ProgramData\cwin-probe\state4` —— 队列 worker 不继承项目环境。**漏了 token，新进程会立刻以 `CYBERBOSS_WEFLOW_TOKEN is required` 退出，而旧进程已经被杀**：2026-09-18 15:48–15:50 就这样把发信通道打断了 2 分钟（账本实测该窗口 0 条消息，未丢件）。脚本现在把自检写进 `s4\bridge-restart-report.txt`。
 
 `-WindowStyle Hidden` 挡不住计划任务那一瞬的窗口创建，`-LogonType S4U` 在本机被拒（需要"作为批处理作业登录"权限）。
 
@@ -67,11 +79,13 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 - **`-LogonType S4U` 跑保活**：最正统的"无窗口"解法，但注册被拒（缺批处理登录权限），改用 `pythonw`。
 - **靠 `CREATE_NO_WINDOW` / `-WindowStyle Hidden` 压住弹窗**：实测都不够（见约束 2 的计数）——窗口创建发生在这些开关生效之前，且本机把控制台交给 Windows Terminal。最终改成"根本不 spawn 控制台子进程"。
 - **"探针没回音也照样重连"**：等于让共享队列的忙闲决定 RDP 连接的生死，实测一次夸克网盘自动化就把连接误杀了一次；改为只对**有明确否定结论**的探针重连。
-- **把保活探针换成截图/窗口枚举自证**：能绕开共享队列，但要在会话内起进程（又回到控制台窗口问题），收益不抵成本，暂不做。
+- **把保活探针换成截图/窗口枚举自证**：能绕开共享队列，但要在会话内起进程（又回到控制台窗口问题），收益不抵成本。最终采用的是**桥内 `/api/probe`**（进程内、无新进程、可只读可强校验）。
+- **让保活直接读桥的 `/readyz`**：`/readyz` 只查"微信窗口是否存在"（UIA），客户端被最小化、会话失去输入桌面时它照样返回 `ready`，是假绿；因此另加 `/api/probe` 测输入桌面本身。
 
 ## Consequences
 
 - 收益：机器人的收发完全在隔离会话完成，用户桌面不参与；桥的失败模式从"抢占 + 遮挡 + 沙箱"收敛为"客户端是否连着"这一条，且这条有保活兜底。用户桌面上的控制台弹窗归零（实测：同一条重连路径 133 秒内产生 **0** 个可见终端事件，修复前是每 1 秒一个）。
 - 代价：多了一个必须活着的 RDP 客户端（`mstsc`）与一个 Windows 账号（`cwinprobe`）；隔离会话的资源占用与真实微信一致；保活/重连助手必须永远避开控制台子进程，这条约束会跟着每一次"顺手加一行 tasklist"复发。
-- 已知缺口：① **投递没有握手** —— 发送失败不重传、不通知（账本里已积累数十条 `status=failed`），方案见 [投递握手提案](../../proposed/feature/2026-09-18-weflow-reply-delivery-handshake.md)；② 隔离会话内的 Agent Room executor 曾因串行执行卡死，文件队列 `C:\ProgramData\cwin-probe\s4\{in,out,done}` 是更可靠的后备通道，但它**是共享资源**：另一个 workload（实测夸克网盘 `q1..q10`）占用时保活探针会超时，现在只会跳过不会重连，需要时就近看 `s4\in`、`s4\done` 的积压。
-- 部署脚本已入库到 `scripts/isolated-session/`（4 个文件，计划任务动作指向仓库路径）；仍留在 `C:\ProgramData\cwin-probe\` 的是历史实验脚本，其中 `s1-restack.ps1`（退役 Ally 栈的端口 8766/5031）与 `s1-mstsc-offscreen2.ps1` **尚未纳入本契约**，`cwin-s1-restack` / `cwin-s1-mstsc-off2` 两个任务保持原样。
+- 已知缺口：① **投递没有握手** —— 发送失败不重传、不通知（账本里已积累数十条 `status=failed`），方案见 [投递握手提案](../../proposed/feature/2026-09-18-weflow-reply-delivery-handshake.md)；② 隔离会话内的 Agent Room executor 曾因串行执行卡死，文件队列 `C:\ProgramData\cwin-probe\s4\{in,out,done}` 是更可靠的后备通道，但它**是共享资源**：另一个 workload（实测夸克网盘 `q1..q10`）占用时队列会排队数分钟，保活探针已改走 HTTP，队列只作为退路。
+- 桥多了一个 HTTP 契约 `/api/probe`（只读 / `?move=1` 强校验），它测的是"隔离会话的输入桌面"，与 `/readyz`（窗口存在性）不是一回事；改桥的探针语义要同步本笔记。
+- 部署脚本已入库到 `scripts/isolated-session/`（5 个文件，计划任务动作指向仓库路径）；仍留在 `C:\ProgramData\cwin-probe\` 的是历史实验脚本，其中 `s1-restack.ps1`（退役 Ally 栈的端口 8766/5031）与 `s1-mstsc-offscreen2.ps1` **尚未纳入本契约**，`cwin-s1-restack` / `cwin-s1-mstsc-off2` 两个任务保持原样。

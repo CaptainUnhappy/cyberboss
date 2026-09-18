@@ -216,6 +216,47 @@ def require_foreground_continuity(window_handle: int) -> None:
         raise DesktopActiveError(0, MIN_CANARY_DESKTOP_IDLE_SECONDS)
 
 
+def probe_input_desktop(move_cursor: bool = False) -> dict:
+    """Report whether this session still owns an injectable input desktop.
+
+    The keepalive asks this question through an in-process HTTP call instead of the
+    shared session-4 file queue, which another workload can hold for minutes.  The
+    read-only form (foreground window handle) is enough for a healthy session; the
+    cursor move is the stronger confirmation and is only requested when the cheap
+    signal already says the session is broken, so a healthy beat never disturbs
+    whatever else is driving this desktop.
+    """
+    user32 = ctypes.windll.user32
+    foreground = 0
+    class_name = ""
+    try:
+        foreground = int(user32.GetForegroundWindow())
+        buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(wintypes.HWND(foreground), buffer, 256)
+        class_name = buffer.value
+    except Exception:
+        foreground = 0
+        class_name = ""
+    moved = None
+    cursor = None
+    if move_cursor:
+        try:
+            moved = bool(user32.SetCursorPos(300, 300))
+            time.sleep(0.2)
+            point = wintypes.POINT()
+            if user32.GetCursorPos(ctypes.byref(point)):
+                cursor = [int(point.x), int(point.y)]
+        except Exception:
+            moved = False
+    return {
+        "ok": bool(foreground) and (moved is not False),
+        "foreground": foreground,
+        "className": class_name,
+        "movedCursor": moved,
+        "cursor": cursor,
+    }
+
+
 def require_focused_chat_input(contact: str) -> None:
     """Fail closed unless keyboard focus is still on the confirmed chat editor."""
     try:
@@ -2906,6 +2947,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/send-source":
             self.send_json(200, {"ok": True, "send_source": self.state.send_source})
+            return
+        if path == "/api/probe":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            move_cursor = str(query.get("move", ["0"])[0]).lower() in {"1", "true", "yes"}
+            self.send_json(200, probe_input_desktop(move_cursor=move_cursor))
             return
         self.send_json(404, {"error": "not found"})
 

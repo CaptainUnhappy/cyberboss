@@ -1,8 +1,10 @@
 import ctypes
 import datetime
+import json
 import os
 import sys
 import time
+import urllib.request
 from ctypes import wintypes
 
 PROBE_DIR = r"C:\ProgramData\cwin-probe\s4"
@@ -10,6 +12,9 @@ PROBE_SCRIPT = os.path.join(PROBE_DIR, "in", "keepalive-probe.ps1")
 PROBE_OUT = os.path.join(PROBE_DIR, "keepalive-probe.txt")
 LOG = r"D:\Projects\cyberboss\tmp\cwin-lab\rdp-keepalive.log"
 HOLD_FILE = r"C:\ProgramData\cwin-probe\rdp-client-hold.txt"
+# The bridge runs inside the isolated session, so it can answer the injectability
+# question in-process; the shared file queue only serves as the fallback.
+BRIDGE_PROBE_URL = "http://127.0.0.1:8776/api/probe"
 # queue_probe() reports this when the session-side worker never picked the probe
 # up; it is a queue failure, not a verdict on the client.
 PROBE_UNAVAILABLE = "(no probe output)"
@@ -142,6 +147,27 @@ def queue_probe(timeout=75):
     return "(no probe output)"
 
 
+def http_probe(move=False):
+    """Ask the isolated session's bridge whether input injection still works.
+
+    The bridge answers from inside session 4 (see its /api/probe route), which
+    makes this a dedicated channel: it cannot be delayed by other automation that
+    shares the file queue.  Returns (verdict, text) with verdict None when the
+    bridge could not be reached, so the caller can fall back to the queue.
+    """
+    url = BRIDGE_PROBE_URL + ("?move=1" if move else "")
+    try:
+        with urllib.request.urlopen(url, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return None, "unreachable (%s)" % exc
+    foreground = int(payload.get("foreground") or 0)
+    moved = payload.get("movedCursor")
+    text = "fg=0x%X cls=%s setCursorPos=%s cursor=%s" % (
+        foreground, payload.get("className") or "", moved, payload.get("cursor"))
+    return (foreground != 0 and moved is not False), text
+
+
 def run_task(name):
     """Start a scheduled task without spawning schtasks.exe.
 
@@ -166,30 +192,54 @@ try:
 except Exception as exc:  # never let parking break the probe
     log("client park failed: %s" % exc)
 
-out = queue_probe()
-log("probe: " + out)
-if "setCursorPos=True" not in out:
-    if out.strip() == PROBE_UNAVAILABLE:
-        # The queue worker, not the session, is what failed here: the worker also
-        # serves other automation (measured: a Quark Cloud Drive run held it for
-        # minutes), and a probe that was never picked up says nothing about the
-        # client.  Reconnecting cannot fix a busy worker, so leave the connection
-        # alone and let the next beat retry.
-        log("probe unavailable -> not reconnecting (shared queue worker busy)")
-        sys.exit(2)
-    # A dead input desktop usually means a displaced client window rather than a
-    # dead connection, so re-assert the window and ask once more before tearing
-    # the session down.  Reconnecting costs the session's automation ~2 minutes.
-    try:
-        log("client(re-assert): " + park_client(force=True))
-    except Exception as exc:
-        log("client re-assert failed: %s" % exc)
-    time.sleep(3)
+
+def measure(move=False, label="http"):
+    """Ask one channel for the session's input-desktop state.
+
+    Returns (verdict, text) where True means injectable, False means measured
+    broken and None means no measurement at all.  The bridge answers in-process
+    over HTTP, so the healthy path never touches the shared file queue; the queue
+    stays as the fallback for when the bridge itself is down.
+    """
+    if label == "http":
+        verdict, text = http_probe(move=move)
+        log("probe(http%s): %s" % (",strong" if move else "", text or "unreachable"))
+        if verdict is not None:
+            return verdict, text
     out = queue_probe()
-    log("probe(retry): " + out)
-if "setCursorPos=True" in out:
+    log("probe(queue): " + out)
+    if out.strip() == PROBE_UNAVAILABLE:
+        return None, out
+    return ("setCursorPos=True" in out), out
+
+
+verdict, out = measure()
+if verdict is True:
     log("healthy")
     sys.exit(0)
+if verdict is None:
+    # Neither channel produced a measurement, so nothing is known about the
+    # client: a busy queue or a dead bridge cannot be fixed by reconnecting, and
+    # reconnecting would cost the session's automation for nothing.
+    log("no probe measurement -> not reconnecting")
+    sys.exit(2)
+
+# A dead input desktop usually means a displaced client window rather than a dead
+# connection, so re-assert the window and confirm with the stronger cursor test
+# before tearing the session down.  Reconnecting costs ~2 minutes of automation.
+log("unhealthy -> re-asserting the client window")
+try:
+    log("client(re-assert): " + park_client(force=True))
+except Exception as exc:
+    log("client re-assert failed: %s" % exc)
+time.sleep(3)
+verdict, out = measure(move=True)
+if verdict is True:
+    log("healthy after re-assert")
+    sys.exit(0)
+if verdict is None:
+    log("no probe measurement after re-assert -> not reconnecting")
+    sys.exit(2)
 
 log("unhealthy -> triggering RDP reconnect")
 rc, detail = run_task("cwin-s1-rdp-reconnect")
@@ -200,6 +250,6 @@ try:
     log("client: " + park_client())
 except Exception as exc:
     log("client park failed: %s" % exc)
-out2 = queue_probe()
-log("after reconnect: " + out2)
-log("recovered" if "setCursorPos=True" in out2 else "still unhealthy")
+verdict, out = measure(move=True)
+log("after reconnect: " + out)
+log("recovered" if verdict is True else "still unhealthy")
