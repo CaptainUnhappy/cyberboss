@@ -261,6 +261,20 @@ def mouse_click(x, y, settle=0.25):
     return True
 
 
+def mouse_double_click(x, y, settle=0.25):
+    """Two rapid down/up pairs - some list rows only open on a real dblclick."""
+    if not set_cursor(x, y):
+        return False
+    time.sleep(settle)
+    for _ in range(2):
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.04)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.06)
+    time.sleep(0.9)
+    return True
+
+
 def post_click(hwnd, x, y):
     lp = (int(y) << 16) | (int(x) & 0xFFFF)
     user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, lp)
@@ -652,7 +666,10 @@ def cmd_click(args):
         time.sleep(args.settle)
     else:
         if args.mode in ("mouse", "both"):
-            mouse_click(sx, sy)
+            if args.double:
+                mouse_double_click(sx, sy)
+            else:
+                mouse_click(sx, sy)
             time.sleep(args.settle)
         if args.mode in ("message", "both") and child:
             p = POINT(args.x, args.y)
@@ -878,6 +895,109 @@ def cmd_desktop(args):
     return 0 if ratio > args.min_ratio else 5
 
 
+def mouse_wheel(clicks, settle=0.4):
+    """Scroll the client content (negative = down)."""
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", ctypes.c_ulong), ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong), ("dwExtraInfo", ULONG_PTR)]
+
+    class MINPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT),
+                    ("pad1", ctypes.c_int), ("pad2", ctypes.c_int)]
+
+    MOUSEEVENTF_WHEEL = 0x0800
+    arr = (MINPUT * 1)()
+    arr[0].type = 0
+    arr[0].mi.dy = int(clicks * 120)
+    arr[0].mi.dwFlags = MOUSEEVENTF_WHEEL
+    sent = user32.SendInput(1, arr, ctypes.sizeof(MINPUT))
+    time.sleep(settle)
+    return sent
+
+
+def cmd_wheel(args):
+    pid, hwnd = main_window()
+    if not hwnd:
+        log("wheel", ok=False, error="client window not found")
+        return 2
+    ok, how, tries = ensure_front(hwnd)
+    if not ok:
+        log("wheel", ok=False, error="client is not in front")
+        return 6
+    cx, cy = client_origin(hwnd)
+    set_cursor(cx + args.x, cy + args.y)
+    time.sleep(0.3)
+    sent = mouse_wheel(args.clicks)
+    log("wheel", clicks=args.clicks, at=(args.x, args.y), sent=sent)
+    if args.shot:
+        screenshot(args.shot)
+        log("shot", path=args.shot)
+    return 0
+
+
+def find_window_by_title(part):
+    """Largest visible top-level window whose title contains `part`."""
+    best, best_area = None, 0
+    for hwnd in top_level_windows():
+        if not is_visible(hwnd):
+            continue
+        if part not in window_text(hwnd):
+            continue
+        l, t, r, b = window_rect(hwnd)
+        area = max(0, r - l) * max(0, b - t)
+        if area > best_area:
+            best, best_area = hwnd, area
+    return best
+
+
+def cmd_clickwin(args):
+    """Click a client-relative point inside a *specific* client sub-window.
+
+    The client's share dialog and action bar live in their own top-level windows
+    inside the same process; clicking the main window at those coordinates is not
+    always the same thing.
+    """
+    hwnd = None
+    if args.hwnd:
+        hwnd = int(args.hwnd, 16) if args.hwnd.lower().startswith("0x") else int(args.hwnd)
+        if not user32.IsWindow(hwnd):
+            log("clickwin", ok=False, error="hwnd %s is not a window" % args.hwnd)
+            return 2
+    else:
+        hwnd = find_window_by_title(args.window)
+    if not hwnd:
+        log("clickwin", ok=False, error="no window with title containing %r" % args.window)
+        return 2
+    activate(hwnd)
+    time.sleep(0.4)
+    cx, cy = client_origin(hwnd)
+    l, t, r, b = window_rect(hwnd)
+    sx, sy = cx + args.x, cy + args.y
+    child = window_under(sx, sy)
+    log("clickwin", window=args.window, hwnd=hex(hwnd), rect=(l, t, r, b),
+        client_origin=(cx, cy), target=(sx, sy),
+        under=hex(child) if child else None, under_cls=class_name(child) if child else None)
+    if args.hover:
+        set_cursor(sx, sy)
+        time.sleep(args.settle)
+    else:
+        if args.mode in ("mouse", "both"):
+            mouse_click(sx, sy)
+            time.sleep(args.settle)
+        if args.mode in ("message", "both") and child:
+            p = POINT(args.x, args.y)
+            user32.ScreenToClient(child, ctypes.byref(p))
+            post_click(child, p.x, p.y)
+            time.sleep(args.settle)
+    dlg = find_dialog("选择文件")
+    log("clickwin", done=True, picker=bool(dlg), foreground=foreground()[3][:40])
+    if args.shot:
+        screenshot(args.shot)
+        log("shot", path=args.shot)
+    return 0
+
+
 def cmd_verify(args):
     db = download_db_path()
     if db:
@@ -888,13 +1008,36 @@ def cmd_verify(args):
             db_mtime=time.strftime("%H:%M:%S", time.localtime(st.st_mtime)),
             rows_hint=blob.count(b"download_task"))
     d = download_dir_default()
-    entries = []
-    if os.path.isdir(d):
-        for name in sorted(os.listdir(d)):
-            if name == "desktop.ini":
-                continue
-            entries.append("%s(%d)" % (name, os.path.getsize(os.path.join(d, name))))
-    log("verify", download_dir=d, files=len(entries), list=",".join(entries[:8]))
+    if not os.path.isdir(d):
+        log("verify", download_dir=d, exists=False)
+        return 0
+    entries = [x for x in sorted(os.listdir(d)) if x != "desktop.ini"]
+    log("verify", download_dir=d, entries=len(entries))
+    for name in entries:
+        full = os.path.join(d, name)
+        try:
+            if os.path.isdir(full):
+                # report real contents: a folder hides the whole download otherwise
+                total = 0
+                count = 0
+                partial = 0
+                for root, _dirs, files in os.walk(full):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        try:
+                            total += os.path.getsize(fp)
+                        except OSError:
+                            pass
+                        count += 1
+                        if f.endswith((".qkdownloading", ".part", ".tmp", ".crdownload")):
+                            partial += 1
+                log("verify", dir=name, files=count, bytes=total,
+                    mib=round(total / 1048576.0, 1), partial=partial)
+            else:
+                log("verify", file=name, bytes=os.path.getsize(full),
+                    mib=round(os.path.getsize(full) / 1048576.0, 1))
+        except OSError as exc:
+            log("verify", entry=name, error=str(exc))
     return 0
 
 
@@ -935,6 +1078,7 @@ def build_parser():
     s.add_argument("--x", type=int, required=True)
     s.add_argument("--y", type=int, required=True)
     s.add_argument("--hover", action="store_true")
+    s.add_argument("--double", action="store_true", help="send a double click instead of a single one")
     s.add_argument("--mode", choices=["mouse", "message", "both"], default="mouse")
     s.add_argument("--settle", type=float, default=2.5)
     s.add_argument("--region", type=int, nargs=4, metavar=("L", "T", "R", "B"),
@@ -978,6 +1122,25 @@ def build_parser():
     s.add_argument("--min-ratio", type=float, default=0.02)
     s.add_argument("--out", default=None)
     s.set_defaults(func=cmd_desktop)
+
+    s = sub.add_parser("clickwin", help="click a client-relative point inside a named sub-window")
+    s.add_argument("--window", default=None, help="substring of the target window's title (ASCII-safe)")
+    s.add_argument("--hwnd", default=None, help="target window handle, decimal or 0x-hex (preferred: "
+                                                "non-ASCII titles get mangled by the ANSI console)")
+    s.add_argument("--x", type=int, required=True)
+    s.add_argument("--y", type=int, required=True)
+    s.add_argument("--hover", action="store_true")
+    s.add_argument("--mode", choices=["mouse", "message", "both"], default="mouse")
+    s.add_argument("--settle", type=float, default=2.5)
+    s.add_argument("--shot", default=None)
+    s.set_defaults(func=cmd_clickwin)
+
+    s = sub.add_parser("wheel", help="scroll inside the client (negative clicks = scroll down)")
+    s.add_argument("--clicks", type=int, default=-3)
+    s.add_argument("--x", type=int, default=640)
+    s.add_argument("--y", type=int, default=400)
+    s.add_argument("--shot", default=None)
+    s.set_defaults(func=cmd_wheel)
 
     s = sub.add_parser("verify", help="download dir + client task table state")
     s.set_defaults(func=cmd_verify)
