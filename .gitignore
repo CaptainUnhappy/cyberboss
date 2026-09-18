@@ -28,3 +28,5 @@ outputs/
 qr-network-*.pcap
 wechat-login-qr.*
 wechatpad-root.html
+tmp/
+.env.bak-*
