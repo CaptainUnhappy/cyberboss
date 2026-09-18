@@ -1042,10 +1042,25 @@ class CyberbossApp {
       );
       return true;
     }
-    this.markPipelineUserInbound?.(message?.receivedAt);
     if (message?.direction === "outgoing") {
+      // The driven account observes its own replies as outgoing rows. A reply
+      // the ledger could not match - for example one polled after the match
+      // window, or one whose status is no longer matchable - must never be
+      // routed back as operator input, otherwise the bot answers itself and
+      // the conversation runs away. Only an explicit operator test marker may
+      // travel the "same-account manual" path; everything else is our own echo.
+      if (!isTestSessionRequest(message?.text)) {
+        console.log(
+          `[cyberboss] WeFlow self echo suppressed`
+          + ` localId=${message?.localId || "(unknown)"}`
+          + ` matchedBy=${classification?.matchedBy || classification?.origin || "ledger"}`
+          + ` marker=[test] missing`
+        );
+        return true;
+      }
       effectiveMessage = { ...message, origin: "self_manual" };
     }
+    this.markPipelineUserInbound?.(message?.receivedAt);
     const target = this.resolveWeFlowInboxReplyTarget();
     if (!target) {
       return false;
