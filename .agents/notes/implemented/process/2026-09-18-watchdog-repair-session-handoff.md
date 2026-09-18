@@ -46,4 +46,11 @@ Status: implemented
 - 代价：每次唤醒都消耗一轮真实 agent（时间与 token）；维修工在无沙箱上下文里执行命令，边界只能靠契约文字约束。
 - 代价：验证要求出站链路可用。若同一隔离桌面里还有别的自动化在跑（另一个 agent 的 UIA 任务），验证会以桥的 502 失败 —— 那是真实信号（发送被占桌面的对手打断），不是误报。
 - 首次实跑记录（2026-09-18 17:14）：`repair-verify.js` 的触发消息**投递成功**（桥 `dispatched=true, verified=true, localId=40`，大号可见），机器人也确实把这一轮路由进了保留会话（日志 `dsh-acp resumed session 984d9210-… for window test-session`），但**回复没发出来** —— 出站再次被 502/abort 挡住（`WeFlow UIA inbound acknowledgement failed: This operation was aborted` → `deferred system reply`），因为同一隔离桌面里另一个 agent 的自动化正在跑。结果是 `ok=false`：这是**真负例**，验证正确指出了"发送侧仍不可用"，而不是误报。
-- 已知缺口：① 验证由维修工契约触发；若它没跑，看门狗不会补跑（可加"健康 + 存在未验证的 dispatch 报告 → 自己跑一次"）；② `scripts/weflow-self-manual-e2e.js` 仍硬编码旧端口 8766 与旧的单数 `CYBERBOSS_WEFLOW_INBOX_CHAT`，在新部署上会直接抛错，需要单独修；③ 机械修复预算（4/天）与维修工唤醒共用同一本账，后续可能要把唤醒单独计账；④ 状态目录出现 `EPERM ... rename .weflow-inbox-cursor.json.tmp` 偶发失败，来源未定位（怀疑杀软或并发写），暂未处理。
+- **唤醒走自己的门槛，不占机械修复预算**：`Invoke-RepairSessionWake` 维护独立的 `cyberboss-repair-wake.json`（24 小时内最多 6 次、两次之间至少 30 分钟）。理由是当天的事故本身：4 次无效机械重启把 4/天的预算吃光后，看门狗连续 7 小时只打印 `repair suppressed ... reason=daily_budget`，**任何形式的修复都不再被允许**。所以抑制分支（`repair suppressed` 之后）与修复分支**都**会调用唤醒；维修工的会话只在异常时被唤醒，平时不常驻、不被探活（用户 2026-09-18 明确要求）。
+
+## Known gaps
+
+- 验证由维修工契约触发；若它没跑，看门狗不会补跑（可加"健康 + 存在未验证的 dispatch 报告 → 自己跑一次"）。
+- `scripts/weflow-self-manual-e2e.js` 仍硬编码旧端口 8766 与旧的单数 `CYBERBOSS_WEFLOW_INBOX_CHAT`，在新部署上会直接抛错，需要单独修。
+- 状态目录偶发 `EPERM ... rename .weflow-inbox-cursor.json.tmp -> weflow-inbox-cursor.json`，来源未定位（怀疑杀软或并发写），暂未处理。
+- 看门狗是单实例：上一拍还在跑时手动再跑一次会被"已在运行"挡掉，验证唤醒链路要等下一个自然心跳（或先等上一拍结束）。

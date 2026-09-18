@@ -483,6 +483,85 @@ function Get-RecoveryGate {
   }
 }
 
+function Invoke-RepairSessionWake {
+  <#
+    Wake the fixed repair session (维修工) with one fault report.
+
+    Kept separate from the mechanical repair budget on purpose: on 2026-09-18 four
+    restarts that cannot fix a third-party reader (WeFlow answered HTTP 500 on its
+    message API throughout) exhausted the 4/day mechanical budget, and then no
+    repair of any kind was allowed for seven hours. The wake therefore runs on its
+    own coarse gate - one wake per 30 minutes, six per 24 hours - so an anomaly
+    always reaches the session that can actually investigate it.
+  #>
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Components,
+    [string]$Fingerprint = "",
+    [string]$PlannedRepair = "",
+    [string]$Reason = ""
+  )
+  if (-not ((Get-ProjectEnvValue -Name "CYBERBOSS_REPAIR_ENABLED") -match "^(?i:1|true|yes|on)$")) { return $false }
+  $dispatchScript = Join-Path $ProjectRoot "scripts\repair-dispatch.js"
+  if (-not (Test-Path -LiteralPath $dispatchScript)) {
+    Write-WatchdogLog "repair wake skipped: $dispatchScript is missing"
+    return $false
+  }
+
+  $now = (Get-Date).ToUniversalTime()
+  $wakeFile = Join-Path $StateDir "cyberboss-repair-wake.json"
+  $attempts = @()
+  if (Test-Path -LiteralPath $wakeFile) {
+    try {
+      $parsed = Get-Content -LiteralPath $wakeFile -Raw | ConvertFrom-Json
+      $attempts = @($parsed.attempts |
+        ForEach-Object { ConvertTo-UtcDateOrNull ([string]$_) } |
+        Where-Object { $_ -and $_ -gt $now.AddHours(-24) })
+    } catch {
+      $attempts = @()
+    }
+  }
+  $lastWake = @($attempts | Sort-Object | Select-Object -Last 1)
+  if ($lastWake.Count -gt 0 -and $now -lt $lastWake[0].AddMinutes(30)) {
+    Write-WatchdogLog "repair wake suppressed: previous wake at $($lastWake[0].ToString('o')) is under 30 minutes old"
+    return $false
+  }
+  if ($attempts.Count -ge 6) {
+    Write-WatchdogLog "repair wake suppressed: 6 wakes already within 24 hours"
+    return $false
+  }
+
+  $requestFile = Join-Path $StateDir "cyberboss-repair-request.json"
+  [ordered]@{
+    at = $now.ToString("o")
+    components = @($Components)
+    faultFingerprint = $Fingerprint
+    plannedRepair = $PlannedRepair
+    reason = $Reason
+  } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $requestFile -Encoding UTF8
+
+  # CYBERBOSS_REPAIR_DISPATCH_CMD exists so the wiring can be exercised without
+  # spending a real agent turn; production uses the dispatch script directly.
+  $override = Get-ProjectEnvValue -Name "CYBERBOSS_REPAIR_DISPATCH_CMD"
+  $fileName = "node.exe"
+  $fileArgs = @($dispatchScript, "--fault", $requestFile, "--reason", $Reason)
+  if (-not [string]::IsNullOrWhiteSpace($override)) {
+    $fileName = "powershell.exe"
+    $fileArgs = @("-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $override,
+      "-Fault", $requestFile, "-Reason", $Reason)
+  }
+  Start-Process -FilePath $fileName `
+    -ArgumentList $fileArgs `
+    -WorkingDirectory $ProjectRoot `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput (Join-Path $StateDir "cyberboss-repair-dispatch.out.log") `
+    -RedirectStandardError (Join-Path $StateDir "cyberboss-repair-dispatch.err.log") | Out-Null
+
+  [ordered]@{ attempts = @($attempts + $now) | ForEach-Object { $_.ToString("o") } } |
+    ConvertTo-Json | Set-Content -LiteralPath $wakeFile -Encoding UTF8
+  Write-WatchdogLog "repair session woken components=$($Components -join ',') reason=$Reason"
+  return $true
+}
+
 function Read-PidFile {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -4277,6 +4356,13 @@ try {
     $detail = "components=$($failed -join ','); plannedRepair=$repairMode; reason=$($gate.reason); retryAt=$($gate.retryAt)$inboxDetail$durableDetail"
     Save-Status -Snapshot $snapshot -Action $action -Detail $detail -RecoveryState $recovery
     Write-WatchdogLog "repair suppressed $detail"
+    # The mechanical budget is spent while the anomaly is confirmed and real: hand it
+    # to the repair session, whose own gate is independent of that budget.
+    [void](Invoke-RepairSessionWake `
+      -Components $failed `
+      -Fingerprint $failureFingerprint `
+      -PlannedRepair $repairMode `
+      -Reason "mechanical repair blocked by $($gate.reason); planned $repairMode")
     exit 2
   }
 
@@ -4431,43 +4517,12 @@ try {
   Ensure-WeixinStarted
 
   # Hand the confirmed fault to the fixed repair session (维修工) as well as running
-  # the mechanical controller below. Process restarts cannot fix every fault class -
-  # a third-party reader such as WeFlow kept answering HTTP 500 on its message API
-  # across four restarts on 2026-09-18 and exhausted the daily repair budget - so a
-  # session that can read the repo, the notes and the raw evidence gets the same
-  # fault report. The dispatch runs detached and holds its own lock file, so this
-  # heartbeat is never blocked by a repair worker's turn.
-  if ((Get-ProjectEnvValue -Name "CYBERBOSS_REPAIR_ENABLED") -match "^(?i:1|true|yes|on)$") {
-    try {
-      $repairDispatchScript = Join-Path $ProjectRoot "scripts\repair-dispatch.js"
-      if (Test-Path -LiteralPath $repairDispatchScript) {
-        $repairRequestFile = Join-Path $StateDir "cyberboss-repair-request.json"
-        [ordered]@{
-          at = (Get-Date).ToUniversalTime().ToString("o")
-          faultFingerprint = [string]$failureFingerprint
-          components = @($failed)
-          plannedRepair = $repairMode
-        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $repairRequestFile -Encoding UTF8
-        $dispatchOut = Join-Path $StateDir "cyberboss-repair-dispatch.out.log"
-        $dispatchErr = Join-Path $StateDir "cyberboss-repair-dispatch.err.log"
-        Start-Process -FilePath "node.exe" `
-          -ArgumentList @(
-            $repairDispatchScript,
-            "--fault", $repairRequestFile,
-            "--reason", "watchdog ${repairMode}: $($failed -join ',')"
-          ) `
-          -WorkingDirectory $ProjectRoot `
-          -WindowStyle Hidden `
-          -RedirectStandardOutput $dispatchOut `
-          -RedirectStandardError $dispatchErr | Out-Null
-        Write-WatchdogLog "repair session dispatched components=$($failed -join ',') mode=$repairMode"
-      } else {
-        Write-WatchdogLog "repair dispatch script missing: $repairDispatchScript"
-      }
-    } catch {
-      Write-WatchdogLog "repair dispatch failed: $($_.Exception.Message)"
-    }
-  }
+  # the mechanical controller below: process restarts cannot fix every fault class.
+  [void](Invoke-RepairSessionWake `
+    -Components $failed `
+    -Fingerprint $failureFingerprint `
+    -PlannedRepair $repairMode `
+    -Reason "watchdog mechanical repair $repairMode for $($failed -join ',')")
 
   $repairStdout = Join-Path $StateDir "cyberboss-watchdog-repair.out.log"
   $repairStderr = Join-Path $StateDir "cyberboss-watchdog-repair.err.log"
