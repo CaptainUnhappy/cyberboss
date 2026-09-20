@@ -1627,6 +1627,42 @@ def read_chat_input_value(value_pattern: Any) -> str:
     return "" if value is None else str(value)
 
 
+CLEAR_STALE_CHAT_INPUT = (os.environ.get("CYBERBOSS_WEFLOW_CLEAR_STALE_INPUT", "1").strip().lower()
+                          not in {"0", "false", "no", "off"})
+
+
+def clear_stale_chat_input(value_pattern: Any, existing: str) -> bool:
+    """Clear editor residue left behind by an earlier failed dispatch.
+
+    A dispatch that fails after the text is written - activation lost, foreground
+    stolen by another writer - leaves that text in the editor, and refusing to write
+    into a non-empty editor then turns the failure into a self-lock: measured on
+    2026-09-18, one 502 left "处理中" in the box and every later send answered 409
+    "confirmed chat input was not empty before dispatch" for hours, so no reply could
+    leave the account.  The residue belongs to automation rather than to a human
+    draft, so clearing is the default here; set CYBERBOSS_WEFLOW_CLEAR_STALE_INPUT=0
+    where a person really types into that window.
+    """
+    if not CLEAR_STALE_CHAT_INPUT:
+        return False
+    try:
+        value_pattern.SetValue("")
+    except Exception as error:
+        print(f"[weflow-uia] stale chat input could not be cleared: {error}", flush=True)
+        return False
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            if not read_chat_input_value(value_pattern):
+                print(f"[weflow-uia] cleared stale chat input before dispatch: {existing[:120]!r}", flush=True)
+                return True
+        except Exception:
+            break
+        time.sleep(0.05)
+    print("[weflow-uia] stale chat input did not verify empty after clearing", flush=True)
+    return False
+
+
 def write_chat_input_without_clipboard(
     input_control: automation.Control,
     text: str,
@@ -1642,7 +1678,7 @@ def write_chat_input_without_clipboard(
     """
     value_pattern = get_chat_input_value_pattern(input_control)
     existing = read_chat_input_value(value_pattern)
-    if existing:
+    if existing and not clear_stale_chat_input(value_pattern, existing):
         raise TargetNotConfirmedError(
             "confirmed chat input was not empty before dispatch"
         )
