@@ -12,6 +12,13 @@ PROBE_SCRIPT = os.path.join(PROBE_DIR, "in", "keepalive-probe.ps1")
 PROBE_OUT = os.path.join(PROBE_DIR, "keepalive-probe.txt")
 LOG = r"D:\Projects\cyberboss\tmp\cwin-lab\rdp-keepalive.log"
 HOLD_FILE = r"C:\ProgramData\cwin-probe\rdp-client-hold.txt"
+# The remote-control guard parks this file while ToDesk/GameViewer is being
+# controlled: the RDP client has to stay down so the remote tool binds to the
+# console session (session 1) instead of the isolated one.  It is treated as
+# "still wanted" only while it keeps being refreshed, so a guard that dies
+# cannot keep the client down forever.
+SUSPEND_FILE = r"C:\ProgramData\cwin-probe\rdp-client-suspend.txt"
+SUSPEND_FRESH_SECONDS = 600.0
 # The bridge runs inside the isolated session, so it can answer the injectability
 # question in-process; the shared file queue only serves as the fallback.
 BRIDGE_PROBE_URL = "http://127.0.0.1:8776/api/probe"
@@ -147,6 +154,20 @@ def queue_probe(timeout=75):
     return "(no probe output)"
 
 
+def suspend_active():
+    """True while the remote-control guard wants the client to stay down.
+
+    The guard refreshes this file every ~5s while a remote-control session is in
+    progress.  Staleness is the whole point: if the guard dies, the file ages out
+    and the keepalive goes back to its normal job of resurrecting the client.
+    """
+    try:
+        age = time.time() - os.path.getmtime(SUSPEND_FILE)
+    except OSError:
+        return False
+    return 0 <= age <= SUSPEND_FRESH_SECONDS
+
+
 def http_probe(move=False):
     """Ask the isolated session's bridge whether input injection still works.
 
@@ -240,6 +261,15 @@ if verdict is True:
 if verdict is None:
     log("no probe measurement after re-assert -> not reconnecting")
     sys.exit(2)
+
+if suspend_active():
+    # The remote-control guard owns the client right now: it took the client down
+    # on purpose so the remote tool binds to the console session, and it will
+    # bring the client back and trigger the reconnect when the session ends.
+    # Reconnecting here would fight it (the remote tool would grab session 4
+    # again mid-session) -- so stand down.
+    log("remote-control suspend active -> not reconnecting (guard owns the client)")
+    sys.exit(3)
 
 log("unhealthy -> triggering RDP reconnect")
 rc, detail = run_task("cwin-s1-rdp-reconnect")

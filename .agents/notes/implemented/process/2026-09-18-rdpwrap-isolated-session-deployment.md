@@ -27,7 +27,7 @@ Status: implemented
 
 **必须遵守的运行约束**
 
-1. **必须存在一个"已连接且未最小化/未隐藏"的 RDP 客户端**。客户端一断、一最小化或一隐藏，隔离会话就失去输入桌面（`GetForegroundWindow()=0`、`SetCursorPos` 返回 False）→ 桥报 `WeChat main window could not be activated` → **回复发不出去**（收消息仍正常，因为读侧只是文件/HTTP）。客户端被别的窗口挡住不影响注入（2026-09-18 实测：失效原因是**被最小化**，不是被遮挡）。
+1. **必须存在一个"已连接且未最小化/未隐藏"的 RDP 客户端**（**远控进行中的例外窗口见** [远控期间自动让出 RDP 客户端](../feature/2026-09-20-remote-control-rdp-client-handoff.md)：ToDesk / GameViewer 被控时会挑中 session 4，守卫在那段时间主动停掉客户端、远控结束后再拉回来）。客户端一断、一最小化或一隐藏，隔离会话就失去输入桌面（`GetForegroundWindow()=0`、`SetCursorPos` 返回 False）→ 桥报 `WeChat main window could not be activated` → **回复发不出去**（收消息仍正常，因为读侧只是文件/HTTP）。客户端被别的窗口挡住不影响注入（2026-09-18 实测：失效原因是**被最小化**，不是被遮挡）。
    **不想看见它时，把它挪到屏幕外（如 `x=1930`，屏幕宽 1920），不要最小化、不要隐藏** —— 屏幕外同样保持"已连接 + 可注入"（实测 `setCursorPos=True`）。会话桌面里的 WeFlow 每约 30 秒会自己起一次 `powershell.exe` + `conhost.exe`，那画面只出现在 RDP 窗口**内部**，停靠屏幕外即可不看见。
 2. **自动/周期性助手一律不得 spawn 控制台子系统子进程**（`tasklist.exe` / `taskkill.exe` / `schtasks.exe` / `cmd.exe` …）。本机把"创建控制台"交给 Windows Terminal，于是每次 spawn 都在**用户自己的桌面**上冒出一个终端窗口：`CREATE_NO_WINDOW` 只能削弱不能消除（实测 10 次 `tasklist` 仍产生 5 次可见终端事件），`powershell.exe -WindowStyle Hidden` 作为计划任务动作同样可见（实测 `CASCADIA_HOSTING_WINDOW_CLASS vis=True` + `PseudoConsoleWindow vis=True`）；`wscript.exe //B` + `hidden-run.vbs`（`WshShell.Run(cmd, 0, True)`）实测只产生隐藏的 `ConsoleWindowClass`（`vis=False`）。替代做法：进程枚举/终止走 Toolhelp32 + `TerminateProcess`；启动计划任务走 `Schedule.Service` COM；跑 PS 脚本走 VBS 包装器。
    这是 2026-09-18 用户第二次报"一直在弹 cmd 窗口"的真正根因：`rdp-autologin.py` 在重连期间**每 1 秒 spawn 一次 `tasklist.exe`**，一次重连 ≈ 110 个终端窗口；用户说的"好像是 rdp 重启就出现"完全正确 —— 那正是重连助手在跑。早先本笔记把锅归给 WeFlow 每 30 秒的控制台窗口，那只在 RDP 窗口画面里可见，与用户桌面上的弹窗无关（已更正）。
@@ -38,7 +38,7 @@ Status: implemented
 
 **保活与静默**
 
-代码在 `scripts/isolated-session/`（**已入库**，计划任务指向仓库路径）：`rdp-keepalive.py`（保活）、`rdp-autologin.py`（重连 + 点掉证书框）、`rdp-client.ps1`（查看开关）、`hidden-run.vbs`（无窗口跑 PS）、`bridge-restart.ps1`（在隔离会话内重启 8776 桥）。`cwin-s1-rdp-keepalive` / `-reconnect` 用 `pythonw.exe` 执行，`-show` / `-hide` 用 `wscript.exe //B //NoLogo hidden-run.vbs` 执行 —— 两者都不产生可见控制台。
+代码在 `scripts/isolated-session/`（**已入库**，计划任务指向仓库路径）：`rdp-keepalive.py`（保活）、`rdp-autologin.py`（重连 + 点掉证书框）、`rdp-client.ps1`（查看开关）、`hidden-run.vbs`（无窗口跑 PS）、`bridge-restart.ps1`（在隔离会话内重启 8776 桥）、`rdp-remote-guard.py` + `register-guard-task.py`（远控期间让出客户端，见 [远控让出笔记](../feature/2026-09-20-remote-control-rdp-client-handoff.md)）。`cwin-s1-rdp-keepalive` / `-reconnect` 用 `pythonw.exe` 执行，`-show` / `-hide` 用 `wscript.exe //B //NoLogo hidden-run.vbs` 执行 —— 两者都不产生可见控制台。
 
 **探针通道**：保活优先走 **HTTP** `GET http://127.0.0.1:8776/api/probe`（桥就在隔离会话内，进程内直接回答"输入桌面还在不在"，即时返回），失败才退回会话内文件队列。之所以要这条专用通道：文件队列是共享的，另一个 workload 连续占用时会排队数分钟，旧实现因此把正常会话误判成故障。
 
