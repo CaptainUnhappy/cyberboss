@@ -109,3 +109,10 @@ Status: proposed
       return drained;
     }
 
+
+## 进度（2026-09-22，自主执行中）
+
+- ① **队列按 id 去重** ✅ `3e3146c`：`enqueue` 改为同 id 覆盖，新增 `enqueueUnique`；自测：同 id 入队两次仍只有一条。
+- ② **重试调度器 + 队列 schema 扩展** ✅ 本次提交：新增 `src/core/deferred-reply-retry-scheduler.js`（30s/1m/2m/5m 封顶、8 次上限、同发件人不重叠、可注入假定时器），并把 `attemptCount` / `nextRetryAtMs` / `exhausted` 三个字段加进 `normalizeDeferredSystemReply` 的白名单——之前严格白名单会把它们丢掉，导致计数每次归零、上限永远到不了（自测抓到的真 bug）。旧文件缺这三个字段时按 `0 / null / false` 处理，向后兼容。
+  - 自测（`node src/core/deferred-reply-retry-scheduler.js`）：成功发送不留残余；失败按原 id 回队且只留一条；第 3 次失败触发 `onGiveUp` 并把条目标记 `exhausted` 留在队列；退避实测 `[30000, 60000]`。
+- ③ **接进 `app.js` + 停桥注入验证** ⏳ 未做：`app.js` 里 `new DeferredReplyRetryScheduler({ store, format: formatDeferredSystemReplyBatch, send })`，并在 `deferSystemReply` 里 `scheduler.schedule(accountId, senderId)`；send 用 `streamDelivery` 的 `state` + `sendSystemReply`（坐标见上面"实现侦察"节）。验收：停桥 → ≤60 秒自愈 → 不重复。

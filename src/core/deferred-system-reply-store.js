@@ -115,6 +115,11 @@ function normalizeDeferredSystemReply(reply) {
   const createdAt = normalizeIsoTime(reply.createdAt);
   const failedAt = normalizeIsoTime(reply.failedAt);
   const lastError = normalizeText(reply.lastError);
+  // Retry bookkeeping (deferred-reply-retry-scheduler.js): a strict field list
+  // dropped these once, resetting the attempt counter on every re-queue.
+  const attemptCount = Number.isFinite(Number(reply.attemptCount)) && Number(reply.attemptCount) > 0 ? Math.floor(Number(reply.attemptCount)) : 0;
+  const nextRetryAtMs = Number.isFinite(Number(reply.nextRetryAtMs)) && Number(reply.nextRetryAtMs) > 0 ? Math.floor(Number(reply.nextRetryAtMs)) : null;
+  const exhausted = reply.exhausted === true;
   if (!id || !accountId || !senderId || !text) {
     return null;
   }
@@ -128,6 +133,9 @@ function normalizeDeferredSystemReply(reply) {
     createdAt: createdAt || new Date().toISOString(),
     failedAt: failedAt || new Date().toISOString(),
     lastError,
+    attemptCount,
+    nextRetryAtMs,
+    exhausted,
   };
 }
 
