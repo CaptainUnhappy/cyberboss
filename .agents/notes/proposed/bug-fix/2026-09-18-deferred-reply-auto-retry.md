@@ -132,3 +132,22 @@ Status: proposed
 - `stream-delivery.js` 的 `deferSystemReply` 现在把**路由**一起交出来（`provider / contextToken / weflowContact / weflowTalker / weflowExactContact`）——之前只交 `threadId/userId/text/kind`，补发因此无法寻址到桥。
 - `app.js`：`deferSystemReply` 采集路由入队后 `scheduler.schedule(accountId, senderId)`；新增 `deferredReplyRetryScheduler()`（懒建）与 `deliverDeferredReplyBatch()`（用条目路由 + `getKnownContextTokens()` 的落盘 token，走 `channelAdapter.sendText`，因此**保留账本与回声归因**）；`start()` 里 `rehydrate()` 重新武装队列里已有的积压。
 - 验证状态：`npm run check` 绿、调度器自测绿（退避/去重/上限）、store 行为测试绿（路由与簿记都保留）。**端到端"重启后自动补发"尚未观察到**：本轮 restack 后机器人启动日志不完整（restack 会截断日志，且 launcher 有 `already_running_unknown_pid` 干扰），队列 8 条簿记未被改动。下一轮：确认机器人把 `start()` 跑到 `bridge loop started`（必要时手工 `node bin/cyberboss.js start --checkin` 前台观察），再看 8 条积压是否在 30 秒后被补发并写入账本。
+
+### 端到端验证（2026-09-22 round 3，真实积压）
+
+重启栈后机器人启动日志（`C:\ProgramData\cwin-probe\stack\shared.*.log`）逐条命中：
+
+```
+[cyberboss] bootstrap ok
+[cyberboss] bridge loop started; waiting for WeChat messages.
+[cyberboss] deferred retry re-armed senders=1                                  ← rehydrate 生效
+[cyberboss] deferred retry failed sender=o9cq…@im.wechat count=8 requeued=8 givenUp=0: sendMessage ret=-2 …
+```
+
+- **不再等下一条入站**：启动 30 秒后调度器自己 drain 了全部 8 条并尝试投递（旧行为是永远等）。
+- **簿记落盘**：队列首条由 `attempt=` 空值变为 `attempt=1 next=1790048047671 exhausted=False` → 退避与次数上限可跨重启延续。
+- **同 id 不重复**：`requeued=8` 且队列条数仍是 8（原 8 条按 id 覆盖回队，没有翻倍）。
+- 这 8 条**投递失败的原因与本次修复无关**：官方通道 `sendMessage ret=-2`（4 天前的 context token 已失效）。现在的差别是——**失败被看见并计次**，而不是静默躺平。
+- 机器人同时确认仍能正常收发：账本新增 `verified`，`dsh-acp resumed session … for window test-session`。
+
+**观察方法与坑**：机器人 stdout 走 launcher 的 `stdio: inherit`，由 `cwin-s1-restack` 重定向进 `stack\shared.out.log`；`~/.cyberboss/logs/shared-weflow.out.log` 是 Ally 时代的陈旧文件，别拿它当证据。另外 restack 会**截断**这两个日志文件，所以要"重启后立刻看"。
