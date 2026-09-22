@@ -202,11 +202,16 @@ function Repair-PidFileFromListener {
     [Parameter(Mandatory = $true)][string]$PidFile,
     [Parameter(Mandatory = $true)][string]$CommandPattern,
     [Parameter(Mandatory = $true)][string]$HostName,
-    [Parameter(Mandatory = $true)][int]$PortNumber
+    [Parameter(Mandatory = $true)][int]$PortNumber,
+    # Set for components that may live in the isolated session, where the
+    # command line is unreadable across Windows accounts.
+    [switch]$AllowEndpointOwnership
   )
 
   $currentPid = Read-PidFile -Path $PidFile
-  if (Test-VerifiedPidAlive -PidValue $currentPid -CommandPattern $CommandPattern) {
+  $endpointOwned = [bool]$AllowEndpointOwnership `
+    -and (Test-PidOwnsTcpEndpoint -PidValue $currentPid -HostName $HostName -PortNumber $PortNumber)
+  if ((Test-VerifiedPidAlive -PidValue $currentPid -CommandPattern $CommandPattern) -or $endpointOwned) {
     if (Test-TcpPort -HostName $HostName -PortNumber $PortNumber) {
       $currentListeners = @(Get-TcpListenerProcessIds -PortNumber $PortNumber)
       if ($currentListeners.Count -ne 1 -or [int]$currentListeners[0] -ne $currentPid) {
@@ -227,6 +232,11 @@ function Repair-PidFileFromListener {
   $verified = @($listenerPids | Where-Object {
     Test-VerifiedPidAlive -PidValue ([int]$_) -CommandPattern $CommandPattern
   })
+  if ($AllowEndpointOwnership -and $listenerPids.Count -eq 1 -and (Test-PidAlive -PidValue ([int]$listenerPids[0]))) {
+    Write-PidFileAtomic -Path $PidFile -PidValue ([int]$listenerPids[0])
+    Write-Host "$Label PID file recovered from the sole endpoint owner PID $($listenerPids[0]) (identity by endpoint ownership)."
+    return [int]$listenerPids[0]
+  }
   if ($listenerPids.Count -ne 1 -or $verified.Count -ne 1) {
     throw "$Label endpoint ${HostName}:$PortNumber is open, but its sole owner could not be verified; it was left untouched"
   }
@@ -286,7 +296,8 @@ function Repair-ManagedPidFiles {
       -PidFile $WeFlowUiaBridgePidFile `
       -CommandPattern $WeFlowUiaCommandPattern `
       -HostName $WeFlowUiaEndpoint.Host `
-      -PortNumber $WeFlowUiaEndpoint.Port
+      -PortNumber $WeFlowUiaEndpoint.Port `
+      -AllowEndpointOwnership
   }
 }
 
@@ -389,7 +400,9 @@ function Stop-VerifiedPidValue {
     [Parameter(Mandatory = $true)][string]$Label,
     [Parameter(Mandatory = $true)][int]$PidValue,
     [string]$PidFile = "",
-    [Parameter(Mandatory = $true)][string]$CommandPattern
+    [Parameter(Mandatory = $true)][string]$CommandPattern,
+    [string]$HostName = "",
+    [int]$PortNumber = 0
   )
 
   if (-not (Test-PidAlive -PidValue $pidValue)) {
@@ -400,6 +413,17 @@ function Stop-VerifiedPidValue {
 
   $commandLine = Get-ProcessCommandLine -PidValue $pidValue
   if ($commandLine -notmatch $CommandPattern) {
+    # Never kill a process that cannot be identified. A component owned by the
+    # other Windows account has no readable command line; when the endpoint
+    # proves this PID is its sole owner, that component is managed inside its
+    # own session (see the bridge-restart recipe), so leave it alone instead of
+    # aborting the whole service operation.
+    if ([string]::IsNullOrWhiteSpace($commandLine) `
+        -and $PortNumber -gt 0 `
+        -and (Test-PidOwnsTcpEndpoint -PidValue $pidValue -HostName $HostName -PortNumber $PortNumber)) {
+      Write-Host "$Label PID $pidValue is owned by another Windows account (command line unreadable) and solely owns ${HostName}:$PortNumber; it is managed in its own session and was left untouched."
+      return
+    }
     throw "$Label PID $pidValue did not match the expected Cyberboss command. It was left untouched."
   }
 
@@ -454,7 +478,9 @@ function Stop-VerifiedProcess {
   param(
     [Parameter(Mandatory = $true)][string]$Label,
     [Parameter(Mandatory = $true)][string]$PidFile,
-    [Parameter(Mandatory = $true)][string]$CommandPattern
+    [Parameter(Mandatory = $true)][string]$CommandPattern,
+    [string]$HostName = "",
+    [int]$PortNumber = 0
   )
 
   $pidValue = Read-PidFile -Path $PidFile
@@ -462,7 +488,9 @@ function Stop-VerifiedProcess {
     -Label $Label `
     -PidValue $pidValue `
     -PidFile $PidFile `
-    -CommandPattern $CommandPattern
+    -CommandPattern $CommandPattern `
+    -HostName $HostName `
+    -PortNumber $PortNumber
 }
 
 function Test-Ready {
@@ -550,6 +578,41 @@ function Get-TcpListenerProcessIds {
   } catch {
     throw "could not verify the owner of local TCP port ${PortNumber}: $($_.Exception.Message)"
   }
+}
+
+function Test-PidOwnsTcpEndpoint {
+  param(
+    [Parameter(Mandatory = $true)][int]$PidValue,
+    [Parameter(Mandatory = $true)][string]$HostName,
+    [Parameter(Mandatory = $true)][int]$PortNumber
+  )
+
+  if ($PidValue -le 0) { return $false }
+  if (-not (Test-TcpPort -HostName $HostName -PortNumber $PortNumber)) { return $false }
+  $listeners = @(Get-TcpListenerProcessIds -PortNumber $PortNumber)
+  return $listeners.Count -eq 1 -and [int]$listeners[0] -eq $PidValue
+}
+
+# The bridge that drives the isolated session belongs to another Windows
+# account, and a non-elevated session-1 caller cannot read its command line at
+# all (measured 2026-09-22: PID 35260 came back with an empty CommandLine while
+# every session-1 PID was readable). Command-line matching can therefore never
+# verify that bridge, which used to abort every repair at the PID-file check
+# ("points to live PID 35260 with an unexpected command") even though the
+# endpoint was healthy. Endpoint ownership is the property the command-line
+# match was only ever a proxy for: the recorded PID is alive and is the *sole*
+# listener on the bridge port.
+function Test-UiaBridgePidVerified {
+  param([Parameter(Mandatory = $true)][int]$PidValue)
+
+  if (Test-VerifiedPidAlive -PidValue $PidValue -CommandPattern $WeFlowUiaCommandPattern) {
+    return $true
+  }
+  if (-not $WeFlowUiaEndpoint.IsLoopback) { return $false }
+  return Test-PidOwnsTcpEndpoint `
+    -PidValue $PidValue `
+    -HostName $WeFlowUiaEndpoint.Host `
+    -PortNumber $WeFlowUiaEndpoint.Port
 }
 
 function Test-WeFlowOwnsApiPort {
@@ -995,6 +1058,8 @@ function Stop-CyberbossComponents {
       Label = "WeFlow UIA Bridge"
       PidFile = $WeFlowUiaBridgePidFile
       CommandPattern = $WeFlowUiaCommandPattern
+      HostName = $WeFlowUiaEndpoint.Host
+      PortNumber = $WeFlowUiaEndpoint.Port
     }
   }
   $stopErrors = @()
@@ -1057,7 +1122,7 @@ function Stop-NewCyberbossComponents {
     @{ Label = "App Server"; PidFile = $AppServerPidFile; CommandPattern = $AppServerCommandPattern; BaselinePid = [int]$Baseline.AppServer }
   )
   if ($WeFlowUiaEndpoint.IsLoopback) {
-    $components += @{ Label = "WeFlow UIA Bridge"; PidFile = $WeFlowUiaBridgePidFile; CommandPattern = $WeFlowUiaCommandPattern; BaselinePid = [int]$Baseline.Uia }
+    $components += @{ Label = "WeFlow UIA Bridge"; PidFile = $WeFlowUiaBridgePidFile; CommandPattern = $WeFlowUiaCommandPattern; BaselinePid = [int]$Baseline.Uia; HostName = $WeFlowUiaEndpoint.Host; PortNumber = $WeFlowUiaEndpoint.Port }
   }
 
   $rollbackErrors = @()
@@ -1098,7 +1163,7 @@ function Show-ServiceStatus {
   $ready = Test-Ready
   $weFlowEnabled = Test-ProjectEnvFlag -Name "CYBERBOSS_ENABLE_WEFLOW_INBOX"
   $weFlowUiaBridgePid = Read-PidFile -Path $WeFlowUiaBridgePidFile
-  $weFlowUiaBridgeAlive = Test-VerifiedPidAlive -PidValue $weFlowUiaBridgePid -CommandPattern $WeFlowUiaCommandPattern
+  $weFlowUiaBridgeAlive = Test-UiaBridgePidVerified -PidValue $weFlowUiaBridgePid
   $weFlowUiaReady = Test-WeFlowUiaReady
   $weFlowFunctionalReady = Test-WeFlowFunctionalReady
   $weFlowHealthReady = $weFlowFunctionalReady -or (Test-WeFlowHealthReady)
@@ -1167,12 +1232,18 @@ function Start-CyberbossService {
   }
   $inboxEnabled = Test-ProjectEnvFlag -Name "CYBERBOSS_ENABLE_WEFLOW_INBOX"
   $baselineUia = if ($WeFlowUiaEndpoint.IsLoopback) {
-    Get-VerifiedManagedPid -PidFile $WeFlowUiaBridgePidFile -CommandPattern $WeFlowUiaCommandPattern
+    $candidateUia = Read-PidFile -Path $WeFlowUiaBridgePidFile
+    if (Test-UiaBridgePidVerified -PidValue $candidateUia) { $candidateUia } else { 0 }
   } else {
     0
   }
   if ($inboxEnabled -and $baselineUia -gt 0 -and -not (Test-WeFlowUiaReady)) {
-    Stop-VerifiedProcess -Label "unhealthy pre-existing WeFlow UIA Bridge" -PidFile $WeFlowUiaBridgePidFile -CommandPattern $WeFlowUiaCommandPattern
+    Stop-VerifiedProcess `
+      -Label "unhealthy pre-existing WeFlow UIA Bridge" `
+      -PidFile $WeFlowUiaBridgePidFile `
+      -CommandPattern $WeFlowUiaCommandPattern `
+      -HostName $WeFlowUiaEndpoint.Host `
+      -PortNumber $WeFlowUiaEndpoint.Port
     $baselineUia = 0
   }
   $baseline = [pscustomobject]@{ Bridge = 0; AppServer = $baselineAppServer; Uia = $baselineUia }
@@ -1210,7 +1281,7 @@ function Start-CyberbossService {
       -or (Test-VerifiedPidAlive -PidValue $newAppServerPid -CommandPattern $AppServerCommandPattern)
     $uiaIdentityReady = -not $inboxEnabled `
       -or -not $WeFlowUiaEndpoint.IsLoopback `
-      -or (Test-VerifiedPidAlive -PidValue $newUiaPid -CommandPattern $WeFlowUiaCommandPattern)
+      -or (Test-UiaBridgePidVerified -PidValue $newUiaPid)
     $uiaHealthReady = -not $inboxEnabled `
       -or -not $WeFlowUiaEndpoint.IsLoopback `
       -or (Test-WeFlowUiaHealthReady)

@@ -596,6 +596,41 @@ function Test-VerifiedPidAlive {
   return -not [string]::IsNullOrWhiteSpace($commandLine) -and $commandLine -match $CommandPattern
 }
 
+function Get-TcpListenerProcessIds {
+  param([Parameter(Mandatory = $true)][int]$PortNumber)
+
+  try {
+    return @(Get-NetTCPConnection -State Listen -LocalPort $PortNumber -ErrorAction Stop |
+      ForEach-Object { [int]$_.OwningProcess } |
+      Where-Object { $_ -gt 0 } |
+      Sort-Object -Unique)
+  } catch {
+    # An unreadable TCP table is "cannot prove", never "proved absent".
+    return @()
+  }
+}
+
+# The bridge that drives the isolated session belongs to another Windows
+# account, so a non-elevated session-1 caller cannot read its command line at
+# all (measured 2026-09-22: PID 35260 came back with an empty CommandLine while
+# every session-1 PID was readable). Command-line matching therefore reported
+# `uia=alive=false,health=true,ready=true` forever, which fanned out into a
+# canary failure and repeated repair attempts. Endpoint ownership is the
+# property the command-line match was only ever a proxy for: the recorded PID is
+# alive and is the *sole* listener on the bridge port.
+function Test-UiaBridgePidVerified {
+  param([int]$PidValue)
+
+  if ($PidValue -le 0) { return $false }
+  if (Test-VerifiedPidAlive -PidValue $PidValue -CommandPattern $UiaCommandPattern) { return $true }
+  if (-not (Test-PidAlive -PidValue $PidValue)) { return $false }
+  $endpoint = $null
+  try { $endpoint = [Uri]$UiaBaseUrl } catch { return $false }
+  if ($null -eq $endpoint -or -not $endpoint.IsLoopback -or $endpoint.Port -le 0) { return $false }
+  $listeners = @(Get-TcpListenerProcessIds -PortNumber $endpoint.Port)
+  return $listeners.Count -eq 1 -and [int]$listeners[0] -eq $PidValue
+}
+
 function Invoke-JsonEndpoint {
   param(
     [Parameter(Mandatory = $true)][string]$Uri,
@@ -2880,7 +2915,7 @@ function Get-HealthSnapshot {
   $uiaProcessAlive = Test-PidAlive -PidValue $uiaPid
   $bridgeAlive = Test-VerifiedPidAlive -PidValue $bridgePid -CommandPattern $BridgeCommandPattern
   $appServerAlive = Test-VerifiedPidAlive -PidValue $appServerPid -CommandPattern $AppServerCommandPattern
-  $uiaAlive = Test-VerifiedPidAlive -PidValue $uiaPid -CommandPattern $UiaCommandPattern
+  $uiaAlive = Test-UiaBridgePidVerified -PidValue $uiaPid
   $bridgeUptimeSeconds = -1
   if ($bridgeAlive) {
     $bridgeProcess = Get-Process -Id $bridgePid -ErrorAction SilentlyContinue

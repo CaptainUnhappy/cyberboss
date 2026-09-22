@@ -35,6 +35,7 @@ Status: implemented
 4. **RDP 客户端必须正常显示启动**：`rdp-autologin.py` 原来用 `STARTF_USESHOWWINDOW` + 默认 `wShowWindow=0`（SW_HIDE）启动 mstsc，等于把会话置于不可注入状态；已改为 `SW_SHOWNORMAL`。
 5. **同号人工输入与回声归因**：账本是唯一权威 —— 账本认领的发出消息按回声吞掉，未认领的按 `self_manual` 路由（见 [归因笔记](../bug-fix/2026-09-18-weflow-self-echo-attribution.md)）。
 6. **官方通道身份只能有一个消费者**：不能同时跑两份 bot。
+7. **跨账号进程的"身份"只能用端点归属证明**：桥活在 session 4（`cwinprobe`），session 1 的非管理员进程**读不到它的命令行**（2026-09-22 实测：PID 35260 的 `CommandLine` 为空，而同一个调用者能读到 session 1 的全部 PID）。所以"命令行匹配"（`Test-VerifiedPidAlive`）永远验证不了隔离会话里的桥，后果是双重的：看门狗把它报成 `uia=alive=false,health=true,ready=true`（`uia` 判失败又连带把 canary 判失败），`cyberboss-service.ps1` 的 PID 文件校验与停机路径则直接抛错 —— **所有机械 Restart/FullRestart 在动任何东西之前就中止**（2026-09-22 16:15 实测：`PID file points to live PID 35260 with an unexpected command`）。现在的判据是**端点归属**：PID 存活**且是该端口唯一监听者**即视为已验证（TCP 表跨账号可读）；停机路径遇到"命令行读不到 + 是唯一属主"的进程**不动它**（它由自己会话里的配方管），而不是抛错。别再退回命令行匹配。
 
 **保活与静默**
 
@@ -95,5 +96,6 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 - 收益：机器人的收发完全在隔离会话完成，用户桌面不参与；桥的失败模式从"抢占 + 遮挡 + 沙箱"收敛为"客户端是否连着"这一条，且这条有保活兜底。用户桌面上的控制台弹窗归零（实测：同一条重连路径 133 秒内产生 **0** 个可见终端事件，修复前是每 1 秒一个）。
 - 代价：多了一个必须活着的 RDP 客户端（`mstsc`）与一个 Windows 账号（`cwinprobe`）；隔离会话的资源占用与真实微信一致；保活/重连助手必须永远避开控制台子进程，这条约束会跟着每一次"顺手加一行 tasklist"复发。
 - 已知缺口：① **投递没有握手** —— 发送失败不重传、不通知（账本里已积累数十条 `status=failed`），方案见 [投递握手提案](../../proposed/feature/2026-09-18-weflow-reply-delivery-handshake.md)；② 隔离会话内的 Agent Room executor 曾因串行执行卡死，文件队列 `C:\ProgramData\cwin-probe\s4\{in,out,done}` 是更可靠的后备通道，但它**是共享资源**：另一个 workload（实测夸克网盘 `q1..q10`）占用时队列会排队数分钟，保活探针已改走 HTTP，队列只作为退路。
+- 遗留缺口（2026-09-22 实测，**未修**）：`scripts/shared-common.js` 的 `ensureWeFlowUiaBridge()` 在 8776 **探不通**时会删掉 PID 文件并**在 session 1 自己 spawn 一个桥** —— 这正是"两个桥抢 8776"的来源（一个在 session 1 看不到微信窗口，canary 触发就挂到 25s 超时）。端点恢复后它又因为 HTTP 通而"保留现状"，所以两个监听者可以长期并存。按本契约该走会话 4 的 `bridge-restart.ps1`，但仓库里还没有这条交接。
 - 桥多了一个 HTTP 契约 `/api/probe`（只读 / `?move=1` 强校验），它测的是"隔离会话的输入桌面"，与 `/readyz`（窗口存在性）不是一回事；改桥的探针语义要同步本笔记。
 - 部署脚本已入库到 `scripts/isolated-session/`（5 个文件，计划任务动作指向仓库路径）；仍留在 `C:\ProgramData\cwin-probe\` 的是历史实验脚本，其中 `s1-restack.ps1`（退役 Ally 栈的端口 8766/5031）与 `s1-mstsc-offscreen2.ps1` **尚未纳入本契约**，`cwin-s1-restack` / `cwin-s1-mstsc-off2` 两个任务保持原样。
