@@ -248,12 +248,23 @@ def probe_input_desktop(move_cursor: bool = False) -> dict:
                 cursor = [int(point.x), int(point.y)]
         except Exception:
             moved = False
+    # The canary/keepalive gate needs the idle time of the desktop *this bridge*
+    # drives. A caller in another session cannot measure it: the watchdog runs in
+    # session 1, so its own GetLastInputInfo reports the user's desktop and kept
+    # the canary deferred forever while the user was at the keyboard (measured
+    # 2026-09-22: idle=51s locally while the bot had been idle 37 minutes).
+    # Read-only: GetLastInputInfo never injects input.
+    try:
+        desktop_idle_seconds = get_desktop_idle_seconds()
+    except Exception:
+        desktop_idle_seconds = None
     return {
         "ok": bool(foreground) and (moved is not False),
         "foreground": foreground,
         "className": class_name,
         "movedCursor": moved,
         "cursor": cursor,
+        "desktopIdleSeconds": desktop_idle_seconds,
     }
 
 

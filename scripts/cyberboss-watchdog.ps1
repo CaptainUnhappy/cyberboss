@@ -2174,16 +2174,43 @@ function Get-PipelineActivityHealth {
   return $result
 }
 
+# The desktop that matters for the canary is the one the bridge injects into
+# (the isolated session), not the one this watchdog happens to run on. Only the
+# bridge can measure it, so ask it first; the local GetLastInputInfo path below
+# stays as the fallback for an older bridge or an unreachable endpoint.
+function Get-IsolatedDesktopIdleState {
+  param([Parameter(Mandatory = $true)][int]$ThresholdSeconds)
+
+  $probe = Invoke-JsonEndpoint -Uri "$($UiaBaseUrl.TrimEnd('/'))/api/probe"
+  if (-not $probe.Ok -or $null -eq $probe.Body) { return $null }
+  $raw = $probe.Body.desktopIdleSeconds
+  if ($null -eq $raw) { return $null }
+  $seconds = 0
+  if (-not [int]::TryParse([string]$raw, [ref]$seconds)) { return $null }
+  $seconds = [Math]::Max(0, $seconds)
+  return [ordered]@{
+    ready = $true
+    idle = $seconds -ge $ThresholdSeconds
+    desktopIdleSeconds = $seconds
+    thresholdSeconds = $ThresholdSeconds
+    reason = if ($seconds -ge $ThresholdSeconds) { "" } else { "desktop_recent_input" }
+    source = "isolated-session-bridge"
+  }
+}
+
 function Get-DesktopInputIdleState {
   param([int]$QuietSeconds = $CanaryDesktopQuietSeconds)
 
   $threshold = [Math]::Max(300, $QuietSeconds)
+  $isolated = Get-IsolatedDesktopIdleState -ThresholdSeconds $threshold
+  if ($null -ne $isolated) { return $isolated }
   $result = [ordered]@{
     ready = $false
     idle = $false
     desktopIdleSeconds = $null
     thresholdSeconds = $threshold
     reason = "desktop_input_unavailable"
+    source = "local-session-fallback"
   }
   try {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {

@@ -52,6 +52,8 @@ Status: implemented
 - 同一轮还暴露了验证的两个环境前提：① `repair-verify.js` 必须在能写 `C:\ProgramData\cwin-probe\repair\` 的上下文里跑（否则 `fs.writeFileSync` EPERM，脚本在打印结论前就崩，退出码 1，看起来像验证失败）；② 维修工自己的会话若被文件沙箱限制在工作区内，验证会以这个 EPERM 假失败收场 —— 判 `ok` 之前先确认报告文件真的写出来了。
 - 第三次实跑（2026-09-22 15:48）先遇到**假通过**（触发器被当成回复，21 秒返回 `ok=true`），补上 localId 下界后才拿到真通过：触发 localId 80 → 机器人回复含 marker 且 localId > 80。教训与上面的"看证据不看退出码"是同一条。
 - **唤醒走自己的门槛，不占机械修复预算**：`Invoke-RepairSessionWake` 维护独立的 `cyberboss-repair-wake.json`（24 小时内最多 6 次、两次之间至少 30 分钟）。理由是当天的事故本身：4 次无效机械重启把 4/天的预算吃光后，看门狗连续 7 小时只打印 `repair suppressed ... reason=daily_budget`，**任何形式的修复都不再被允许**。所以抑制分支（`repair suppressed` 之后）与修复分支**都**会调用唤醒；维修工的会话只在异常时被唤醒，平时不常驻、不被探活（用户 2026-09-18 明确要求）。
+- **canary 的"桌面空闲"门槛必须量注入侧**（2026-09-22 修）：`Get-DesktopInputIdleState` 原来用本进程的 `GetLastInputInfo`，而看门狗跑在 session 1 —— 用户一动键鼠门槛就按住，canary 永远不重跑，07:15 的陈旧失败因此被反复当成现役故障，最后把 4/天的机械修复预算吃光、`action=circuit_open`（`retryAt=2026-09-23T02:44`）。现在优先取桥在 `/api/probe` 里回报的隔离会话空闲秒数（实测同一时刻本地 51s vs 隔离桌面 2327s），并新增 `source` 字段。**"门槛量错了会话"和"故障没修好"看起来一模一样**：判 canary 之前先看 `canary.lastAttemptAt` 有没有前进。
+- 该轮后续：预算耗尽期间即使 canary 重跑成功，`nextRepairAllowedAt` 也要等 24 小时窗口滚过；只要快照转 healthy 就不需要修复，所以门槛修好后 `circuit_open` 会自动失效而不是卡住。
 
 ## Known gaps
 
