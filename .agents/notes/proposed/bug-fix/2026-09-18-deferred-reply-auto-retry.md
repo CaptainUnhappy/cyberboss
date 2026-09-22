@@ -116,3 +116,13 @@ Status: proposed
 - ② **重试调度器 + 队列 schema 扩展** ✅ 本次提交：新增 `src/core/deferred-reply-retry-scheduler.js`（30s/1m/2m/5m 封顶、8 次上限、同发件人不重叠、可注入假定时器），并把 `attemptCount` / `nextRetryAtMs` / `exhausted` 三个字段加进 `normalizeDeferredSystemReply` 的白名单——之前严格白名单会把它们丢掉，导致计数每次归零、上限永远到不了（自测抓到的真 bug）。旧文件缺这三个字段时按 `0 / null / false` 处理，向后兼容。
   - 自测（`node src/core/deferred-reply-retry-scheduler.js`）：成功发送不留残余；失败按原 id 回队且只留一条；第 3 次失败触发 `onGiveUp` 并把条目标记 `exhausted` 留在队列；退避实测 `[30000, 60000]`。
 - ③ **接进 `app.js` + 停桥注入验证** ⏳ 未做：`app.js` 里 `new DeferredReplyRetryScheduler({ store, format: formatDeferredSystemReplyBatch, send })`，并在 `deferSystemReply` 里 `scheduler.schedule(accountId, senderId)`；send 用 `streamDelivery` 的 `state` + `sendSystemReply`（坐标见上面"实现侦察"节）。验收：停桥 → ≤60 秒自愈 → 不重复。
+
+### 第 ③ 步的接口真相（2026-09-22 侦察，下一轮直接用）
+
+- **发一条文本的最小载荷**（`stream-delivery.js:785-793 sendSystemReply`）：
+  `{ userId, text, contextToken }` + `applyWeFlowReplyRoute(payload, target)` 补上 WeFlow 路由字段，然后 `channelAdapter.sendText(payload)`。
+- **context token 不需要等下一条入站**：`app.js:923` 已在用 `this.channelAdapter.getKnownContextTokens()`（`userId → token`），而它是**落盘**的（`context-token-store.js: persistContextToken / loadPersistedContextTokens`），进程重启后仍在。→ 补发可以直接取 token。
+- **难点是 `applyWeFlowReplyRoute` 需要 target**，而 deferred 条目只存了 `accountId / senderId / threadId / text / kind`，没有 weflow 路由字段（talker/contact）。两条候选路：
+  1. 从 `senderId`（形如 `weflow:<chatId>`）重建路由，再直接 `sendText`；
+  2. 改用 `streamDelivery.queueReplyTargetForThread(entry.threadId, target)`（`app.js:1825` 等处已在用）把补发排进投递管道，让既有路径负责 token 刷新/重试/记账。**待确认：排队目标是否会在没有新回合时被消费**——若必须等回合，这条路不成立。
+- 下一轮第一步：读 `queueReplyTargetForThread` 的消费者（`stream-delivery.js` 里 `replyTargetByBindingKey` / run-key 状态机），确认 1 还是 2。
