@@ -101,6 +101,18 @@ function messageText(message) {
   return "";
 }
 
+// The reader answers with the raw WeChat row schema, where "this account sent
+// it" is `isSend` (1) and there is no `direction` field at all. Accept the
+// normalized `direction: "outgoing"` shape too, so this stays correct for either
+// reader. Checking only `direction` made every successful round trip look like a
+// timeout: the reply was in the chat, the poll simply skipped it.
+function isOutgoingMessage(message) {
+  if (!message) return false;
+  const flag = message.isSend ?? message.is_send;
+  if (flag === true || flag === 1 || flag === "1") return true;
+  return String(message.direction || "").trim().toLowerCase() === "outgoing";
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const bridgeBaseUrl = normalizeBaseUrl(process.env.CYBERBOSS_WEFLOW_BRIDGE_BASE_URL, "CYBERBOSS_WEFLOW_BRIDGE_BASE_URL");
@@ -125,6 +137,24 @@ async function main() {
     result.verify = send.body;
   } else {
     result.dispatched = true;
+    // The trigger is itself an outgoing row from the same account, and its text
+    // contains the marker (we ask the bot to echo it). So "an outgoing row that
+    // contains the marker" also matches the trigger: a poll that accepts that
+    // reports success before the bot has answered anything. The answer must be a
+    // *later* row than the one we just sent, and never the trigger text itself.
+    const triggerLocalId = Number.parseInt(String(send.body?.localId ?? ""), 10);
+    const triggerText = text.trim();
+    result.triggerLocalId = send.body?.localId ?? "";
+    const isRepairReply = (message) => {
+      if (!isOutgoingMessage(message)) return false;
+      const body = messageText(message);
+      if (!body.includes(marker) || body.trim() === triggerText) return false;
+      const localId = Number.parseInt(String(message.localId ?? ""), 10);
+      if (Number.isFinite(triggerLocalId) && Number.isFinite(localId)) {
+        return localId > triggerLocalId;
+      }
+      return true;
+    };
     const deadline = Date.now() + args.timeoutMs;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
@@ -135,14 +165,12 @@ async function main() {
         result.detail = `reader error: ${error.message}`;
         continue;
       }
-      const hit = messages.find(
-        (message) => String(message.direction || "").toLowerCase() === "outgoing"
-          && messageText(message).includes(marker),
-      );
+      const hit = messages.find(isRepairReply);
       if (hit) {
         result.replySeen = true;
         result.ok = true;
         result.reply = messageText(hit).slice(0, 500);
+        result.replyLocalId = hit.localId ?? "";
         result.replyAt = hit.timestamp || "";
         break;
       }

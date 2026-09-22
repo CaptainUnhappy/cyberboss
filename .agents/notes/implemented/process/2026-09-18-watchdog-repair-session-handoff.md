@@ -27,6 +27,8 @@ Status: implemented
 
 - 通过 UIA 桥以**同号身份**向大号（`CYBERBOSS_WEFLOW_INBOX_CHAT` = `wxid_ubo0cy5xh4px22`）发一条 `[test] 服务已重启完成…<marker>`；因为带 `[test]`，这一轮落在保留会话 `test-session`（`src/core/app.js` 的 `TEST_SESSION_KEY`），不会污染真实窗口的上下文；因为没有账本条目，机器人按同号人工消息处理。
 - 然后轮询 WeFlow 的 `/api/v1/messages`，直到看到机器人**回复里含该唯一 marker**。退出码 0 = 端到端通（用户同时真的看到了那条重启消息）。
+  - 判定"这条是机器人发的"必须读**原始行 schema**：`isSend`（`true`/`1`/`"1"`），因为本机 WeFlow 的响应里**根本没有 `direction` 字段**（`cyberboss-watchdog-canary.js` 与 `src/integrations/weflow-inbox.js` 也是这么归一化的）。2026-09-22 之前这里只认 `direction === "outgoing"`，于是**每一轮成功的往返都被判成超时**：marker 已在库里、大号已收到，轮询却整条跳过。现已同时接受 `isSend` 与 `direction`。
+  - 但**只按"发出 + 含 marker"匹配必然误报**：触发消息本身就是同号的发出行，而且我们要求机器人"原样包含标记"，所以**触发文本里也有 marker**。修掉 `direction` 之后的第一版立刻把这个触发器当成了回复，在发出后 21 秒就 `ok=true`（假通过）。真正的判据是**时序**：回复必须是比触发更靠后的那一行 —— 用桥返回的 `sendBody.localId` 作下界，且内容不等于触发文本。判"验证通过"时同时看 `ok` 与 `reply`/`replyLocalId`，只看退出码会被这类假通过骗过。
 - 报告写 `C:\ProgramData\cwin-probe\repair\verify-<ts>.json` + `verify.log`。
 
 **4. 维修工的契约**（写进它的 bootstrap 与每次请求文本）：诊断 → 用 `scripts/isolated-session/` 已入库的配方修 → 跑 `node scripts/repair-verify.js` → 把结论写 `report-<ts>.json` → 简短回复。边界：不改 `.env` 端口/账号，不重启用户会话（session 1）的东西。
@@ -46,6 +48,9 @@ Status: implemented
 - 代价：每次唤醒都消耗一轮真实 agent（时间与 token）；维修工在无沙箱上下文里执行命令，边界只能靠契约文字约束。
 - 代价：验证要求出站链路可用。若同一隔离桌面里还有别的自动化在跑（另一个 agent 的 UIA 任务），验证会以桥的 502 失败 —— 那是真实信号（发送被占桌面的对手打断），不是误报。
 - 首次实跑记录（2026-09-18 17:14）：`repair-verify.js` 的触发消息**投递成功**（桥 `dispatched=true, verified=true, localId=40`，大号可见），机器人也确实把这一轮路由进了保留会话（日志 `dsh-acp resumed session 984d9210-… for window test-session`），但**回复没发出来** —— 出站再次被 502/abort 挡住（`WeFlow UIA inbound acknowledgement failed: This operation was aborted` → `deferred system reply`），因为同一隔离桌面里另一个 agent 的自动化正在跑。结果是 `ok=false`：这是**真负例**，验证正确指出了"发送侧仍不可用"，而不是误报。
+- 第二次实跑记录（2026-09-22 15:41，即上面那条 schema 修复之前）：那一轮**往返其实是通的** —— 小号发 `[test]`（localId 77）→ 机器人回"处理中"（78）→ 回 `REPAIR_OK_…`（79），三条 `isSend=1` 都在大号窗口里；但脚本只认 `direction`，因此 `ok=false` 且 `detail=no reply containing …`。**"marker 没回来"与"读侧认不出 marker"从此必须分开**：前者查 5051 的原始行，后者查这个 schema 判定。
+- 同一轮还暴露了验证的两个环境前提：① `repair-verify.js` 必须在能写 `C:\ProgramData\cwin-probe\repair\` 的上下文里跑（否则 `fs.writeFileSync` EPERM，脚本在打印结论前就崩，退出码 1，看起来像验证失败）；② 维修工自己的会话若被文件沙箱限制在工作区内，验证会以这个 EPERM 假失败收场 —— 判 `ok` 之前先确认报告文件真的写出来了。
+- 第三次实跑（2026-09-22 15:48）先遇到**假通过**（触发器被当成回复，21 秒返回 `ok=true`），补上 localId 下界后才拿到真通过：触发 localId 80 → 机器人回复含 marker 且 localId > 80。教训与上面的"看证据不看退出码"是同一条。
 - **唤醒走自己的门槛，不占机械修复预算**：`Invoke-RepairSessionWake` 维护独立的 `cyberboss-repair-wake.json`（24 小时内最多 6 次、两次之间至少 30 分钟）。理由是当天的事故本身：4 次无效机械重启把 4/天的预算吃光后，看门狗连续 7 小时只打印 `repair suppressed ... reason=daily_budget`，**任何形式的修复都不再被允许**。所以抑制分支（`repair suppressed` 之后）与修复分支**都**会调用唤醒；维修工的会话只在异常时被唤醒，平时不常驻、不被探活（用户 2026-09-18 明确要求）。
 
 ## Known gaps
