@@ -910,6 +910,15 @@ class StreamDelivery {
         text,
         error,
         kind,
+        // A retry later has no fresh inbound to rebuild the route from, so the entry
+        // itself must carry it: without these the flush can only address the official
+        // channel and the WeFlow bridge stays unreachable (measured 2026-09-22: eight
+        // replies queued for days because the sender ids never matched).
+        provider: target.provider || "",
+        contextToken: target.contextToken || "",
+        weflowContact: target.weflowContact || "",
+        weflowTalker: target.weflowTalker || "",
+        weflowExactContact: target.weflowExactContact === true,
       });
       console.warn(
         `[cyberboss] deferred system reply until the next inbound message thread=${state.threadId} user=${target.userId}`

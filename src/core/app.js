@@ -54,6 +54,7 @@ const { resolvePreferredSenderId, resolvePreferredWorkspaceRoot } = require("./d
 const { StreamDelivery } = require("./stream-delivery");
 const { ThreadStateStore } = require("./thread-state-store");
 const { DeferredSystemReplyStore } = require("./deferred-system-reply-store");
+const { DeferredReplyRetryScheduler } = require("./deferred-reply-retry-scheduler");
 const { SystemMessageQueueStore } = require("./system-message-queue-store");
 const { SystemMessageDispatcher } = require("./system-message-dispatcher");
 const { TimelineScreenshotQueueStore } = require("./timeline-screenshot-queue-store");
@@ -292,6 +293,16 @@ class CyberbossApp {
       await this.ensureLocationServerStarted();
     }
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
+    // Timers live in memory, the deferred backlog lives on disk: without re-arming
+    // here a restart puts every queued reply back to "wait for the next inbound".
+    try {
+      const rearmed = this.deferredReplyRetryScheduler().rehydrate();
+      if (rearmed) {
+        console.log(`[cyberboss] deferred retry re-armed senders=${rearmed}`);
+      }
+    } catch (rehydrateError) {
+      console.warn(`[cyberboss] deferred retry rehydrate failed: ${rehydrateError.message}`);
+    }
     if (this.config.startWithCheckin) {
       console.log("[cyberboss] checkin: enabled");
       void runSystemCheckinPoller(this.config).catch((error) => {
@@ -1343,10 +1354,22 @@ class CyberbossApp {
     }
   }
 
-  deferSystemReply({ threadId = "", userId = "", text = "", error = null, kind = "plain_reply" }) {
-    return this.deferredSystemReplyQueue.enqueue({
+  deferSystemReply({
+    threadId = "",
+    userId = "",
+    text = "",
+    error = null,
+    kind = "plain_reply",
+    provider = "",
+    contextToken = "",
+    weflowContact = "",
+    weflowTalker = "",
+    weflowExactContact = false,
+  }) {
+    const accountId = this.activeAccountId || this.channelAdapter.resolveAccount().accountId;
+    const deferred = this.deferredSystemReplyQueue.enqueue({
       id: `${normalizeCommandArgument(threadId) || "system"}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-      accountId: this.activeAccountId || this.channelAdapter.resolveAccount().accountId,
+      accountId,
       senderId: userId,
       threadId,
       text,
@@ -1354,7 +1377,65 @@ class CyberbossApp {
       createdAt: new Date().toISOString(),
       failedAt: new Date().toISOString(),
       lastError: error instanceof Error ? error.message : String(error || ""),
+      // Captured now because the retry has no inbound to rebuild them from.
+      provider,
+      contextToken,
+      weflowContact,
+      weflowTalker,
+      weflowExactContact: weflowExactContact === true,
     });
+    // The queue used to wait for the sender's next inbound, so a failure cost as much
+    // as the user's silence. Arm the retry timer instead (see the scheduler module).
+    try {
+      this.deferredReplyRetryScheduler().schedule(accountId, userId);
+    } catch (scheduleError) {
+      console.warn(`[cyberboss] deferred retry could not be armed: ${scheduleError.message}`);
+    }
+    return deferred;
+  }
+
+  /** Lazily created so the reply path is untouched when nothing was ever deferred. */
+  deferredReplyRetryScheduler() {
+    if (!this.deferredReplyRetrySchedulerInstance) {
+      this.deferredReplyRetrySchedulerInstance = new DeferredReplyRetryScheduler({
+        store: this.deferredSystemReplyQueue,
+        format: formatDeferredSystemReplyBatch,
+        log: (message) => console.warn(`[cyberboss] ${message}`),
+        onGiveUp: (entry) => console.warn(`[cyberboss] deferred reply gave up id=${entry.id} error=${entry.lastError}`),
+        send: ({ senderId, text, entries }) => this.deliverDeferredReplyBatch({ senderId, text, entries }),
+      });
+    }
+    return this.deferredReplyRetrySchedulerInstance;
+  }
+
+  /**
+   * Send one drained batch directly, rebuilding the route from the entry.
+   *
+   * `channelAdapter.sendText` is the same call the normal reply path makes, so the
+   * retry keeps the ledger entry, the echo attribution and the delivery
+   * verification instead of becoming an untracked same-account message.
+   */
+  async deliverDeferredReplyBatch({ senderId, text, entries }) {
+    const route = Array.isArray(entries) && entries.length ? entries[0] : {};
+    const knownTokens = this.channelAdapter.getKnownContextTokens?.() || {};
+    const payload = {
+      userId: senderId,
+      text,
+      contextToken: route.contextToken || knownTokens[senderId] || "",
+    };
+    if (route.provider === "weflow-uia") {
+      payload.provider = "weflow-uia";
+    }
+    if (route.weflowContact) {
+      payload.weflowContact = route.weflowContact;
+    }
+    if (route.weflowTalker) {
+      payload.weflowTalker = route.weflowTalker;
+    }
+    if (route.weflowExactContact === true) {
+      payload.weflowExactContact = true;
+    }
+    return this.channelAdapter.sendText(payload);
   }
 
   primeDeferredRepliesForSender(normalized) {

@@ -78,6 +78,25 @@ class DeferredSystemReplyStore {
     return this.enqueue(normalized);
   }
 
+  /**
+   * Distinct (accountId, senderId) pairs that still hold queued replies.
+   *
+   * The retry scheduler arms one timer per sender, and after a restart there are no
+   * timers while the queue file still holds a backlog (measured 2026-09-22: eight
+   * replies queued across days). This is what lets startup re-arm them.
+   */
+  listSenders() {
+    this.load();
+    const seen = new Map();
+    for (const reply of this.state.replies) {
+      const key = `${reply.accountId}\u0000${reply.senderId}`;
+      if (!seen.has(key)) {
+        seen.set(key, { accountId: reply.accountId, senderId: reply.senderId });
+      }
+    }
+    return [...seen.values()];
+  }
+
   drainForSender(accountId, senderId) {
     this.load();
     const normalizedAccountId = normalizeText(accountId);
@@ -92,7 +111,6 @@ class DeferredSystemReplyStore {
         pending.push(reply);
       }
     }
-
     if (drained.length) {
       this.state.replies = pending;
       this.save();

@@ -126,3 +126,9 @@ Status: proposed
   1. 从 `senderId`（形如 `weflow:<chatId>`）重建路由，再直接 `sendText`；
   2. 改用 `streamDelivery.queueReplyTargetForThread(entry.threadId, target)`（`app.js:1825` 等处已在用）把补发排进投递管道，让既有路径负责 token 刷新/重试/记账。**待确认：排队目标是否会在没有新回合时被消费**——若必须等回合，这条路不成立。
 - 下一轮第一步：读 `queueReplyTargetForThread` 的消费者（`stream-delivery.js` 里 `replyTargetByBindingKey` / run-key 状态机），确认 1 还是 2。
+
+### 接线完成（2026-09-22，round 2）
+
+- `stream-delivery.js` 的 `deferSystemReply` 现在把**路由**一起交出来（`provider / contextToken / weflowContact / weflowTalker / weflowExactContact`）——之前只交 `threadId/userId/text/kind`，补发因此无法寻址到桥。
+- `app.js`：`deferSystemReply` 采集路由入队后 `scheduler.schedule(accountId, senderId)`；新增 `deferredReplyRetryScheduler()`（懒建）与 `deliverDeferredReplyBatch()`（用条目路由 + `getKnownContextTokens()` 的落盘 token，走 `channelAdapter.sendText`，因此**保留账本与回声归因**）；`start()` 里 `rehydrate()` 重新武装队列里已有的积压。
+- 验证状态：`npm run check` 绿、调度器自测绿（退避/去重/上限）、store 行为测试绿（路由与簿记都保留）。**端到端"重启后自动补发"尚未观察到**：本轮 restack 后机器人启动日志不完整（restack 会截断日志，且 launcher 有 `already_running_unknown_pid` 干扰），队列 8 条簿记未被改动。下一轮：确认机器人把 `start()` 跑到 `bridge loop started`（必要时手工 `node bin/cyberboss.js start --checkin` 前台观察），再看 8 条积压是否在 30 秒后被补发并写入账本。

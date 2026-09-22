@@ -89,6 +89,28 @@ class DeferredReplyRetryScheduler {
     this.#arm(accountId, senderId, this.firstDelayMs);
   }
 
+  /**
+   * Re-arm retries for whatever the queue still holds. Called once at startup: the
+   * timers live in memory while the backlog lives on disk, so without this a
+   * restart leaves every queued reply waiting for the sender's next message again
+   * (measured 2026-09-22: eight replies, oldest four days).
+   */
+  rehydrate({ delayMs = this.firstDelayMs } = {}) {
+    if (this.stopped || typeof this.store.listSenders !== "function") {
+      return 0;
+    }
+    const senders = this.store.listSenders();
+    for (const sender of senders) {
+      if (sender?.accountId && sender?.senderId) {
+        this.#arm(sender.accountId, sender.senderId, delayMs);
+      }
+    }
+    if (senders.length) {
+      this.log(`deferred retry re-armed senders=${senders.length}`);
+    }
+    return senders.length;
+  }
+
   cancel(accountId, senderId) {
     const key = senderKey(accountId, senderId);
     const timer = this.timers.get(key);
