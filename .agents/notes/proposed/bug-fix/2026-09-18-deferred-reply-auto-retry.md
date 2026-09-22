@@ -52,3 +52,60 @@ Status: proposed
 - 这是**回复主链路**的改动：去重做错会重复发送（用户看到两遍），入队/出队做错会漏发。必须先在临时停桥的条件下验证，再放开。
 - 定时器与既有 `primeDeferredRepliesForSender` 并发时，两边都可能 drain 到同一批 —— 去重靠 `id`，要写测试锁死。
 - 只有"最近一次 contextToken"可用；若该 token 已过期（微信侧），直接发送会失败并进入退避，最终由人接手。这是可接受的降级方向（宁可留在队列，也不要丢）。
+
+## 实现侦察（2026-09-22 抓取，窗口余量耗尽前留给下一轮）
+
+下一窗口从这里直接开工，不必再找接口：
+
+### stream-delivery.js：状态访问器与发送入口
+  62: this.deferredReplyPrefixByBindingKey = new Map();
+  67: setReplyTarget(bindingKey, target) {
+  104: setDeferredReplyPrefix(bindingKey, text) {
+  110: this.deferredReplyPrefixByBindingKey.set(normalizedBindingKey, normalizedText);
+  285: deferredReplyPrefix: "",
+  327: if (!state.deferredReplyPrefix) {
+  328: const prefix = this.deferredReplyPrefixByBindingKey.get(linked.bindingKey) || "";
+  330: state.deferredReplyPrefix = prefix;
+  331: this.deferredReplyPrefixByBindingKey.delete(linked.bindingKey);
+  451: this.restoreDeferredReplyPrefix(state);
+  471: const prependDeferredPrefix = Boolean(state.deferredReplyPrefix) && delivery.kind !== "media";
+  496: state.deferredReplyPrefix = "";
+  588: await this.sendSystemReply(state, resolved.message);
+  597: async sendReplyDelivery(state, delivery, { prependDeferredPrefix = false } = {}) {
+
+### deferred-system-reply-store.js：enqueue / drainForSender 语义
+    enqueue(reply) {
+      this.load();
+      const normalized = normalizeDeferredSystemReply(reply);
+      if (!normalized) {
+        throw new Error("invalid deferred system reply");
+      }
+      this.state.replies.push(normalized);
+      this.state.replies.sort(compareDeferredReplies);
+      this.save();
+      return normalized;
+    }
+  
+    drainForSender(accountId, senderId) {
+      this.load();
+      const normalizedAccountId = normalizeText(accountId);
+      const normalizedSenderId = normalizeText(senderId);
+      const drained = [];
+      const pending = [];
+  
+      for (const reply of this.state.replies) {
+        if (reply.accountId === normalizedAccountId && reply.senderId === normalizedSenderId) {
+          drained.push(reply);
+        } else {
+          pending.push(reply);
+        }
+      }
+  
+      if (drained.length) {
+        this.state.replies = pending;
+        this.save();
+      }
+  
+      return drained;
+    }
+
