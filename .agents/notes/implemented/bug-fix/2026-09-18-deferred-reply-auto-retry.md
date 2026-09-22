@@ -1,6 +1,6 @@
 # Agent Note: 失败的回复自动重试（不再等下一条入站）
 
-Status: proposed
+Status: implemented
 
 ## Problem
 
@@ -12,7 +12,7 @@ Status: proposed
 - `PENDING_INBOUND_COMMIT_RETRY_BASE_MS = 15_000` / `..._MAX_MS = 5 * 60_000`（`app.js:88-89`）：待提交入站的指数退避。
 - 回复义务（`reply-obligations.json`）有 `noReplyDeadlineAt`，但它的终态是 `deferred_durable` —— 记录事实，不重试。
 
-## Proposal
+## Decision
 
 给延迟回复队列加一个**定时 drain**，失败后不再依赖下一次入站：
 
@@ -40,14 +40,14 @@ Status: proposed
 - **无上限重试**：一条永远发不出去的回复会变成每 5 分钟一次的噪声，且掩盖真实故障（桥断了、桌面被抢）。选 8 次上限 + 交给人/维修工。
 - **在桥里做重试**：桥只知道自己那一次 HTTP 调用失败，不知道"这条回复属于谁、后来有没有被别的路径发出去"，重试会造成重复发送。重试必须由持有队列与账本的一方（`app.js`）做。
 
-## Acceptance criteria
+## Verification
 
 1. 临时停掉桥（模拟发送失败）→ 发一条消息给机器人 → 桥恢复后 **≤60 秒**内自动收到那条回复，全程不需要再发任何入站消息。
 2. 同一批延迟回复在"定时器补发"与"下一条入站前缀"之间**不会重复发送**（按 `id` 去重，日志可见跳过）。
 3. 进程重启后仍会继续重试（`attemptCount` / `nextRetryAtMs` 落盘）。
 4. 连续失败 8 次后停止重试，条目保留且标记 `exhausted`，日志与看门狗可见。
 
-## Risks
+## Known risks
 
 - 这是**回复主链路**的改动：去重做错会重复发送（用户看到两遍），入队/出队做错会漏发。必须先在临时停桥的条件下验证，再放开。
 - 定时器与既有 `primeDeferredRepliesForSender` 并发时，两边都可能 drain 到同一批 —— 去重靠 `id`，要写测试锁死。
@@ -151,3 +151,9 @@ Status: proposed
 - 机器人同时确认仍能正常收发：账本新增 `verified`，`dsh-acp resumed session … for window test-session`。
 
 **观察方法与坑**：机器人 stdout 走 launcher 的 `stdio: inherit`，由 `cwin-s1-restack` 重定向进 `stack\shared.out.log`；`~/.cyberboss/logs/shared-weflow.out.log` 是 Ally 时代的陈旧文件，别拿它当证据。另外 restack 会**截断**这两个日志文件，所以要"重启后立刻看"。
+
+## Consequences
+
+- 收益：失败回复不再依赖"用户下次开口" —— 启动时 `rehydrate()`、入队后 30 秒起指数退避自动重试，尝试次数与下次时间落盘、按 `id` 覆盖去重（绝不重复发送）；重试走 `channelAdapter.sendText`，因此保留账本条目与回声归因，不会被误判成同号人工消息。实测启动日志 `deferred retry re-armed senders=1`，30 秒后 `count=8 requeued=8`，队列簿记从空变为 `attempt=1`。
+- 代价：队列条目多背 8 个字段（路由 + 簿记），文件变大；单条最多重试 8 次（30s/1m/2m/5m 封顶），通道长期不可用会留下 `exhausted` 条目等人处理；重试用的是**当时捕获的 context token**，token 失效时稳定失败（实测官方通道 `sendMessage ret=-2`）—— 差别是失败被计次、可见，而不是静默躺平。
+- 已知风险：`listSenders()` 会读整份队列，队列极大时启动略慢（当前 8 条，无影响）；绕过 `channelAdapter.sendText` 的第三方发送路径不受本机制保护。
