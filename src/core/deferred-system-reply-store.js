@@ -33,16 +33,49 @@ class DeferredSystemReplyStore {
     fs.writeFileSync(this.filePath, JSON.stringify(this.state, null, 2));
   }
 
+  /**
+   * Queue one reply, keyed by its id.
+   *
+   * The retry path re-queues a batch it failed to send, and it may race the
+   * next-inbound flush.  A plain push would then hold the same reply twice and the
+   * user would read it twice, so the id is the queue's identity: an entry that is
+   * already queued is replaced instead of appended.  Comparison is by id only;
+   * everything else about the newer record wins (it carries the updated attempt
+   * count and next retry time).
+   */
   enqueue(reply) {
     this.load();
     const normalized = normalizeDeferredSystemReply(reply);
     if (!normalized) {
       throw new Error("invalid deferred system reply");
     }
-    this.state.replies.push(normalized);
+    const existingIndex = this.state.replies.findIndex((entry) => entry.id === normalized.id);
+    if (existingIndex >= 0) {
+      this.state.replies[existingIndex] = normalized;
+    } else {
+      this.state.replies.push(normalized);
+    }
     this.state.replies.sort(compareDeferredReplies);
     this.save();
     return normalized;
+  }
+
+  /**
+   * Queue a reply only when its id is not already queued.
+   *
+   * The flush path uses this so a retry cannot resurrect an entry that a
+   * concurrent drain already handed to the delivery pipeline.
+   */
+  enqueueUnique(reply) {
+    this.load();
+    const normalized = normalizeDeferredSystemReply(reply);
+    if (!normalized) {
+      throw new Error("invalid deferred system reply");
+    }
+    if (this.state.replies.some((entry) => entry.id === normalized.id)) {
+      return null;
+    }
+    return this.enqueue(normalized);
   }
 
   drainForSender(accountId, senderId) {
