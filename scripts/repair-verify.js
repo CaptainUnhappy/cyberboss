@@ -45,12 +45,42 @@ function requiredEnv(name) {
 }
 
 function parseArgs(argv) {
-  const args = { text: "", timeoutMs: DEFAULT_TIMEOUT_MS };
+  const args = { text: "", timeoutMs: DEFAULT_TIMEOUT_MS, force: false };
   for (let index = 0; index < argv.length; index += 1) {
     if (argv[index] === "--text") args.text = argv[++index] || "";
     else if (argv[index] === "--timeout-seconds") args.timeoutMs = Math.max(30, Number(argv[++index]) || 300) * 1000;
+    else if (argv[index] === "--force") args.force = true;
   }
   return args;
+}
+
+/**
+ * Every run drops a user-visible notice into 大号's chat, so runs are throttled.
+ *
+ * Measured 2026-09-22: the repair worker re-ran this after each repair attempt while
+ * the underlying fault persisted, and the user received a stream of restart
+ * notices. One notice per cooldown proves delivery; `--force` is for a human who
+ * explicitly wants another round trip.
+ */
+const VERIFY_COOLDOWN_MS = 30 * 60_000;
+
+function newestVerifyReportMs() {
+  try {
+    const names = fs.readdirSync(STATE_DIR).filter((name) => name.startsWith("verify-") && name.endsWith(".json"));
+    let newest = 0;
+    for (const name of names) {
+      const stamp = Date.parse(
+        name.slice("verify-".length, -".json".length).replace(
+          /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/,
+          "$1T$2:$3:$4.$5Z",
+        ),
+      );
+      if (Number.isFinite(stamp) && stamp > newest) newest = stamp;
+    }
+    return newest;
+  } catch {
+    return 0;
+  }
 }
 
 async function postJson(url, payload, timeoutMs) {
@@ -115,6 +145,25 @@ function isOutgoingMessage(message) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+
+  // Throttle before anything visible happens: this script's whole point is to put a
+  // message in front of the user, and a repair loop must not turn that into spam.
+  if (!args.force) {
+    const previous = newestVerifyReportMs();
+    if (previous && Date.now() - previous < VERIFY_COOLDOWN_MS) {
+      const waitedMinutes = Math.round((Date.now() - previous) / 60_000);
+      console.log(
+        JSON.stringify({
+          ok: false,
+          skipped: true,
+          reason: "verify_cooldown",
+          detail: `last verification was ${waitedMinutes} minute(s) ago; pass --force to send another notice`,
+        }),
+      );
+      return 2;
+    }
+  }
   const bridgeBaseUrl = normalizeBaseUrl(process.env.CYBERBOSS_WEFLOW_BRIDGE_BASE_URL, "CYBERBOSS_WEFLOW_BRIDGE_BASE_URL");
   const weflowBaseUrl = normalizeBaseUrl(process.env.CYBERBOSS_WEFLOW_BASE_URL, "CYBERBOSS_WEFLOW_BASE_URL");
   const token = requiredEnv("CYBERBOSS_WEFLOW_TOKEN");
