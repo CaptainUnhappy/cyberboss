@@ -186,6 +186,30 @@ async function main() {
     summary.sessionId = sessionId;
     appendLog(`resume repair session id=${sessionId} (from ${existing.source || "new"})`);
 
+    // A stored id can outlive the session: the DSH store drops sessions, and then
+    // every wake failed with "unknown session" instead of repairing anything
+    // (measured 2026-09-22: the watchdog woke the worker and it died on the id).
+    // Recover by minting a replacement rather than reporting a dead repair path.
+    if (!summary.createdSession) {
+      try {
+        await client.resumeSession(sessionId, { cwd: REPAIR_CWD });
+      } catch (error) {
+      if (!/unknown session/i.test(String(error && error.message))) throw error;
+      appendLog(`stored repair session ${sessionId} no longer exists; creating a replacement`);
+      try {
+        fs.renameSync(SESSION_FILE, `${SESSION_FILE}.stale-${Date.now()}`);
+      } catch {
+        // No stored file to archive.
+      }
+      sessionId = await client.newSession({ cwd: REPAIR_CWD });
+      writeSessionId(sessionId);
+      summary.sessionId = sessionId;
+      summary.createdSession = true;
+      appendLog(`replacement repair session id=${sessionId}; bootstrapping`);
+      await client.prompt(sessionId, [{ type: "text", text: BOOTSTRAP_TEXT }]);
+      }
+    }
+
     const requestText = args.text || buildRequestText(args);
     const startedAt = Date.now();
     const result = await client.prompt(sessionId, [{ type: "text", text: requestText }]);
