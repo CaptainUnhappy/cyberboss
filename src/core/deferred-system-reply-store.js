@@ -120,6 +120,14 @@ function normalizeDeferredSystemReply(reply) {
   const attemptCount = Number.isFinite(Number(reply.attemptCount)) && Number(reply.attemptCount) > 0 ? Math.floor(Number(reply.attemptCount)) : 0;
   const nextRetryAtMs = Number.isFinite(Number(reply.nextRetryAtMs)) && Number(reply.nextRetryAtMs) > 0 ? Math.floor(Number(reply.nextRetryAtMs)) : null;
   const exhausted = reply.exhausted === true;
+  // Reply routing captured at deferral time. A retry has no fresh inbound to
+  // rebuild the WeFlow route from, so the entry itself must carry it - otherwise
+  // the flush can only address the official channel and the bridge is unreachable.
+  const provider = normalizeText(reply.provider);
+  const weflowContact = normalizeText(reply.weflowContact);
+  const weflowTalker = normalizeText(reply.weflowTalker);
+  const weflowExactContact = reply.weflowExactContact === true;
+  const contextToken = normalizeText(reply.contextToken);
   if (!id || !accountId || !senderId || !text) {
     return null;
   }
@@ -136,6 +144,11 @@ function normalizeDeferredSystemReply(reply) {
     attemptCount,
     nextRetryAtMs,
     exhausted,
+    provider,
+    weflowContact,
+    weflowTalker,
+    weflowExactContact,
+    contextToken,
   };
 }
 
