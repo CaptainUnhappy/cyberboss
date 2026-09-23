@@ -80,7 +80,8 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 
 - 微信**必须活在会话 4**：桥只驱动那个桌面，session 1 里的 `Weixin.exe` 桥永远找不到（`/readyz` 一直 503 `wechatWindow:false`），而看门狗的存活判定是**跨会话**的 `Get-Process Weixin` —— 于是"session 1 有个微信"会把真正的故障**盖住**。2026-09-23 18:14:50 机械修复里的 `Ensure-WeixinStarted` 就在 session 1 起了这样一个野实例（PID 40124）。
 - **恢复判据只看桥的 `/readyz`**（它能看见"已登录的主聊天窗口"才返回 200）。`Get-Process Weixin` 只说明进程起来了，**说明不了登没登录**、更说明不了在哪个会话。
-- `/readyz` 一直 503 而微信进程活着 = **登录态丢了**（实测扫码窗口只有 296x388，主窗口是 1296x768），需要人拿 Azzy 的手机扫码：先 `Start-ScheduledTask -TaskName cwin-s1-rdp-show` 把会话桌面挪到屏幕上，扫完再 `-hide`。脚本报告里会写 `READY = False` 和"需要扫码"。
+- `/readyz` 一直 503 而微信进程活着时，**先看登录窗是什么**：实测崩溃/被杀之后回来的是 `mmui::LoginWindow`，上面写着 `当前登录用户Azzy` + 一个 **`进入微信`** 按钮 —— 那只是"续用已记住的会话"，**不需要手机**，脚本会自动点掉它。点法有讲究：**`InvokePattern.Invoke()` 对 mmui 按钮会"返回成功但什么都不做"**（2026-09-23 实测：调用返回了、`/readyz` 仍是 503），所以脚本改用 UIA 取按钮矩形的中心做**物理点击**，并按桥的 `activate_window()` 手法（AttachThreadInput + ShowWindow + BringWindowToTop + SetForegroundWindow）**先把窗口激活** —— 否则点击会落到当时在前台的那个窗口上。脚本只信 `/readyz`，不信任何一次点击的返回值。
+- 只有当登录窗**真的要求扫码**时才需要人：`Start-ScheduledTask -TaskName cwin-s1-rdp-show` → 拿 Azzy 的手机扫码 → `-hide`。脚本报告里会写 `READY = True/False`，`resume outcome:` 一行给出是否找到登录窗、是否点到按钮。
 - 刚杀掉另一个 Weixin 实例后**立刻重启可能秒退**（2026-09-23 18:16 实测 launcher 进程直接消失，18:19 再试就稳定留在会话 4）：失败就隔几秒重试一次，别急着判定"起不来"。
 
 **一个桌面只能有一个自动化**：机器人的出站要激活微信窗口，而同一个隔离桌面里还有别的 agent 在跑 UIA 自动化（实测对方 `q74-real.ps1` / `q75-uia.ps1` 运行时，桥返回 **502 `WeChat main window could not be activated`**）。此时机器人把回复转成 `deferred_durable` 存进 `deferred-system-replies.json`，**在同一位发件人的下一条入站消息时一并补发**（`app.js` 的 `drainForSender`）—— 所以排队不等于丢失，但也不会自己重试。要立刻拿到回复：让对方停一下桌面自动化，或在微信里再发一句。
