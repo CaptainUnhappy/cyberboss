@@ -167,7 +167,7 @@ async function runScheduledCanary(config, dependencies = {}) {
           lastSuccessAt: schedule.lastSuccessAt,
           consecutiveFailures: schedule.consecutiveFailures,
           nextDueAt: new Date(decision.nextDueAtMs).toISOString(),
-          repairable: urgentBudgetWait || demandAlreadyHandled
+          repairable: budgetWait || urgentBudgetWait || demandAlreadyHandled
             ? false
             : schedule.lastRepairable !== false,
           detail: decision.reason,
