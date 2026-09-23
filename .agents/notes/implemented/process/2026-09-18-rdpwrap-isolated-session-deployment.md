@@ -116,3 +116,5 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 现在 `scripts/isolated-session/weflow-guard.ps1` 每 15 分钟（计划任务 `cwin-weflow-guard`，走 `hidden-run.vbs` 静默执行）打一次 messages API：健康就记一行 `reader healthy`；非 2xx 就把 `weflow-restart.ps1` 丢进 `C:\ProgramData\cwin-probe\s4\in`，由会话 4 的 worker 执行重启（幂等：已在队列里就不重复投）。日志 `C:\ProgramData\cwin-probe\repair\weflow-guard.log`。
 
 **教训（第二次踩）**：这个仓库里**含非 ASCII 的 `.ps1` 必须带 UTF-8 BOM**，否则 PowerShell 5.1 按 GBK 读，脚本直接解析失败（2026-09-18 的 `cyberboss-watchdog.ps1` 就是这样整体停摆 4 天）。`weflow-guard.ps1` 因此刻意写成纯 ASCII。
+
+**搜索结果稳定性窗口（2026-09-23 修）**：微信在 18:19 被更新程序重启后，桥的发送开始稳定失败，日志给出确切原因 —— `target not confirmed: … ordered search content identity had not repeated yet (polls=1, window=2.0s)`：桥需要**连续两次看到同一份搜索弹窗内容**才敢按 Enter，而窗口只有 2.0 秒，慢的时候只轮询到 1 次，于是 fail-closed 完全发不出去（表现为"又不回复"，且与空间/抢桌面无关）。修法：`MAX_SEARCH_RESULT_STABILIZATION_SECONDS` 3.0 → **12.0**，并新增下限 `MIN_SEARCH_RESULT_STABILIZATION_SECONDS = 6.0`，窗口取 `max(下限, min(上限, 调用方超时))`，保证至少有两次轮询的时间。修复后实测 `POST /api/send → dispatched=true verified=true`。

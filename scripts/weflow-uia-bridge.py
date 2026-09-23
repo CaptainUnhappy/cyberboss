@@ -58,7 +58,14 @@ MIN_SEARCH_SELECTION_CONFIRM_SECONDS = 2.0
 # larger budget cannot make a wrong target acceptable.  It was 1.0s while the
 # direct session-row route handled the common case, and the search route now runs
 # for every send, so a cold popup needs a realistic window.
-MAX_SEARCH_RESULT_STABILIZATION_SECONDS = 3.0
+MAX_SEARCH_RESULT_STABILIZATION_SECONDS = 12.0
+# Stability is proven by seeing the SAME ordered search content twice, so a window
+# shorter than a couple of polls can never succeed. Measured 2026-09-23: right after
+# a WeChat update the popup answered slowly, the window below received one poll, and
+# the bridge refused to press Enter with "ordered search content identity had not
+# repeated yet (polls=1, window=2.0s)" - a fail-closed refusal to send at all.
+# The floor keeps at least this much time for the repeat, whatever the caller asks.
+MIN_SEARCH_RESULT_STABILIZATION_SECONDS = 6.0
 MAX_SEARCH_NAVIGATION_DOWNS = 10
 CHAT_INPUT_VALUE_VERIFY_TIMEOUT_SECONDS = 1.0
 GA_ROOT = 2
@@ -1304,7 +1311,7 @@ def select_exact_search_result_with_enter(
     # snapshots before deriving any key count. Foreground/focus loss and
     # multiple exact target rows remain immediate fail-closed conditions.
     stabilization_deadline = time.monotonic() + max(
-        0.1,
+        MIN_SEARCH_RESULT_STABILIZATION_SECONDS,
         min(MAX_SEARCH_RESULT_STABILIZATION_SECONDS, timeout),
     )
     last_identity_error = "exact search result was not materialized"
