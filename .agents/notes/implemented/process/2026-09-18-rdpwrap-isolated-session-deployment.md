@@ -100,3 +100,9 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 - 桥多了一个 HTTP 契约 `/api/probe`（只读 / `?move=1` 强校验），它测的是"隔离会话的输入桌面"，与 `/readyz`（窗口存在性）不是一回事；改桥的探针语义要同步本笔记。
 - **`/api/probe` 同时回报 `desktopIdleSeconds`**（隔离会话自己的空闲秒数，`GetLastInputInfo`，只读、不注入）。为什么必须由桥来报：看门狗跑在 session 1，它自己的 `GetLastInputInfo` 量的是**用户桌面** —— 于是"用户一动键鼠就把 canary 的空闲门槛按住"，canary 永远等不到重跑，记录里的陈旧失败也永远清不掉（2026-09-22 17:00 实测：本地 idle=51s，同一时刻隔离桌面 idle=**2327s**，而机器人侧 `userIdleSeconds=2221`）。看门狗的 `Get-DesktopInputIdleState` 现在**优先取桥的 `desktopIdleSeconds`**，拿不到才退回本地测量，返回值里多一个 `source` 字段标明来源（`isolated-session-bridge` / `local-session-fallback`）。改这个字段要同时改看门狗与保活。
 - 部署脚本已入库到 `scripts/isolated-session/`（5 个文件，计划任务动作指向仓库路径）；仍留在 `C:\ProgramData\cwin-probe\` 的是历史实验脚本，其中 `s1-restack.ps1`（退役 Ally 栈的端口 8766/5031）与 `s1-mstsc-offscreen2.ps1` **尚未纳入本契约**，`cwin-s1-restack` / `cwin-s1-mstsc-off2` 两个任务保持原样。
+
+**读侧看门狗 `cwin-weflow-guard`（2026-09-23 起）**：WeFlow 的 `/api/v1/health` 一直 200，但 `/api/v1/messages` 会突然变成 **HTTP 500**，此时机器人**一条消息都读不到**（表现为"又不回复"）。2026-09-18 至 09-23 之间实测复发 **3 次**，而服务控制器在"health 通、消息 500"这一支是**刻意保留进程**的，看门狗的修复路径也够不到会话 4 的程序 —— 所以每次都要人发现。
+
+现在 `scripts/isolated-session/weflow-guard.ps1` 每 15 分钟（计划任务 `cwin-weflow-guard`，走 `hidden-run.vbs` 静默执行）打一次 messages API：健康就记一行 `reader healthy`；非 2xx 就把 `weflow-restart.ps1` 丢进 `C:\ProgramData\cwin-probe\s4\in`，由会话 4 的 worker 执行重启（幂等：已在队列里就不重复投）。日志 `C:\ProgramData\cwin-probe\repair\weflow-guard.log`。
+
+**教训（第二次踩）**：这个仓库里**含非 ASCII 的 `.ps1` 必须带 UTF-8 BOM**，否则 PowerShell 5.1 按 GBK 读，脚本直接解析失败（2026-09-18 的 `cyberboss-watchdog.ps1` 就是这样整体停摆 4 天）。`weflow-guard.ps1` 因此刻意写成纯 ASCII。
