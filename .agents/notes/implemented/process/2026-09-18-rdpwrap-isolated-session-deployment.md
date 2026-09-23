@@ -36,10 +36,11 @@ Status: implemented
 5. **同号人工输入与回声归因**：账本是唯一权威 —— 账本认领的发出消息按回声吞掉，未认领的按 `self_manual` 路由（见 [归因笔记](../bug-fix/2026-09-18-weflow-self-echo-attribution.md)）。
 6. **官方通道身份只能有一个消费者**：不能同时跑两份 bot。
 7. **跨账号进程的"身份"只能用端点归属证明**：桥活在 session 4（`cwinprobe`），session 1 的非管理员进程**读不到它的命令行**（2026-09-22 实测：PID 35260 的 `CommandLine` 为空，而同一个调用者能读到 session 1 的全部 PID）。所以"命令行匹配"（`Test-VerifiedPidAlive`）永远验证不了隔离会话里的桥，后果是双重的：看门狗把它报成 `uia=alive=false,health=true,ready=true`（`uia` 判失败又连带把 canary 判失败），`cyberboss-service.ps1` 的 PID 文件校验与停机路径则直接抛错 —— **所有机械 Restart/FullRestart 在动任何东西之前就中止**（2026-09-22 16:15 实测：`PID file points to live PID 35260 with an unexpected command`）。现在的判据是**端点归属**：PID 存活**且是该端口唯一监听者**即视为已验证（TCP 表跨账号可读）；停机路径遇到"命令行读不到 + 是唯一属主"的进程**不动它**（它由自己会话里的配方管），而不是抛错。别再退回命令行匹配。
+   **同一堵墙也挡着 WeFlow（5051）**：`Test-WeFlowOwnsApiPort` 原来用 `Win32_Process.ExecutablePath` 比对 `WeFlow.exe` 路径，跨账号同样是空值，于是每一轮机械 Restart/FullRestart 都在这里中止（2026-09-22 15:30、2026-09-23 16:45 与 18:15 三次实测 `local WeFlow API port 5051 has an unverifiable owner`）。现在读不到 Exe 路径时退回**功能身份**：该监听者必须能用本项目的 token 答出 `/api/v1/health` 与一条 `/api/v1/messages` 查询（`Test-WeFlowFunctionalReady`）。
 
 **保活与静默**
 
-代码在 `scripts/isolated-session/`（**已入库**，计划任务指向仓库路径）：`rdp-keepalive.py`（保活）、`rdp-autologin.py`（重连 + 点掉证书框）、`rdp-client.ps1`（查看开关）、`hidden-run.vbs`（无窗口跑 PS）、`bridge-restart.ps1`（在隔离会话内重启 8776 桥）、`rdp-remote-guard.py` + `register-guard-task.py`（远控期间让出客户端，见 [远控让出笔记](../feature/2026-09-20-remote-control-rdp-client-handoff.md)）。`cwin-s1-rdp-keepalive` / `-reconnect` 用 `pythonw.exe` 执行，`-show` / `-hide` 用 `wscript.exe //B //NoLogo hidden-run.vbs` 执行 —— 两者都不产生可见控制台。
+代码在 `scripts/isolated-session/`（**已入库**，计划任务指向仓库路径）：`rdp-keepalive.py`（保活）、`rdp-autologin.py`（重连 + 点掉证书框）、`rdp-client.ps1`（查看开关）、`hidden-run.vbs`（无窗口跑 PS）、`bridge-restart.ps1`（在隔离会话内重启 8776 桥）、`weflow-restart.ps1`（重启 5051 读侧）、`wechat-restart.ps1`（重启机器人号的微信）、`rdp-remote-guard.py` + `register-guard-task.py`（远控期间让出客户端，见 [远控让出笔记](../feature/2026-09-20-remote-control-rdp-client-handoff.md)）。`cwin-s1-rdp-keepalive` / `-reconnect` 用 `pythonw.exe` 执行，`-show` / `-hide` 用 `wscript.exe //B //NoLogo hidden-run.vbs` 执行 —— 两者都不产生可见控制台。
 
 **探针通道**：保活优先走 **HTTP** `GET http://127.0.0.1:8776/api/probe`（桥就在隔离会话内，进程内直接回答"输入桌面还在不在"，即时返回），失败才退回会话内文件队列。之所以要这条专用通道：文件队列是共享的，另一个 workload 连续占用时会排队数分钟，旧实现因此把正常会话误判成故障。
 
@@ -75,6 +76,13 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 - **恢复判据不能只看端口**：必须用真实 token 打一次 `/api/v1/messages` 并拿到 200；脚本已内置这一步（`READER OK = ...`，写入 `s4\weflow-restart-report.txt`）。
 - 重启只是杀 `WeFlow.exe`（会话 4）再 `Start-Process C:\ProgramData\cwin-probe\WeFlow\WeFlow.exe`；配置在应用侧，不需要额外参数。
 
+**在隔离会话内重启微信（机器人号 Azzy）**：把 `scripts/isolated-session/wechat-restart.ps1` 丢进 `C:\ProgramData\cwin-probe\s4\in`。
+
+- 微信**必须活在会话 4**：桥只驱动那个桌面，session 1 里的 `Weixin.exe` 桥永远找不到（`/readyz` 一直 503 `wechatWindow:false`），而看门狗的存活判定是**跨会话**的 `Get-Process Weixin` —— 于是"session 1 有个微信"会把真正的故障**盖住**。2026-09-23 18:14:50 机械修复里的 `Ensure-WeixinStarted` 就在 session 1 起了这样一个野实例（PID 40124）。
+- **恢复判据只看桥的 `/readyz`**（它能看见"已登录的主聊天窗口"才返回 200）。`Get-Process Weixin` 只说明进程起来了，**说明不了登没登录**、更说明不了在哪个会话。
+- `/readyz` 一直 503 而微信进程活着 = **登录态丢了**（实测扫码窗口只有 296x388，主窗口是 1296x768），需要人拿 Azzy 的手机扫码：先 `Start-ScheduledTask -TaskName cwin-s1-rdp-show` 把会话桌面挪到屏幕上，扫完再 `-hide`。脚本报告里会写 `READY = False` 和"需要扫码"。
+- 刚杀掉另一个 Weixin 实例后**立刻重启可能秒退**（2026-09-23 18:16 实测 launcher 进程直接消失，18:19 再试就稳定留在会话 4）：失败就隔几秒重试一次，别急着判定"起不来"。
+
 **一个桌面只能有一个自动化**：机器人的出站要激活微信窗口，而同一个隔离桌面里还有别的 agent 在跑 UIA 自动化（实测对方 `q74-real.ps1` / `q75-uia.ps1` 运行时，桥返回 **502 `WeChat main window could not be activated`**）。此时机器人把回复转成 `deferred_durable` 存进 `deferred-system-replies.json`，**在同一位发件人的下一条入站消息时一并补发**（`app.js` 的 `drainForSender`）—— 所以排队不等于丢失，但也不会自己重试。要立刻拿到回复：让对方停一下桌面自动化，或在微信里再发一句。
 
 **回滚**：`Copy-Item .env.bak-<日期> .env -Force` 后 `Start-ScheduledTask cwin-s1-restack`。
@@ -97,9 +105,10 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 - 代价：多了一个必须活着的 RDP 客户端（`mstsc`）与一个 Windows 账号（`cwinprobe`）；隔离会话的资源占用与真实微信一致；保活/重连助手必须永远避开控制台子进程，这条约束会跟着每一次"顺手加一行 tasklist"复发。
 - 已知缺口：① **投递没有握手** —— 发送失败不重传、不通知（账本里已积累数十条 `status=failed`），方案见 [投递握手提案](../../proposed/feature/2026-09-18-weflow-reply-delivery-handshake.md)；② 隔离会话内的 Agent Room executor 曾因串行执行卡死，文件队列 `C:\ProgramData\cwin-probe\s4\{in,out,done}` 是更可靠的后备通道，但它**是共享资源**：另一个 workload（实测夸克网盘 `q1..q10`）占用时队列会排队数分钟，保活探针已改走 HTTP，队列只作为退路。
 - 遗留缺口（2026-09-22 实测，**未修**）：`scripts/shared-common.js` 的 `ensureWeFlowUiaBridge()` 在 8776 **探不通**时会删掉 PID 文件并**在 session 1 自己 spawn 一个桥** —— 这正是"两个桥抢 8776"的来源（一个在 session 1 看不到微信窗口，canary 触发就挂到 25s 超时）。端点恢复后它又因为 HTTP 通而"保留现状"，所以两个监听者可以长期并存。按本契约该走会话 4 的 `bridge-restart.ps1`，但仓库里还没有这条交接。
+- 同类遗留（2026-09-23 实测，**未修**）：`cyberboss-service.ps1` 的 `Ensure-WeixinStarted` 用**跨会话**的 `Get-Process Weixin` 判"已经在跑"，缺失时又**在 session 1 `Start-Process` 微信** —— 这既是 18:14:50 那个野实例的来源，也让"session 1 有微信"永久掩盖会话 4 里微信已死/未登录。按契约它该交给会话 4 的 `wechat-restart.ps1`（脚本已入库）；本轮没改，是因为当时没有已登录的微信可用来验证这条交接。
 - 桥多了一个 HTTP 契约 `/api/probe`（只读 / `?move=1` 强校验），它测的是"隔离会话的输入桌面"，与 `/readyz`（窗口存在性）不是一回事；改桥的探针语义要同步本笔记。
 - **`/api/probe` 同时回报 `desktopIdleSeconds`**（隔离会话自己的空闲秒数，`GetLastInputInfo`，只读、不注入）。为什么必须由桥来报：看门狗跑在 session 1，它自己的 `GetLastInputInfo` 量的是**用户桌面** —— 于是"用户一动键鼠就把 canary 的空闲门槛按住"，canary 永远等不到重跑，记录里的陈旧失败也永远清不掉（2026-09-22 17:00 实测：本地 idle=51s，同一时刻隔离桌面 idle=**2327s**，而机器人侧 `userIdleSeconds=2221`）。看门狗的 `Get-DesktopInputIdleState` 现在**优先取桥的 `desktopIdleSeconds`**，拿不到才退回本地测量，返回值里多一个 `source` 字段标明来源（`isolated-session-bridge` / `local-session-fallback`）。改这个字段要同时改看门狗与保活。
-- 部署脚本已入库到 `scripts/isolated-session/`（5 个文件，计划任务动作指向仓库路径）；仍留在 `C:\ProgramData\cwin-probe\` 的是历史实验脚本，其中 `s1-restack.ps1`（退役 Ally 栈的端口 8766/5031）与 `s1-mstsc-offscreen2.ps1` **尚未纳入本契约**，`cwin-s1-restack` / `cwin-s1-mstsc-off2` 两个任务保持原样。
+- 部署脚本已入库到 `scripts/isolated-session/`（`rdp-keepalive.py` / `rdp-autologin.py` / `rdp-client.ps1` / `hidden-run.vbs` / `bridge-restart.ps1` / `weflow-restart.ps1` / `weflow-guard.ps1` / `wechat-restart.ps1` / `rdp-remote-guard.py` / `register-guard-task.py`，计划任务动作指向仓库路径）；仍留在 `C:\ProgramData\cwin-probe\` 的是历史实验脚本，其中 `s1-restack.ps1`（退役 Ally 栈的端口 8766/5031）与 `s1-mstsc-offscreen2.ps1` **尚未纳入本契约**，`cwin-s1-restack` / `cwin-s1-mstsc-off2` 两个任务保持原样。
 
 **读侧看门狗 `cwin-weflow-guard`（2026-09-23 起）**：WeFlow 的 `/api/v1/health` 一直 200，但 `/api/v1/messages` 会突然变成 **HTTP 500**，此时机器人**一条消息都读不到**（表现为"又不回复"）。2026-09-18 至 09-23 之间实测复发 **3 次**，而服务控制器在"health 通、消息 500"这一支是**刻意保留进程**的，看门狗的修复路径也够不到会话 4 的程序 —— 所以每次都要人发现。
 

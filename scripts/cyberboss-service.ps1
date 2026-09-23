@@ -630,9 +630,20 @@ function Test-WeFlowOwnsApiPort {
   $expectedPath = Get-WeFlowExecutablePath
   foreach ($listenerPid in $listenerPids) {
     $listener = Get-CimInstance Win32_Process -Filter "ProcessId=$listenerPid" -ErrorAction SilentlyContinue
-    if ($null -eq $listener `
-        -or [string]::IsNullOrWhiteSpace([string]$listener.ExecutablePath) `
-        -or -not [string]::Equals([IO.Path]::GetFullPath([string]$listener.ExecutablePath), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+    $listenerPath = if ($null -ne $listener) { [string]$listener.ExecutablePath } else { "" }
+    if ([string]::IsNullOrWhiteSpace($listenerPath)) {
+      # WeFlow runs in the isolated session (cwinprobe), and a non-elevated
+      # session-1 caller cannot read its ExecutablePath - the same cross-account
+      # blind spot as the UIA bridge command line (see
+      # Test-UiaBridgePidVerified). Identity then has to come from the endpoint
+      # itself: the listener must answer this project's authenticated WeFlow
+      # API. Without this fallback every mechanical Restart/FullRestart aborted
+      # here with "local WeFlow API port 5051 has an unverifiable owner"
+      # (measured 2026-09-22 and 2026-09-23) even while WeFlow was healthy.
+      if (-not (Test-WeFlowFunctionalReady)) { return $false }
+      continue
+    }
+    if (-not [string]::Equals([IO.Path]::GetFullPath($listenerPath), $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
       return $false
     }
   }
