@@ -75,6 +75,8 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 - **失败签名**：`/api/v1/health` 返回 200，但 `/api/v1/messages` 一律 **HTTP 500** → 机器人读不到任何新消息（`WeFlow outgoing poll failed ... HTTP 500` 刷屏），**能收不能答**。2026-09-18 实测持续约 2 小时（14:40–16:55），期间用户消息全被漏看。
 - **恢复判据不能只看端口**：必须用真实 token 打一次 `/api/v1/messages` 并拿到 200；脚本已内置这一步（`READER OK = ...`，写入 `s4\weflow-restart-report.txt`）。
 - 重启只是杀 `WeFlow.exe`（会话 4）再 `Start-Process C:\ProgramData\cwin-probe\WeFlow\WeFlow.exe`；配置在应用侧，不需要额外参数。
+- **但 `-105` 那一种 500 重启治不了（2026-09-25 实测）**：当 500 的 body 是 `{"error":"错误码: -105"}`、且 `%APPDATA%\weflow\logs\wcdb.log` 在刷 `[bootstrap] native runtime policy mismatch value=-105` 时，问题在 **WCDB 的离线防回拨锚点状态**，不是进程卡死 —— 重启 WeFlow（含 guard 每 15 分钟一次）连做多次都无效。锚点分三处：`%LOCALAPPDATA%\WeFlow\Runtime\anchor-v7-<id>.bin`、`%LOCALAPPDATA%\WeFlow\State\native-anchor-v7-<id>.bin`、`HKCU\Software\WeFlow\Runtime\AnchorV7-<id>`。解药是 [09-11 方案](../../../docs/remediation-plan-2026-09-11.md) §修复F 第 3 条（重建状态）：**实测只删注册表那个 `AnchorV7-*` 值就够了** —— WeFlow 起来后立刻写了一个**新的 `<id>`** 锚点，`/api/v1/messages` 马上从 500 变 200（原文要求"成对删"，实测只删注册表侧即可，文件留着不影响）。已入库配方 `scripts/isolated-session/weflow-anchor-rebuild.ps1`（先把锚点值与文件备份到 `repair\weflow-anchor-backup-<ts>\`，删值、重启、探活；**若读侧仍不通就自动把导出的字节还原**，所以不会丢锚点）。
+- 触发条件值得记：这次 `-105` 的起点是 2026-09-23 21:15 的**非正常关机**（`Kernel-Power 41` + `EventLog 6008`），当晚又多次重启 —— 那套 WCDB 库被留在未 checkpoint 的中间态（多个 `.db-wal` 恰好卡在 4 MB、mtime 停在崩溃时刻）。**先看机器有没有非正常关机，再看锚点。**
 
 **在隔离会话内重启微信（机器人号 Azzy）**：把 `scripts/isolated-session/wechat-restart.ps1` 丢进 `C:\ProgramData\cwin-probe\s4\in`。
 
