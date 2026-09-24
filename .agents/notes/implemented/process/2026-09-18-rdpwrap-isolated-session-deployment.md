@@ -83,6 +83,7 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 - `/readyz` 一直 503 而微信进程活着时，**先看登录窗是什么**：实测崩溃/被杀之后回来的是 `mmui::LoginWindow`，上面写着 `当前登录用户Azzy` + 一个 **`进入微信`** 按钮 —— 那只是"续用已记住的会话"，**不需要手机**，脚本会自动点掉它。点法有讲究：**`InvokePattern.Invoke()` 对 mmui 按钮会"返回成功但什么都不做"**（2026-09-23 实测：调用返回了、`/readyz` 仍是 503），所以脚本改用 UIA 取按钮矩形的中心做**物理点击**，并按桥的 `activate_window()` 手法（AttachThreadInput + ShowWindow + BringWindowToTop + SetForegroundWindow）**先把窗口激活** —— 否则点击会落到当时在前台的那个窗口上。脚本只信 `/readyz`，不信任何一次点击的返回值。
 - 只有当登录窗**真的要求扫码**时才需要人：`Start-ScheduledTask -TaskName cwin-s1-rdp-show` → 拿 Azzy 的手机扫码 → `-hide`。脚本报告里会写 `READY = True/False`，`resume outcome:` 一行给出是否找到登录窗、是否点到按钮。
 - 刚杀掉另一个 Weixin 实例后**立刻重启可能秒退**（2026-09-23 18:16 实测 launcher 进程直接消失，18:19 再试就稳定留在会话 4）：失败就隔几秒重试一次，别急着判定"起不来"。
+- **会话号不是常量（2026-09-24 实测）**：隔离会话在一次丢失 + 重连后**从 4 变成 3**（RDPWrap 重连会给一个新号），而配方里 `SessionId -eq 4` 这类过滤全部失配 —— 微信明明已经在正确的会话里跑着，`Get-Session4WeixinPids` 却返回空，于是"续用已记住的会话"的点击被**静默跳过**、桥的 `/readyz` 一直 503，看起来像"微信根本起不来"。配方是**在目标会话内部**执行的，所以会话号应当取 `(Get-Process -Id $PID).SessionId`；`wechat-restart.ps1`（`Get-IsolatedWeixinPids`）与 `weflow-restart.ps1` 已改成这样。队列目录名 `s4\` 只是历史名字，与当前会话号无关；判断"在哪个会话"永远用运行期取值，不要写字面量。
 
 **一个桌面只能有一个自动化**：机器人的出站要激活微信窗口，而同一个隔离桌面里还有别的 agent 在跑 UIA 自动化（实测对方 `q74-real.ps1` / `q75-uia.ps1` 运行时，桥返回 **502 `WeChat main window could not be activated`**）。此时机器人把回复转成 `deferred_durable` 存进 `deferred-system-replies.json`，**在同一位发件人的下一条入站消息时一并补发**（`app.js` 的 `drainForSender`）—— 所以排队不等于丢失，但也不会自己重试。要立刻拿到回复：让对方停一下桌面自动化，或在微信里再发一句。
 

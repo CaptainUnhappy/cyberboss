@@ -27,11 +27,17 @@ $loginWindowClass = 'mmui::LoginWindow'
 # Built with -join: [string]::Concat(<chars>) resolves to an overload that
 # returns $null here, which silently disabled the resume click once already.
 $enterWeChatLabel = -join @([char]0x8FDB, [char]0x5165, [char]0x5FAE, [char]0x4FE1)
+# The isolated session's id is simply whatever session this script runs in.
+# Until 2026-09-24 everything hardcoded "session 4"; when the session was lost
+# and recreated it came back as session 3, so every `-eq 4` filter matched
+# nothing while a WeChat was quietly running in the right session.  Never
+# hardcode the id again: a recipe runs *inside* the session it manages.
+$isolatedSessionId = (Get-Process -Id $PID).SessionId
 Start-Transcript -Path $report -Force | Out-Null
 
-function Get-Session4WeixinPids {
+function Get-IsolatedWeixinPids {
   return @(Get-Process Weixin -ErrorAction SilentlyContinue |
-    Where-Object { $_.SessionId -eq 4 } |
+    Where-Object { $_.SessionId -eq $isolatedSessionId } |
     ForEach-Object { $_.Id })
 }
 
@@ -53,7 +59,7 @@ function Resume-RememberedWeChatSession {
   $rootElement = [System.Windows.Automation.AutomationElement]::RootElement
   $children = [System.Windows.Automation.TreeScope]::Children
   $descendants = [System.Windows.Automation.TreeScope]::Descendants
-  foreach ($wxPid in Get-Session4WeixinPids) {
+  foreach ($wxPid in Get-IsolatedWeixinPids) {
     $condition = New-Object System.Windows.Automation.PropertyCondition(
       [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $wxPid)
     foreach ($window in $rootElement.FindAll($children, $condition)) {
@@ -137,19 +143,19 @@ public static class CyberbossWin32Input {
   return $false
 }
 
-"whoami=$([Environment]::UserName) session=$((Get-Process -Id $PID).SessionId) started=$(Get-Date -Format o)"
+"whoami=$([Environment]::UserName) session=$isolatedSessionId started=$(Get-Date -Format o)"
 "exe exists = $(Test-Path -LiteralPath $exe)"
 
-if (@(Get-Session4WeixinPids).Count -eq 0) {
-  foreach ($process in @(Get-Process Weixin -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq 4 })) {
-    try { Stop-Process -Id $process.Id -Force -ErrorAction Stop; "killed previous session-4 weixin pid=$($process.Id)" }
+if (@(Get-IsolatedWeixinPids).Count -eq 0) {
+  foreach ($process in @(Get-Process Weixin -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $isolatedSessionId })) {
+    try { Stop-Process -Id $process.Id -Force -ErrorAction Stop; "killed previous isolated-session weixin pid=$($process.Id)" }
     catch { "kill $($process.Id) failed: $($_.Exception.Message)" }
   }
   Start-Sleep -Seconds 2
   $launcher = Start-Process -FilePath $exe -WorkingDirectory (Split-Path -Parent $exe) -PassThru
   "launcher pid=$($launcher.Id)"
 } else {
-  "session-4 weixin already running: $((Get-Session4WeixinPids) -join ',')"
+  "isolated-session weixin already running: $((Get-IsolatedWeixinPids) -join ',')"
 }
 
 $ready = $false
@@ -166,12 +172,12 @@ for ($attempt = 1; $attempt -le 40; $attempt++) {
     "resume outcome: $(@($resumeOutcome) -join ' | ')"
   }
   if ($attempt -eq 1 -or $attempt % 5 -eq 0) {
-    "attempt $attempt : session4 weixin pids=$((Get-Session4WeixinPids) -join ',') readyz not ok"
+    "attempt $attempt : isolated-session weixin pids=$((Get-IsolatedWeixinPids) -join ',') readyz not ok"
   }
 }
 
-$titles = @(Get-Process Weixin -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq 4 } | ForEach-Object { "$($_.Id):$($_.MainWindowTitle)" })
-"session4 weixin windows: $($titles -join ' | ')"
+$titles = @(Get-Process Weixin -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $isolatedSessionId } | ForEach-Object { "$($_.Id):$($_.MainWindowTitle)" })
+"isolated-session weixin windows: $($titles -join ' | ')"
 try {
   $final = Invoke-WebRequest -Uri $bridgeReadyz -TimeoutSec 5 -UseBasicParsing
   "readyz -> $($final.StatusCode) $($final.Content)"
@@ -180,6 +186,6 @@ try {
 }
 "READY = $ready"
 if (-not $ready) {
-  "WeChat is running in session 4 but the bridge still cannot see a logged-in main chat window. If the login window asks for a QR code (not a remembered account), a human must scan it: Start-ScheduledTask -TaskName cwin-s1-rdp-show, scan, then -hide."
+  "WeChat is running in session $isolatedSessionId but the bridge still cannot see a logged-in main chat window. If the login window asks for a QR code (not a remembered account), a human must scan it: Start-ScheduledTask -TaskName cwin-s1-rdp-show, scan, then -hide."
 }
 Stop-Transcript | Out-Null
