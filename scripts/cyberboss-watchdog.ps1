@@ -74,7 +74,10 @@ $AppServerPidFile = Join-Path $LogDir "shared-app-server.pid"
 $UiaPidFile = Join-Path $LogDir "weflow-uia-bridge.pid"
 $SharedPortText = Get-ProjectEnvValue -Name "CYBERBOSS_SHARED_PORT"
 $SharedPort = if ($SharedPortText -match "^\d+$") { [int]$SharedPortText } else { 8765 }
-$BridgeCommandPattern = "(?:^|[\\/])bin[\\/]cyberboss\.js\s+start(?:\s|$)"
+# See the matching note in cyberboss-service.ps1: a bot launched as
+# `node bin\cyberboss.js start --checkin` has whitespace before "bin", which the
+# old pattern rejected - so a live bot could never be identity-verified.
+$BridgeCommandPattern = "(?:^|[\s\\/])bin[\\/]cyberboss\.js\s+start(?:\s|$)"
 $AppServerCommandPattern = "(?:^|\s)app-server(?:\s|$).*--listen\s+ws://127\.0\.0\.1:$SharedPort(?:\s|$)"
 $UiaCommandPattern = "weflow-uia-bridge\.py(?:\s|$)"
 $WeFlowBaseUrl = Get-ProjectEnvValue -Name "CYBERBOSS_WEFLOW_BASE_URL"

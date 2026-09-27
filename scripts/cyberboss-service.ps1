@@ -118,7 +118,12 @@ $BridgePidFile = Join-Path $LogDir "shared-wechat.pid"
 $AppServerPidFile = Join-Path $LogDir "shared-app-server.pid"
 $WeFlowUiaBridgePidFile = Join-Path $LogDir "weflow-uia-bridge.pid"
 $PipelineActivityFile = Join-Path $StateDir "cyberboss-pipeline-activity.json"
-$BridgeCommandPattern = "(?:^|[\\/])bin[\\/]cyberboss\.js\s+start(?:\s|$)"
+# A bot launched as `node bin\cyberboss.js start --checkin` (bare relative path,
+# measured 2026-09-27) has whitespace - not a separator - before "bin", so the
+# old pattern could never verify it: the watchdog reported `cyberboss` down, the
+# service refused to adopt the live PID from the activity file, and a duplicate
+# start then removed the PID file. Accept any whitespace prefix as well.
+$BridgeCommandPattern = "(?:^|[\s\\/])bin[\\/]cyberboss\.js\s+start(?:\s|$)"
 $AppServerCommandPattern = "(?:^|\s)app-server(?:\s|$).*--listen\s+ws://127\.0\.0\.1:$Port(?:\s|$)"
 $WeFlowUiaCommandPattern = 'weflow-uia-bridge\.py"?(?:\s|$)'
 $SharedStartCommandPattern = 'shared-start\.js"?(?:\s|$)'
