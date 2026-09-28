@@ -4792,7 +4792,20 @@ try {
   exit 0
 } catch {
   $detail = $_.Exception.Message
-  if ($repairStarted -and $null -ne $recovery) {
+  # A controller that exceeds its 120s bound has usually already stopped the bot and
+  # then hung (measured 2026-09-28: a manual Restart ran >600s with the bot gone for
+  # 160s+). Waiting for the next 15-minute cycle costs the user that whole window, so
+  # fall back to the direct start the guard uses (measured: 40s to a polling bot).
+  if ($detail -match "controller exceeded") {
+    try {
+      $taskService = New-Object -ComObject Schedule.Service
+      $taskService.Connect()
+      $taskService.GetFolder('\').GetTask('cwin-s1-bot').Run($null)
+      Write-WatchdogLog "repair controller timed out; triggered cwin-s1-bot as fallback"
+    } catch {
+      Write-WatchdogLog "repair controller timed out and the cwin-s1-bot fallback failed: $($_.Exception.Message)"
+    }
+  }  if ($repairStarted -and $null -ne $recovery) {
     try {
       Set-WatchdogRepairOutcome -RecoveryState $recovery -Outcome "controller_error" -Ineffective -Completed
       Save-RecoveryState -State $recovery

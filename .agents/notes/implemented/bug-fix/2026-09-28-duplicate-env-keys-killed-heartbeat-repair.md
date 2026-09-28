@@ -206,3 +206,18 @@ deferred_busy` 说明它一直以"管线忙"为由推迟（而这台机器上"�
 附带效果：Ally 现在在收件箱**之外**，于是"选项 E"（把 Ally 做成专用 canary）只差一个
 `CYBERBOSS_WEFLOW_CANARY_CHAT=wxid_ty69l7hjiqt012` —— 三条约束（不是通知目标、不在收件箱、
 能自动产生回复）里的前两条已满足，第三条（它能否自动回复）仍需实测。
+## 追加：控制器超时后回落到直启（2026-09-28 17:22）
+
+实测 `cyberboss-service.ps1 -Mode Restart`：手工跑超过 **600 秒**没结束，期间 **bot 实例为 0 持续
+160+ 秒**（控制器先杀掉 bot，然后卡在健康检查里）。看门狗自己调用控制器时本来就有 120 秒上界
+（`WaitForExit(120000)` + `Stop-Process`），所以真实后果是"杀掉 bot → 抛错退出 → 等下一个 15 分钟
+周期"，而用户在这段时间里收不到任何回复。
+
+修法（`scripts/cyberboss-watchdog.ps1` 的 catch 分支）：当异常信息匹配 `controller exceeded` 时，
+立刻用 `Schedule.Service` COM 触发 `cwin-s1-bot`（也就是 guard 走的那条已验证路径，实测 40 秒
+恢复轮询），并写一行日志；触发失败也只记日志，不影响原有的状态落盘。
+
+顺带澄清一个此前的误判：`WeFlow UIA bridge already_running_unknown_pid` 是
+`scripts/shared-common.js:459` 的**信息性状态**（端点就绪但 pid 文件里的 pid 跨账号读不到命令行时
+返回它，然后继续启动），**不阻断**控制器；12:27 那次回滚的真凶是选项 A 的 canary 配置错误
+（`config.js:360`）。所以启动器不需要为这条日志改动。
