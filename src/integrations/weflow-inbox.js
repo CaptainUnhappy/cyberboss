@@ -2796,7 +2796,37 @@ async function writeJsonAtomic(filePath, value) {
   await fsPromises.mkdir(dir, { recursive: true });
   const temp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
   await fsPromises.writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  await fsPromises.rename(temp, filePath);
+  // Windows returns EPERM/EBUSY from rename() while another process still holds the
+  // destination open - an antivirus scanner, the search indexer, or a second reader.
+  // Measured 2026-09-24: repeated "EPERM: operation not permitted, rename
+  // '.weflow-inbox-cursor.json.<pid>.<ts>.tmp'" aborted the inbound/echo poll in a
+  // loop, inbound piled up, and the bot looked like it had stopped replying.
+  // Retry briefly, then fall back to writing in place so a poll can still advance.
+  const retryDelaysMs = [25, 75, 150, 300, 600];
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await fsPromises.rename(temp, filePath);
+      return;
+    } catch (error) {
+      const code = error?.code;
+      const retryable = code === "EPERM" || code === "EBUSY" || code === "EACCES";
+      if (!retryable) {
+        throw error;
+      }
+      if (attempt < retryDelaysMs.length) {
+        await delay(retryDelaysMs[attempt]);
+        continue;
+      }
+      // Atomicity is already lost for this attempt; the payload is durable in `temp`,
+      // so copying it into place keeps the cursor moving instead of stalling a poll.
+      console.warn(
+        `[cyberboss] atomic write fell back to in-place for ${path.basename(filePath)} after ${attempt} retries: ${code}`
+      );
+      await fsPromises.copyFile(temp, filePath);
+      await fsPromises.unlink(temp).catch(() => {});
+      return;
+    }
+  }
 }
 
 function delay(ms) {
