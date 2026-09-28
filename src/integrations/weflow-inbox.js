@@ -179,6 +179,15 @@ class WeFlowInboxSource {
         await this.consumePushStream(this.abortController.signal);
       } catch (error) {
         if (this.running && !isAbortError(error)) {
+          if (error?.pushDisabled) {
+            // The server answers 401/403 for /api/v1/push/messages ("Message push
+            // is disabled") on deployments that only expose polling. Retrying that
+            // every second produced ~1 error line per second for hours (measured
+            // 2026-09-28: 3605 lines in one service log) while polling carried all
+            // traffic anyway, so stop the push loop instead of reconnecting.
+            this.logger.error?.(`[cyberboss] WeFlow message push is disabled by the server; polling only (${formatError(error)})`);
+            break;
+          }
           this.logger.error?.(`[cyberboss] WeFlow push reconnecting: ${formatError(error)}`);
         }
       }
@@ -197,6 +206,11 @@ class WeFlowInboxSource {
       headers: buildHeaders(this.config, { accept: "text/event-stream" }),
       signal,
     });
+    if (response.status === 401 || response.status === 403) {
+      const disabled = new Error(`HTTP ${response.status}`);
+      disabled.pushDisabled = true;
+      throw disabled;
+    }
     assertHttpOk(response, "WeFlow message push");
     if (!response.body) {
       throw new Error("WeFlow message push returned an empty stream");
