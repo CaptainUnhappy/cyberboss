@@ -574,6 +574,19 @@ function Read-PidFile {
   return 0
 }
 
+function Write-PidFileAtomic {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][int]$PidValue
+  )
+
+  if ($PidValue -le 0) { throw "refusing to persist an invalid PID: $PidValue" }
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
+  $temporary = "$Path.$PID.tmp"
+  [IO.File]::WriteAllText($temporary, "$PidValue`r`n", [Text.UTF8Encoding]::new($false))
+  Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
 function Test-PidAlive {
   param([int]$PidValue)
   return $PidValue -gt 0 -and $null -ne (Get-Process -Id $PidValue -ErrorAction SilentlyContinue)
@@ -2936,6 +2949,37 @@ function Test-CanaryProbeDeferredByActivity {
     -or $ProbeCode -eq "CANARY_DESKTOP_ACTIVE"
 }
 
+# The shared pid file is maintained by the shared-start launcher, so a bot that
+# was started out of band - for example a direct `node bin\cyberboss.js start`
+# while the deployment was being reconfigured - never updates it. The stored pid
+# then goes stale while the process keeps writing pipeline activity, and the
+# heartbeat used to conclude "cyberboss dead" and order a Restart that killed the
+# healthy process (2026-09-28 10:14: snapshot said pid 33708/alive=false while a
+# bot started at 09:45 kept writing activity). Fresh activity whose pid is alive
+# AND whose command line still matches the bridge pattern is proof of the core;
+# adopt it and repair the pid file. A genuinely dead bot has no live verified pid
+# to adopt, so real crashes are still attributed. Mirrors
+# Repair-BridgePidFileFromActivity in cyberboss-service.ps1.
+function Repair-BridgePidFileFromActivity {
+  if (-not (Test-Path -LiteralPath $PipelineActivityFile)) { return 0 }
+  try {
+    $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+    $activity = [System.IO.File]::ReadAllText($PipelineActivityFile, $strictUtf8) | ConvertFrom-Json
+    $activityPid = [int]$activity.pid
+    $updatedAt = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$activity.updatedAt, [ref]$updatedAt)) { return 0 }
+    $ageSeconds = ([DateTimeOffset]::UtcNow - $updatedAt.ToUniversalTime()).TotalSeconds
+    if ($ageSeconds -lt 0 -or $ageSeconds -gt 120) { return 0 }
+    if (-not (Test-VerifiedPidAlive -PidValue $activityPid -CommandPattern $BridgeCommandPattern)) { return 0 }
+    Write-PidFileAtomic -Path $BridgePidFile -PidValue $activityPid
+    Write-WatchdogLog "core PID file recovered from fresh pipeline activity PID $activityPid"
+    return $activityPid
+  } catch {
+    # An unreadable or malformed activity snapshot is never evidence of liveness.
+    return 0
+  }
+}
+
 function Get-HealthSnapshot {
   $bridgePid = Read-PidFile -Path $BridgePidFile
   $appServerPid = Read-PidFile -Path $AppServerPidFile
@@ -2944,6 +2988,17 @@ function Get-HealthSnapshot {
   $appServerProcessAlive = Test-PidAlive -PidValue $appServerPid
   $uiaProcessAlive = Test-PidAlive -PidValue $uiaPid
   $bridgeAlive = Test-VerifiedPidAlive -PidValue $bridgePid -CommandPattern $BridgeCommandPattern
+  if (-not $bridgeAlive) {
+    # A stale pid file must not be read as "the core is dead": that verdict buys a
+    # mechanical Restart, and the restart kills the live bot the pid file merely
+    # failed to describe.
+    $recoveredBridgePid = Repair-BridgePidFileFromActivity
+    if ($recoveredBridgePid -gt 0) {
+      $bridgePid = $recoveredBridgePid
+      $bridgeProcessAlive = $true
+      $bridgeAlive = $true
+    }
+  }
   $appServerAlive = Test-VerifiedPidAlive -PidValue $appServerPid -CommandPattern $AppServerCommandPattern
   $uiaAlive = Test-UiaBridgePidVerified -PidValue $uiaPid
   $bridgeUptimeSeconds = -1
