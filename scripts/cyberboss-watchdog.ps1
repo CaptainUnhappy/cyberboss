@@ -7,6 +7,39 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Repair-DuplicateEnvironmentKeys {
+  # Windows PowerShell 5.1 throws from Start-Process while it copies the process
+  # environment if two keys differ only by case. Measured 2026-09-28: a hosted
+  # shell contributed http_proxy/HTTP_PROXY, https_proxy/HTTPS_PROXY and
+  # NO_PROXY/no_proxy, and the heartbeat repair died with "Item has already been
+  # added. Key in dictionary: 'NO_PROXY' Key being added: 'no_proxy'" one second
+  # after it had activated the restart notification, so no repair ever ran.
+  # Collapse every such group to one key, keeping the first spelling (and the
+  # conventional "Path" casing).
+  $environment = [Environment]::GetEnvironmentVariables("Process")
+  $groups = @($environment.Keys |
+    Group-Object { ([string]$_).ToLowerInvariant() } |
+    Where-Object { $_.Count -gt 1 })
+  foreach ($group in $groups) {
+    $keys = @($group.Group | ForEach-Object { [string]$_ })
+    $value = ""
+    foreach ($key in $keys) {
+      $candidate = [string]$environment[$key]
+      if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        $value = $candidate
+        break
+      }
+    }
+    foreach ($key in $keys) {
+      [Environment]::SetEnvironmentVariable($key, $null, "Process")
+    }
+    $keep = if ($group.Name -eq "path") { "Path" } else { $keys[0] }
+    [Environment]::SetEnvironmentVariable($keep, $value, "Process")
+  }
+}
+
+Repair-DuplicateEnvironmentKeys
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ProjectEnvFile = Join-Path $ProjectRoot ".env"
 $ServiceScript = Join-Path $PSScriptRoot "cyberboss-service.ps1"

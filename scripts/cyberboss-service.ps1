@@ -9,30 +9,38 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ProjectEnvFile = Join-Path $ProjectRoot ".env"
 $UserEnvFile = Join-Path (Join-Path $HOME ".cyberboss") ".env"
 
-function Repair-DuplicatePathEnvironment {
-  # Some launchers inject both `Path` and `PATH`. Windows PowerShell 5.1 then
-  # throws from Start-Process while copying the environment dictionary.
+function Repair-DuplicateEnvironmentKeys {
+  # Windows PowerShell 5.1 throws from Start-Process while it copies the process
+  # environment if two keys differ only by case. Measured 2026-09-28: a hosted
+  # shell contributed http_proxy/HTTP_PROXY, https_proxy/HTTPS_PROXY and
+  # NO_PROXY/no_proxy, and the heartbeat repair died with "Item has already been
+  # added. Key in dictionary: 'NO_PROXY' Key being added: 'no_proxy'" one second
+  # after it had activated the restart notification, so no repair ever ran.
+  # Collapse every such group to one key, keeping the first spelling (and the
+  # conventional "Path" casing).
   $environment = [Environment]::GetEnvironmentVariables("Process")
-  $pathKeys = @($environment.Keys | Where-Object { [string]$_ -ieq "Path" })
-  if ($pathKeys.Count -le 1) {
-    return
-  }
-
-  $pathValue = ""
-  foreach ($key in @("Path", "PATH") + $pathKeys) {
-    $candidate = [string]$environment[$key]
-    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-      $pathValue = $candidate
-      break
+  $groups = @($environment.Keys |
+    Group-Object { ([string]$_).ToLowerInvariant() } |
+    Where-Object { $_.Count -gt 1 })
+  foreach ($group in $groups) {
+    $keys = @($group.Group | ForEach-Object { [string]$_ })
+    $value = ""
+    foreach ($key in $keys) {
+      $candidate = [string]$environment[$key]
+      if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        $value = $candidate
+        break
+      }
     }
+    foreach ($key in $keys) {
+      [Environment]::SetEnvironmentVariable($key, $null, "Process")
+    }
+    $keep = if ($group.Name -eq "path") { "Path" } else { $keys[0] }
+    [Environment]::SetEnvironmentVariable($keep, $value, "Process")
   }
-  foreach ($key in $pathKeys) {
-    [Environment]::SetEnvironmentVariable([string]$key, $null, "Process")
-  }
-  [Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")
 }
 
-Repair-DuplicatePathEnvironment
+Repair-DuplicateEnvironmentKeys
 
 function Get-ProjectEnvValue {
   param([Parameter(Mandatory = $true)][string]$Name)
