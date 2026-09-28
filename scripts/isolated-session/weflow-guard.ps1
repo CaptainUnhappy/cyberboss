@@ -43,6 +43,37 @@ if (-not $token -or -not $talker) {
   exit 65
 }
 
+# --- bot liveness -----------------------------------------------------------
+# The WeFlow reader can be perfectly healthy while nothing is reading it: on
+# 2026-09-28 the bot process died at 12:44 and stayed dead for 27 minutes,
+# because cwin-s1-bot only fires on logon (plus manual runs) and the heartbeat
+# watchdog's repair budget was in cooldown. Nothing else watched the bot itself.
+# Start it again if it is gone; never touch a live one.
+$botPattern = 'bin\\cyberboss\.js\s+start'
+$botAlive = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.CommandLine -match $botPattern -and $_.CommandLine -notmatch 'runner\.js' })
+if ($botAlive.Count -gt 0) {
+  Write-GuardLog ("bot healthy (pid " + ($botAlive.ProcessId -join ',') + ")")
+} else {
+  # Start through the scheduler's own COM API: schtasks.exe is a console program
+  # and this host hands console creation to Windows Terminal, so the user would
+  # see a terminal flash (same reason rdp-keepalive.py avoids schtasks.exe).
+  $started = $false
+  $detail = ''
+  try {
+    $service = New-Object -ComObject Schedule.Service
+    $service.Connect()
+    $service.GetFolder('\').GetTask('cwin-s1-bot').Run($null)
+    $started = $true
+  } catch {
+    $detail = $_.Exception.Message
+  }
+  if ($started) {
+    Write-GuardLog "bot missing -> triggered cwin-s1-bot"
+  } else {
+    Write-GuardLog "bot missing and cwin-s1-bot could not be triggered: $detail"
+  }
+}
 $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $uri = "http://127.0.0.1:$port/api/v1/messages?talker=$([Uri]::EscapeDataString($talker))&limit=1&start=$($now - 600)&end=$now"
 

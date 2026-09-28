@@ -150,3 +150,24 @@ heartbeat error: Item has already been added. Key in dictionary: 'NO_PROXY'  Key
   某个 agent 会话在循环重启），期间 activity 与收件箱游标都不推进。用
   `schtasks /run /tn cwin-s1-bot`（`bot-direct.cmd`）拉起后恢复，`cyberboss.pid` 指向任务实例。
   处置这类停摆要先看"谁在拉起它"（看父进程），不要只顾着重启。
+## 追加：给"bot 自己死了"补一道 15 分钟自愈（2026-09-28 14:31）
+
+12:44–13:13 的 27 分钟停摆根因不是"被反复杀掉"，而是**没有任何东西负责把死掉的 bot 拉起来**：
+`cwin-s1-bot` 只在登录时触发（外加手动 `/run`），心跳看门狗的修复受冷却与预算约束（≤6/24h、
+≥30 分钟一次），于是 bot 一死就是几十分钟。
+
+修法：把存活检查并进已经在跑的 15 分钟任务 `cwin-weflow-guard`（`scripts/isolated-session/
+weflow-guard.ps1`）——它本来就每 15 分钟醒一次、以当前用户身份运行、不需要提权。新逻辑：
+用 `Get-CimInstance` 找 `bin\cyberboss.js start` 的 node 进程（排除 `runner.js`，否则会命中排查
+命令自身），**在就不动，不在就用 Task Scheduler 的 COM API 触发 `cwin-s1-bot`**（不用
+`schtasks.exe`：它是控制台程序，本机会把控制台交给 Windows Terminal，用户会看到窗口闪一下，
+这也是 `rdp-keepalive.py` 当初改用 COM 的原因），并写一行日志。
+
+端到端实测（14:31）：杀掉 bot（实例数 0）→ 手动跑一次 guard →
+`bot missing -> triggered cwin-s1-bot` → 35 秒后新实例起来、activity 8 秒新鲜。
+即"bot 死了"的自愈时间从 27 分钟量级降到 ~30 秒（不是 15 分钟，因为 guard 的检查是即时的，
+15 分钟只是它的巡检周期；最坏情况仍是 15 分钟内被发现）。
+
+排查纪律（本次踩到的坑）：用 `-like '*cyberboss.js*'` 数进程会**命中排查命令自己**——命令行里
+包含这个字样。必须用带路径的锚（`bin\\cyberboss\.js\s+start`）并排除 `runner.js`，否则会得出
+"每分钟冒出重复实例"的错误结论（我自己就先得出了这个结论）。
