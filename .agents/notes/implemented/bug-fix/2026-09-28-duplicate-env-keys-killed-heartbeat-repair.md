@@ -171,3 +171,28 @@ weflow-guard.ps1`）——它本来就每 15 分钟醒一次、以当前用户�
 排查纪律（本次踩到的坑）：用 `-like '*cyberboss.js*'` 数进程会**命中排查命令自己**——命令行里
 包含这个字样。必须用带路径的锚（`bin\\cyberboss\.js\s+start`）并排除 `runner.js`，否则会得出
 "每分钟冒出重复实例"的错误结论（我自己就先得出了这个结论）。
+## 追加：验证义务不再"永远 deferred"（2026-09-28 15:56）
+
+清掉恢复状态里过期的 `pendingRepairVerification` 时发现它指向的身份
+（`2026-09-28T04:35:44Z`，即 12:35 那次修复）**根本没有任何通知记录**——`StartWeixin` /
+`ResetAzzySource` 这类修复模式本来就不入队重启通知。而 `Complete-VerifiedRepair` 的派发要求该身份
+有可投递的义务，于是这种义务**永远完不成**：每轮心跳都写 `post-repair canary remains deferred`，
+状态机看起来"还在等验证"，实际等的东西不存在。
+
+修法（`scripts/cyberboss-watchdog.ps1`）：
+
+1. `Get-WatchdogRestartNotificationStatus` 增加可选 `-RepairIdentity`：按身份精确取记录，取不到就
+   返回 `action="missing"`（原来只会返回**最新一条**，身份不同就会看错对象）；
+2. 延迟验证分支在跑 canary 之前先查该身份的义务：`missing`/`cancelled`/`error`/`state_error`
+   → 用 `Set-VerifiedRecoveryState` 关闭验证义务，写
+   `repair_verification_closed` 状态并记一行日志，而不是继续 deferred。
+   `pending`/`uncertain_pending`/`awaiting_repair_verification`/`verified` 仍走原来的验证流程。
+
+手工清状态只做了一次（`cyberboss-watchdog-recovery.json`，备份 `*.bak-before-clear`）；上面的代码
+改动才是"以后不会再卡住"的那一半。
+
+清完之后暴露出的下一条红线（**未处理，需要人定**）：模型 E2E 金丝雀
+`model E2E pipeline blocked after 2 consecutive routine failures; code=MODEL_CANARY_HANDOFF_FAILED;
+nextDue=2026-09-15T16:15:42Z`——`nextDue` 停在 09-15，说明这个子系统早就卡死；`currentAction=
+deferred_busy` 说明它一直以"管线忙"为由推迟（而这台机器上"忙"的常常是自动化自己）。选项：
+关掉 `CYBERBOSS_ENABLE_WEFLOW_MODEL_CANARY`（少一道自检），或专门排查它的状态文件与 handoff 逻辑。

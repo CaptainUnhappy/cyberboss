@@ -3117,6 +3117,7 @@ function Get-HealthSnapshot {
 }
 
 function Get-WatchdogRestartNotificationStatus {
+  param([string]$RepairIdentity = "")
   $result = [ordered]@{
     action = "none"
     pendingCount = 0
@@ -3167,7 +3168,15 @@ function Get-WatchdogRestartNotificationStatus {
     $result.awaitingRepairVerificationCount = $awaiting.Count
     $result.cancelledCount = $cancelled.Count
     if ($notifications.Count -eq 0) { return $result }
-    $latest = $notifications[-1]
+    $latest = if ([string]::IsNullOrWhiteSpace($RepairIdentity)) {
+      $notifications[-1]
+    } else {
+      @($notifications | Where-Object { [string]$_.repairIdentity -ceq $RepairIdentity })[-1]
+    }
+    if ($null -eq $latest) {
+      $result.action = "missing"
+      return $result
+    }
     $result.action = [string]$latest.status
     $result.repairIdentity = [string]$latest.repairIdentity
     $result.repairMode = [string]$latest.repairMode
@@ -4142,6 +4151,21 @@ try {
       [string]$recovery.pendingRepairVerificationIdentity
     } else {
       [string]$recovery.pendingRepairVerificationAt
+    }
+    # A repair that never enqueued a restart notification (StartWeixin/ResetAzzySource
+    # modes do not) or whose notification an operator cancelled can never be completed by
+    # the dispatch inside Complete-VerifiedRepair. Left alone, that obligation stayed
+    # pending forever and every run reported "post-repair canary remains deferred"
+    # (measured 2026-09-28: identity 2026-09-28T04:35:44Z had no notification record at
+    # all). Close the verification obligation instead of deferring it forever.
+    $obligation = Get-WatchdogRestartNotificationStatus -RepairIdentity $identity
+    if ([string]$obligation.action -in @("missing", "cancelled", "error", "state_error")) {
+      Set-VerifiedRecoveryState -Snapshot $snapshot -RecoveryState $recovery
+      Save-RecoveryState -State $recovery
+      $closeDetail = "identity=$identity has no deliverable restart notification (action=$($obligation.action)); verification obligation closed"
+      Save-Status -Snapshot $snapshot -Action "repair_verification_closed" -Detail $closeDetail -RecoveryState $recovery
+      Write-WatchdogLog $closeDetail
+      exit 0
     }
     $verification = Invoke-PostRepairCanaryVerification `
       -Snapshot $snapshot `
