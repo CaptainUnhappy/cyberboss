@@ -196,3 +196,13 @@ weflow-guard.ps1`）——它本来就每 15 分钟醒一次、以当前用户�
 nextDue=2026-09-15T16:15:42Z`——`nextDue` 停在 09-15，说明这个子系统早就卡死；`currentAction=
 deferred_busy` 说明它一直以"管线忙"为由推迟（而这台机器上"忙"的常常是自动化自己）。选项：
 关掉 `CYBERBOSS_ENABLE_WEFLOW_MODEL_CANARY`（少一道自检），或专门排查它的状态文件与 handoff 逻辑。
+## 追加：收件箱名单剔除退役账号（2026-09-28 17:05）
+
+`CYBERBOSS_WEFLOW_INBOX_CHATS` 从 `wxid_ubo0cy5xh4px22,wxid_ty69l7hjiqt012` 改为只剩
+`wxid_ubo0cy5xh4px22`（Ally 退役）：退役账号不该留在"当作真人对话处理"的白名单里。备份
+`.env.bak-inbox-drop-ally-*`。实测：kill + `weflow-guard` 自愈后 bot 正常起、activity 9s /
+收件箱游标 1s。
+
+附带效果：Ally 现在在收件箱**之外**，于是"选项 E"（把 Ally 做成专用 canary）只差一个
+`CYBERBOSS_WEFLOW_CANARY_CHAT=wxid_ty69l7hjiqt012` —— 三条约束（不是通知目标、不在收件箱、
+能自动产生回复）里的前两条已满足，第三条（它能否自动回复）仍需实测。
