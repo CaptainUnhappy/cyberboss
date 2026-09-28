@@ -87,3 +87,44 @@ heartbeat error: Item has already been added. Key in dictionary: 'NO_PROXY'  Key
   超时/换定位方式。这是产品取舍，需要人来定，不是能单方面改的。
 - canary 未绿期间，守护脚本每轮会以 `blocked_nonrestartable` 退出（exit 2），但**不影响收发**：
   通知义务的派发走 drain 路径，已经在本笔记的演练里证明可独立完成。
+
+## 追加（同日）：canary 目标选型的边界 —— "把 canary 指到 yourself/大号" 走不通
+
+用户选了"canary 改到 `wxid_ubo0cy5xh4px22`（yourself，主收件箱窗口）"。实施后发现**产品自带不变量
+直接拒绝**，这条路的代价也比看上去大：
+
+1. `src/core/config.js:360` 硬校验：`CYBERBOSS_WEFLOW_CANARY_CHAT must differ from
+   CYBERBOSS_WEFLOW_INBOX_CHAT; dedicated canary routing is disabled`。
+   `CYBERBOSS_WEFLOW_INBOX_CHATS=wxid_ubo0cy5xh4px22,wxid_ty69l7hjiqt012`，所以 canary 一旦指到
+   大号（或指到另一个机器人号 Ally），**bot 直接起不来**——实测控制器 `-Mode Restart` 的新进程
+   以这条错误退出，控制器做了回滚（"Partial startup was rolled back without stopping pre-existing
+   healthy components"）。换句话说：这不是"没配好"，是设计上不允许 canary 复用收件箱窗口。
+2. 更深一层：canary 的验证要 `triggerLocalId` **和** `replyLocalId` 成对（守护脚本判绿的条件）。
+   能自动产生"回复"的只有**自己跟自己**的窗口（机器人给自己发、自己再回）。历史上所有绿过的
+   canary run，`targetTalker` 都是 `wxid_s3178hwvzsl922`（Azzy 自己）。而 Azzy 自己现在正是
+   ♻️ 通知的目标——隔离断言要求两者不同，于是"能自动回复的窗口"和"不能是通知目标"这两条**同时
+   成立的候选几乎为空**。
+3. 所以 `.env` 已回滚成能启动的形态：`CANARY_CHAT=wxid_6r2qv9w2hgth22`、`CANARY_DISPLAY_NAME=.`
+   （该 talker 在 WeFlow 通讯录里 `displayName`/`nickname` 就是 `.`，写"美女"会在桥的
+   `exact_contact` 校验处直接报 `contact '美女' is not a name of talker ...: ['.']`）。
+   注意这个 target 名字有歧义（`.` 在搜索框里会匹配到别的行），探针仍会
+   `canary trigger timed out after 25000ms`。
+
+真正可选的收口方式（都需要人定，且都不是"改个 .env"）：
+
+- **C**：把 ♻️ 通知挪回非自身窗口（例如大号收件箱），canary 用 Azzy 自己——即回到改动前的分工，
+  牺牲"通知只发给自己"这条。
+- **D**：承认 canary 无法自动化，去掉/放宽"canary 必须绿"这道门（例如修复验证只依赖账本 drain +
+  心跳），守护脚本不再把 canary 的失败当成不健康组件。
+- **E**：给 canary 一个**专用的第三个账号**（例如把退役的 Ally 重新登录、并把它从 inbox 列表里
+  摘掉），这样"能自动回复"与"不是通知目标/不在收件箱"三条同时成立。长期最干净，代价是要重新
+  登录一个账号。
+
+另外两个今天顺带看到的真实现象（未处理，供排查）：
+
+- 控制器启停一次会留下 `WeFlow push reconnecting: WeFlow message push returned HTTP 403` 刷屏
+  （今天两份服务日志：`20260928-101522` 3605 行、`20260928-123617` 419 行；此前几天的日志 0 行）。
+  轮询路径正常（游标 20 秒级推进），所以收发没断，但推送通道是坏的。
+- 启动器对桥 pid 文件的**跨账号判读**：`WeFlow UIA bridge already_running_unknown_pid pid=23088`
+  会让控制器 `Restart` 的启动健康检查失败并回滚；用 `schtasks /run /tn cwin-s1-bot`
+  （`bot-direct.cmd` 直启，绕开启动器）可以把 bot 拉起来。
