@@ -122,3 +122,11 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 **教训（第二次踩）**：这个仓库里**含非 ASCII 的 `.ps1` 必须带 UTF-8 BOM**，否则 PowerShell 5.1 按 GBK 读，脚本直接解析失败（2026-09-18 的 `cyberboss-watchdog.ps1` 就是这样整体停摆 4 天）。`weflow-guard.ps1` 因此刻意写成纯 ASCII。
 
 **搜索结果稳定性窗口（2026-09-23 修）**：微信在 18:19 被更新程序重启后，桥的发送开始稳定失败，日志给出确切原因 —— `target not confirmed: … ordered search content identity had not repeated yet (polls=1, window=2.0s)`：桥需要**连续两次看到同一份搜索弹窗内容**才敢按 Enter，而窗口只有 2.0 秒，慢的时候只轮询到 1 次，于是 fail-closed 完全发不出去（表现为"又不回复"，且与空间/抢桌面无关）。修法：`MAX_SEARCH_RESULT_STABILIZATION_SECONDS` 3.0 → **12.0**，并新增下限 `MIN_SEARCH_RESULT_STABILIZATION_SECONDS = 6.0`，窗口取 `max(下限, min(上限, 调用方超时))`，保证至少有两次轮询的时间。修复后实测 `POST /api/send → dispatched=true verified=true`。
+
+**会话号会变，脚本不得硬编码（2026-09-24 实测）**：重启后隔离会话的 id 从 **4 变成 3**，于是 `weflow-restart.ps1` 里 `Where-Object { $_.SessionId -eq 4 }` 的"杀旧进程"一步**什么都没杀**，旧 WeFlow 继续拿着失效的库密钥占着 5051，读侧恒 500 —— 白排查数小时。同一坑当天出现三次（另一个会话的 `rdp-remote-guard` 也按 session 4 写死）。因此所有脚本一律按**进程名/路径/端口**定位，禁止按会话号筛选。
+
+**启动器的桥检查会误判并拒绝启动机器人（2026-09-24）**：`shared-start.js` 校验桥的 pid 文件时会读那个进程的命令行；桥以 cwinprobe 身份跑在隔离会话里，session 1/2 的启动器**读不到它的命令行**，于是报 `WeFlow UIA bridge already_running_unknown_pid pid=…` 并**拒绝拉起机器人本体**；即使勉强起来，运行时也会 `dsh request timed out: initialize`（回合起不来 → `pendingInbound` 积压、`reply obligations reached no-reply timeout` = 用户看到"不回复"）。绕过办法：`cwin-s1-bot` 任务 + `bot-direct.cmd` **直接执行 `node bin/cyberboss.js start --checkin`**，不经过启动器的桥校验。
+
+**状态目录原子写被拒（复发性根因）**：`EPERM: operation not permitted, rename '…\.cyberboss\.weflow-inbox-cursor.json.tmp'` 反复出现，打断入站/回声轮询 → 入站积压 → 不回复。怀疑杀软/索引器实时扫描 `C:\Users\79388\.cyberboss\`；待办：写入加"重试+退避"，并把游标目录迁到 `D:\`。
+
+**心跳窗口与重启通知必须用不同窗口（2026-09-28）**：`cyberboss-watchdog-restart-notification.js:496` 的 `assertTargetIsolation` 会**抛错**拒绝"通知窗口 == 心跳窗口"（防止两类流量在账本里混淆）。现在：重启通知 → `wxid_s3178hwvzsl922`（Azzy 自聊，`CYBERBOSS_WATCHDOG_NOTIFY_CHAT`），心跳 → `wxid_6r2qv9w2hgth22`（另一个 Azzy 会话）。看门狗新增 `CYBERBOSS_WATCHDOG_NOTIFY_CHAT/_DISPLAY_NAME` 两个键，缺省回落 inbox。

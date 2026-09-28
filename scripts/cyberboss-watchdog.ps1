@@ -3206,6 +3206,13 @@ function Invoke-WatchdogRestartNotification {
   } else {
     30000
   }
+  # Restart-notification target. Defaults to the inbox chat, but an operator can
+  # point the watchdog heartbeat/restart notices at another window (e.g. the bot's
+  # own self-chat) without moving the inbox itself.
+  $notifyChat = Get-ProjectEnvValue -Name "CYBERBOSS_WATCHDOG_NOTIFY_CHAT"
+  $notifyDisplayName = Get-ProjectEnvValue -Name "CYBERBOSS_WATCHDOG_NOTIFY_DISPLAY_NAME"
+  if ([string]::IsNullOrWhiteSpace($notifyChat)) { $notifyChat = $WeFlowInboxChat }
+  if ([string]::IsNullOrWhiteSpace($notifyDisplayName)) { $notifyDisplayName = $WeFlowInboxDisplayName }
   $request = [ordered]@{
     stateDir = $StateDir
     stateFile = $RestartNotificationState
@@ -3215,8 +3222,8 @@ function Invoke-WatchdogRestartNotification {
       weflowBridgeTimeoutMs = $timeoutMs
     }
     requireDesktopIdleSeconds = 0
-    primaryTalker = $WeFlowInboxChat
-    primaryContact = $WeFlowInboxDisplayName
+    primaryTalker = $notifyChat
+    primaryContact = $notifyDisplayName
     canaryTalker = $WeFlowCanaryChat
   }
   if ($Action -ne "drain") {
