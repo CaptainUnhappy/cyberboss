@@ -128,3 +128,25 @@ heartbeat error: Item has already been added. Key in dictionary: 'NO_PROXY'  Key
 - 启动器对桥 pid 文件的**跨账号判读**：`WeFlow UIA bridge already_running_unknown_pid pid=23088`
   会让控制器 `Restart` 的启动健康检查失败并回滚；用 `schtasks /run /tn cwin-s1-bot`
   （`bot-direct.cmd` 直启，绕开启动器）可以把 bot 拉起来。
+
+## 已选 C 并落地（2026-09-28 13:07）
+
+`.env` 现值（备份 `.env.bak-optionC-20260928-130659`）：
+
+- `CYBERBOSS_WATCHDOG_NOTIFY_CHAT=wxid_ubo0cy5xh4px22` / `..._DISPLAY_NAME=yourself` —— 通知发回大号；
+- `CYBERBOSS_WEFLOW_CANARY_CHAT=wxid_s3178hwvzsl922` / `..._DISPLAY_NAME=Azzy` —— canary 用 Azzy 自己。
+
+落地证据：bot 启动日志 `WeFlow canary inbox enabled chat=wxid_s3178hwvzsl922 contact=Azzy`
+（配置被接受，不再触发 `must differ from` 校验）；canary 入站游标已由 bot 重新基线到
+`wxid_s3178hwvzsl922`；恢复状态里的 `pendingRepairVerification` 下次走延迟验证时应能真正判绿
+（历史上 canary 目标为 Azzy 自己时全部 verified）。
+
+同一次操作暴露的两个真实现象：
+
+- **环境重复键不只会打断守护脚本，也会打断任何被托管的 shell**：本会话 pwsh 里 `Start-Process`
+  直接抛 `Item has already been added. Key in dictionary: 'NO_PROXY' Key being added: 'no_proxy'`，
+  所以 `20d0b68` 的"启动即收敛"是"在被污染的 shell 里做任何起进程的事"的前提，而不是可选项。
+- **bot 在 12:44–13:11 停摆 27 分钟**：进程被反复拉起又立刻消失（父进程是 DSH web 宿主，说明是
+  某个 agent 会话在循环重启），期间 activity 与收件箱游标都不推进。用
+  `schtasks /run /tn cwin-s1-bot`（`bot-direct.cmd`）拉起后恢复，`cyberboss.pid` 指向任务实例。
+  处置这类停摆要先看"谁在拉起它"（看父进程），不要只顾着重启。
