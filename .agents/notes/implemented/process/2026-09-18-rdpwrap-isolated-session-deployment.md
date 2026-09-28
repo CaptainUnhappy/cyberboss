@@ -132,3 +132,5 @@ Start-ScheduledTask -TaskName cwin-s1-rdp-hide   # 移除暂停文件 + 停靠�
 **心跳窗口与重启通知必须用不同窗口（2026-09-28）**：`cyberboss-watchdog-restart-notification.js:496` 的 `assertTargetIsolation` 会**抛错**拒绝"通知窗口 == 心跳窗口"（防止两类流量在账本里混淆）。现在：重启通知 → `wxid_s3178hwvzsl922`（Azzy 自聊，`CYBERBOSS_WATCHDOG_NOTIFY_CHAT`），心跳 → `wxid_6r2qv9w2hgth22`（另一个 Azzy 会话）。看门狗新增 `CYBERBOSS_WATCHDOG_NOTIFY_CHAT/_DISPLAY_NAME` 两个键，缺省回落 inbox。
 
 **原子写被拒（EPERM）已加退避 + 兜底（2026-09-28）**：`C:\Users\79388\.cyberboss\` 下的原子写在 Windows 上会被 `rename()` 返回 `EPERM/EBUSY/EACCES` —— 目标文件被别的进程打开时就会这样（杀软实时扫描、搜索索引器、或第二个读者）。症状是入站/回声轮询被反复打断（`EPERM … rename '.weflow-inbox-cursor.json.<pid>.<ts>.tmp'`）→ 入站积压 → 表现为"不回复"。修法（`src/integrations/weflow-inbox.js: writeJsonAtomic`）：rename 失败时按 25/75/150/300/600 ms 退避重试 5 次；仍失败则**拷贝到目标并删除临时文件**（记一条 `atomic write fell back to in-place` 警告）——原子性让位于"游标必须能推进"。
+
+**离线回归测试（2026-09-28）**：`test/weflow-inbox-atomic-write.test.js` 用 `vm` 加载 `writeJsonAtomic` 的真实函数文本，再起一个子进程把目标文件按只读句柄占住（Windows 上这种占用会让 `rename()` 返回 `EPERM`），跑两个场景：占 400 ms → 退避重试救回（实测 567 ms，未走兜底）；占 2500 ms → 重试到顶走原地拷贝（实测 1168 ms，数据完整）。两个场景都断言不留 `.tmp`。跑法：`node test/weflow-inbox-atomic-write.test.js`。
