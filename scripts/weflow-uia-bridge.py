@@ -2824,16 +2824,19 @@ class BridgeState:
                 input_control = confirm_current_chat_target(root, contact)
                 input_control.Click(waitTime=0.05)
                 selected_tick = get_last_input_tick()
+                _send_timing_log("pre-idle-assert", globals().get("_last_send_request_at"))
                 require_no_competing_desktop_input(
                     selected_tick,
                     max(MIN_CANARY_DESKTOP_IDLE_SECONDS, int(require_desktop_idle_seconds or 0)),
                 )
                 input_control = confirm_current_chat_target(root, contact)
                 require_foreground_continuity(window_handle)
+                _send_timing_log("pre-focus-assert", globals().get("_last_send_request_at"))
                 require_focused_chat_input(contact)
             else:
                 input_control.Click(waitTime=0.05)
                 require_foreground_continuity(window_handle)
+                _send_timing_log("pre-focus-assert", globals().get("_last_send_request_at"))
                 require_focused_chat_input(contact)
                 selected_tick = get_last_input_tick()
 
@@ -2845,7 +2848,9 @@ class BridgeState:
             input_value_patterns.append(input_value_pattern)
             input_control = confirm_current_chat_target(root, contact)
             require_foreground_continuity(window_handle)
+            _send_timing_log("pre-focus-assert", globals().get("_last_send_request_at"))
             require_focused_chat_input(contact)
+            _send_timing_log("pre-idle-assert", globals().get("_last_send_request_at"))
             require_no_competing_desktop_input(
                 selected_tick,
                 max(MIN_CANARY_DESKTOP_IDLE_SECONDS, int(require_desktop_idle_seconds or 0))
@@ -2863,6 +2868,7 @@ class BridgeState:
                     "fresh confirmed chat input did not retain the exact requested text before Enter"
                 )
             require_foreground_continuity(window_handle)
+            _send_timing_log("pre-focus-assert", globals().get("_last_send_request_at"))
             require_focused_chat_input(contact)
             automation.SendKeys("{Enter}", waitTime=0.05)
             enter_dispatched = True
