@@ -2525,7 +2525,7 @@ class BridgeState:
                         exact_contact=exact_contact,
                     )
             _send_timing_log("typed", globals().get("_last_send_request_at"))
-            deadline = time.monotonic() + max(1.0, timeout)
+            deadline = time.monotonic() + max(0.0, timeout)  # 0 = 回车后立即返回；超时分支本就返回 dispatched/uncertain，由机器人账本核验
             last_error = ""
             while time.monotonic() < deadline:
                 try:
@@ -2674,7 +2674,7 @@ class BridgeState:
             with foreground_return(), uia_com_apartment():
                 self._dispatch_image(contact, image_bytes)
             _send_timing_log("typed", globals().get("_last_send_request_at"))
-            deadline = time.monotonic() + max(1.0, timeout)
+            deadline = time.monotonic() + max(0.0, timeout)  # 0 = 回车后立即返回；超时分支本就返回 dispatched/uncertain，由机器人账本核验
             last_error = ""
             while time.monotonic() < deadline:
                 try:
@@ -3104,7 +3104,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 _verify_cap = os.environ.get("CYBERBOSS_WEFLOW_SEND_VERIFY_SECONDS", "").strip()
                 if _verify_cap:
                     try:
-                        timeout = min(timeout, max(1.0, float(_verify_cap)))
+                        timeout = min(timeout, max(0.0, float(_verify_cap)))
                     except ValueError:
                         pass
                 exact_contact = payload.get("exactContact", False)
