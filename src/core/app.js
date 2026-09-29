@@ -2188,7 +2188,9 @@ class CyberbossApp {
     try {
       await this.channelAdapter.sendText(payload);
       console.log(`[cyberboss] inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
-      if (isInboundTimestampRequest(prepared?.text)) {
+      if (isInboundTimestampRequest(prepared?.originalText)
+          || isInboundTimestampRequest(prepared?.contentText)
+          || isInboundTimestampRequest(prepared?.text)) {
         // "[test]" → deterministic reply with the three timestamps the operator asked for
         // (received → 处理中 sent → this report). Sent as its own message so it never
         // depends on the runtime turn finishing.
@@ -2202,7 +2204,8 @@ class CyberbossApp {
           `收到消息：${receivedAtText || "(未知)"}` ,
           `处理中已发出：${new Date(ackSentAtMs).toISOString()}${delta(ackSentAtMs)}`,
           `正式回复发出：${new Date(replyAtMs).toISOString()}${delta(replyAtMs)}`,
-        ].join("\\n");
+        ].join("\n");
+        try {
         await this.channelAdapter.sendText(applyWeFlowInboundReplyRoute({
           userId: prepared.senderId,
           text: reportText,
@@ -2210,6 +2213,9 @@ class CyberbossApp {
           provider: prepared.provider,
           messageKind: "inbound_timestamp_report",
         }, prepared));
+        } catch (reportError) {
+          console.warn(`[cyberboss] inbound timestamp report failed: ${formatErrorMessage(reportError)}`);
+        }
       }
       return true;
     } catch (error) {
