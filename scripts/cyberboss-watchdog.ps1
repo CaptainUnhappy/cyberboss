@@ -3013,6 +3013,30 @@ function Repair-BridgePidFileFromActivity {
   }
 }
 
+# Same stale-bookkeeping trap as the core pid file, on the cross-account bridge:
+# the bridge lives in its own session and can be restarted out of band, which
+# leaves a dead PID recorded while the endpoint keeps serving. Until now the
+# watchdog only *verified* the recorded PID (Test-UiaBridgePidVerified), so every
+# such restart reported `uia=alive=false,health=true,ready=true` and bought a
+# mechanical Restart that restarted the healthy core as collateral damage
+# (2026-09-29 10:59: recorded 23088 dead, sole listener 37756 healthy, 11:00 the
+# service recovered the file and stopped the live bot 38460 anyway). The service
+# has recovered the file from endpoint ownership since 2026-09-22
+# (Repair-PidFileFromListener -AllowEndpointOwnership); mirror that here.
+function Repair-UiaBridgePidFileFromListener {
+  $endpoint = $null
+  try { $endpoint = [Uri]$UiaBaseUrl } catch { return 0 }
+  if ($null -eq $endpoint -or -not $endpoint.IsLoopback -or $endpoint.Port -le 0) { return 0 }
+  $listeners = @(Get-TcpListenerProcessIds -PortNumber $endpoint.Port)
+  if ($listeners.Count -ne 1) { return 0 }
+  $candidate = [int]$listeners[0]
+  if ($candidate -le 0 -or -not (Test-PidAlive -PidValue $candidate)) { return 0 }
+  if ($candidate -eq (Read-PidFile -Path $UiaPidFile)) { return 0 }
+  Write-PidFileAtomic -Path $UiaPidFile -PidValue $candidate
+  Write-WatchdogLog "uia bridge PID file recovered from the sole endpoint owner PID $candidate (identity by endpoint ownership)"
+  return $candidate
+}
+
 function Get-HealthSnapshot {
   $bridgePid = Read-PidFile -Path $BridgePidFile
   $appServerPid = Read-PidFile -Path $AppServerPidFile
@@ -3034,6 +3058,16 @@ function Get-HealthSnapshot {
   }
   $appServerAlive = Test-VerifiedPidAlive -PidValue $appServerPid -CommandPattern $AppServerCommandPattern
   $uiaAlive = Test-UiaBridgePidVerified -PidValue $uiaPid
+  if (-not $uiaAlive) {
+    # A dead PID in the bridge pid file is bookkeeping, not evidence that the
+    # bridge is gone: adopt the sole endpoint owner before reporting `uia` failed.
+    $recoveredUiaPid = Repair-UiaBridgePidFileFromListener
+    if ($recoveredUiaPid -gt 0) {
+      $uiaPid = $recoveredUiaPid
+      $uiaProcessAlive = $true
+      $uiaAlive = $true
+    }
+  }
   $bridgeUptimeSeconds = -1
   if ($bridgeAlive) {
     $bridgeProcess = Get-Process -Id $bridgePid -ErrorAction SilentlyContinue
