@@ -2970,7 +2970,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         return self.server.bridge_state  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        print(f"[weflow-uia] {self.address_string()} {fmt % args}", flush=True)
+        started = getattr(self, "_request_started_at", None)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
