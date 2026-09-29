@@ -46,3 +46,9 @@ if (ackSentAtMs && Date.now() - ackSentAtMs < WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPP
   （这是想要的：新的一轮）。
 - 记忆在进程内（`Map`），重启后清空；第一轮消息会重新回执一次，符合预期。
 - 未加自动化测试（回执路径依赖 store/渠道适配器；验证方式是实机连发三条只出现一条"处理中"）。
+## 追加（同日，策略被用户要求取代）
+
+用户明确要求"处理中"在收到消息后**立刻**发出，所以上面"一轮只回一条"的策略**作废**：现在每条消息
+（按 `pendingId` 去重）都立刻回执。实现三处：抑制常量置 0（保留开关便于回退）；`acknowledgeBufferedInboundOnce`
+里改为按消息 id 去重、并让 `claimed` 恒为真——原来 `pendingInboundStore.claimAcknowledgement` 的
+scope 级门（`scope.acknowledgementStatus`）在上一条回合结束前一直关着，这就是"没第一时间收到处理中"的直接原因。
