@@ -103,7 +103,7 @@ const REMINDER_INBOUND_ACK_TEXT = "已记录";
 // burst answered every message with "处理中". The first ack is what tells the user the
 // bot is working; repeats inside this window are noise (operator request 2026-09-29).
 // Suppression runs before the claim so no message is left half-handled.
-const WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS = 0; // 0 = every message gets its ack immediately (operator request 2026-09-29)
+const WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS = 60_000;
 const SILENT_DELIVERY_POLICY = "silent";
 
 function createRuntimeAdapter(config) {
@@ -2458,7 +2458,7 @@ class CyberbossApp {
         this.inboundAckSentAtMs = new Map();
       }
       const ackSentAtMs = Number(this.inboundAckSentAtMs.get(ackSuppressionKey) || 0);
-      if (WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS > 0 && ackSentAtMs && Date.now() - ackSentAtMs < WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS) {
+      if (ackSentAtMs && Date.now() - ackSentAtMs < WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS) {
         return false;
       }
       this.inboundAckSentAtMs.set(ackSuppressionKey, Date.now());
@@ -2467,7 +2467,7 @@ class CyberbossApp {
     const pendingId = normalizeText(buffered?.message?.pendingId)
       || normalizeText(buffered?.message?.messageId)
       || normalizeText(prepared?.messageId);
-    const ackedIds = this.inboundAckMessageIds instanceof Set ? this.inboundAckMessageIds : (this.inboundAckMessageIds = new Set());
+    let claimed = buffered?.added !== false;
     if (this.pendingInboundStore) {
       claimed = this.pendingInboundStore.claimAcknowledgement(scopeKey, pendingId);
       if (claimed) {
@@ -2483,7 +2483,7 @@ class CyberbossApp {
         buffered.message.acknowledgementStatus = "sending";
       }
     }
-    claimed = true;
+    if (!claimed) {
       return false;
     }
     const success = await this.acknowledgeWeFlowUiaInbound(prepared);
