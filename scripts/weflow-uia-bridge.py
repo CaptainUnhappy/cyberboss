@@ -65,7 +65,7 @@ MAX_SEARCH_RESULT_STABILIZATION_SECONDS = 12.0
 # the bridge refused to press Enter with "ordered search content identity had not
 # repeated yet (polls=1, window=2.0s)" - a fail-closed refusal to send at all.
 # The floor keeps at least this much time for the repeat, whatever the caller asks.
-MIN_SEARCH_RESULT_STABILIZATION_SECONDS = 6.0
+MIN_SEARCH_RESULT_STABILIZATION_SECONDS = 2.0
 MAX_SEARCH_NAVIGATION_DOWNS = 10
 CHAT_INPUT_VALUE_VERIFY_TIMEOUT_SECONDS = 1.0
 GA_ROOT = 2
