@@ -2807,7 +2807,13 @@ class BridgeState:
             except Exception as _probe_error:  # a probe must never break the send path
                 _probe_verdict = "error:" + type(_probe_error).__name__
             _send_timing_log("fastpath-probe=" + _probe_verdict, globals().get("_last_send_request_at"))
-
+            if _probe_input is not None:
+                # Target chat already open (proven by the confirmation above): skip the
+                # search+select slow path (measured 5.8s -> ~1s). All guards below still run.
+                root, input_control = _probe_root, _probe_input
+                _send_timing_log("fastpath-used", globals().get("_last_send_request_at"))
+            else:
+                root, input_control = select_exact_contact_session(window_handle, contact)
             if exact_contact:
                 # Reconfirm both exact labels after selection, then watch a
                 # quiet gap for competing desktop input before writing.
@@ -2931,7 +2937,13 @@ class BridgeState:
             except Exception as _probe_error:  # a probe must never break the send path
                 _probe_verdict = "error:" + type(_probe_error).__name__
             _send_timing_log("fastpath-probe=" + _probe_verdict, globals().get("_last_send_request_at"))
-
+            if _probe_input is not None:
+                # Target chat already open (proven by the confirmation above): skip the
+                # search+select slow path (measured 5.8s -> ~1s). All guards below still run.
+                root, input_control = _probe_root, _probe_input
+                _send_timing_log("fastpath-used", globals().get("_last_send_request_at"))
+            else:
+                root, input_control = select_exact_contact_session(window_handle, contact)
             input_control.Click(waitTime=0.05)
             confirm_current_chat_target(root, contact)
             require_foreground_continuity(window_handle)
