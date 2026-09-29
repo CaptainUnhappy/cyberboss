@@ -145,3 +145,25 @@ send took          5531 ms   回车后观察 ≈2.2 s（受 SEND_VERIFY_SECONDS=
 后续可选（按收益/风险）：① 复用探针的确认结果、省掉写入前的重复确认（~0.5-0.8 s，但要先确认那两次
 确认是否仍防着"选中后渲染竞态"）；② 把回车后观察改成异步（~2 s，收益最大，属并发模型改动，风险最高）。
 两者都没做——当前 5.5 s 已在"不动并发模型、不删安全断言"的前提下接近地板。
+## 追加（同日，13:46）：再挤一段 —— 3.70 s → 3.16 s
+
+断言段细分打点（`pre-idle-assert` / `pre-focus-assert`）把写入前的 1.25 s 拆开：
+
+```
+pre-asserts       952 ms
+pre-idle-assert  1702 ms   +750 ms  两次 confirm + Click（其中第一次与快路径探测重复）
+pre-focus-assert 2375 ms   +673 ms  require_no_competing_desktop_input
+pre-write        2389 ms   +14  ms
+pre-focus-assert 3389 ms   +1000 ms write_chat_input_without_clipboard（UIA SetValue + 读回校验）
+pre-focus-assert 3514 ms   +125 ms
+typed            3671 ms   +157 ms  写入后校验 + 回车
+send took        3702 ms   +31  ms  零等待返回
+```
+
+改动：**快路径下跳过紧跟其后的那次重复 `confirm_current_chat_target`**（探测刚用同一个 root/contact
+做过同一断言），慢路径与其余断言（Click、桌面空闲检查、前台连续性、输入框聚焦、写入后读回校验）**全部保留**。
+
+实测（两次发送，含一次三条 dispatch 才收敛）：**3 156 ms**，`already_verified` id=219/220，无重复行。
+
+累计：**36 250 → 3 156 ms（−91%）**。剩余结构：探测 0.95 s + 确认/点击 ~0.4 s + 桌面空闲断言 0.67 s +
+UIA 写入 1.0 s + 尾部 0.16 s，**都是真实动作或安全断言**，再往下压就必须动安全边界（不建议）。
