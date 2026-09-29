@@ -2504,7 +2504,7 @@ class BridgeState:
                 baseline_available = False
                 before = set()
             dispatched_after = int(time.time()) - 2
-            _send_timing_log("pre-foreground", getattr(self, "_request_started_at", None))
+            _send_timing_log("pre-foreground", getattr(self, "_request_started_at", None) or getattr(getattr(self, "server", None), "_request_started_at", None))
             with foreground_return(), uia_com_apartment():
                 if desktop_input_lease_request is not None or desktop_input_lease is not None:
                     target = self._dispatch_text(
@@ -2523,7 +2523,7 @@ class BridgeState:
                         require_desktop_idle_seconds=require_desktop_idle_seconds,
                         exact_contact=exact_contact,
                     )
-            _send_timing_log("typed", getattr(self, "_request_started_at", None))
+            _send_timing_log("typed", getattr(self, "_request_started_at", None) or getattr(getattr(self, "server", None), "_request_started_at", None))
             deadline = time.monotonic() + max(1.0, timeout)
             last_error = ""
             while time.monotonic() < deadline:
@@ -2667,10 +2667,10 @@ class BridgeState:
                 before = set()
 
             dispatched_after = int(time.time()) - 2
-            _send_timing_log("pre-foreground", getattr(self, "_request_started_at", None))
+            _send_timing_log("pre-foreground", getattr(self, "_request_started_at", None) or getattr(getattr(self, "server", None), "_request_started_at", None))
             with foreground_return(), uia_com_apartment():
                 self._dispatch_image(contact, image_bytes)
-            _send_timing_log("typed", getattr(self, "_request_started_at", None))
+            _send_timing_log("typed", getattr(self, "_request_started_at", None) or getattr(getattr(self, "server", None), "_request_started_at", None))
             deadline = time.monotonic() + max(1.0, timeout)
             last_error = ""
             while time.monotonic() < deadline:
@@ -3034,6 +3034,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         self._request_started_at = time.monotonic()
+        # The sending engine is a different object, so publish the request start on
+        # the server too and let the marks resolve it from either place.
+        self.server._request_started_at = self._request_started_at
         path = urllib.parse.urlparse(self.path).path
         try:
             payload = self.read_json()
