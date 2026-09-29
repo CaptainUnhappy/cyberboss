@@ -62,3 +62,30 @@ Status: implemented
 - 过程中踩到两个坑，写在这里防重犯：① 半应用的补丁**删掉了桥的访问日志**（`2238611` 只写了半行），
   靠"写入后回读 + `py_compile` 失败即 `git checkout`"才发现并修复（`e41dc45`）；
   ② 重启配方与复制文件同名会被 worker 去重，**必须换文件名并确认监听 pid 变化**才算真重启。
+## 追加（同日，13:16）：分段打点落地，9.2 秒的构成
+
+打点过程本身踩了三次坑，值得记下来（每次都靠"回读 + `py_compile` + 失败即还原"挡住）：
+
+1. 第一版锚点用了嵌套数组存"期望次数"，PowerShell 把第三项当成锚点文本 → ABORT；
+2. 第二版对 `deadline = time.monotonic() + max(1.0, timeout)` 用固定 8 空格替换，而它有两处且缩进不同
+   → `IndentationError` → 还原。**正确做法**：`[regex]::Replace` 的 MatchEvaluator 里取
+   `$m.Groups[1].Value` 作为该匹配自身的缩进；
+3. 第三版取时间戳用 `getattr(self, "_request_started_at")`，但 `dispatch_and_verify` 属于**发送引擎**，
+   与 HTTP handler 没有对象关系（既无该属性也无 `.server`）→ 打点静默。
+   **最终做法**：`do_POST` 里写模块级全局 `globals()["_last_send_request_at"]`，调用点读它。
+
+落地后的三段（一次真实发送）：
+
+```
+pre-foreground   141 ms   前台激活/准备——可忽略
+typed           5031 ms   搜索 + 选中 + 输入 + 回车（含 2s 搜索稳定 + 2s 选中确认两份固定等待）
+send took       9218 ms   回车后到 HTTP 返回 ≈ 4.19 s，正好顶到 SEND_VERIFY_SECONDS=4 的上限
+```
+
+结论：**可见延迟 ~11.6 s 的两大块是"搜索+选中+输入 5.0 s"与"回车后观察 4.2 s"**，
+前台激活不是原因（0.14 s）。下一步有两条路：
+
+- **治本**：目标会话已打开时跳过搜索+选中（省 ~4 s）。**必须先有可靠断言**（判定不了就退回慢路径），
+  因为发错窗口是不可接受的失败模式；
+- **后置 4.2 s**：它精确等于上限，说明桥在观察窗口内没等到它要找的可见性；要么查清它在等什么
+  （读 API 可见性延迟），要么把上限降到 2 s 并观察 `uncertain_pending` 是否变多。
