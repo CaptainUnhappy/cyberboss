@@ -39,3 +39,7 @@ npm run check-anchors    # 软报告，不阻断
 
 - 运行时：`.js` CommonJS（`"type": "commonjs"`），入口 `src/index.js`，改动后跑 `npm run check`。
 - 本文件与 `.agents/skills/` 之外的工程约定（分支、发布、评审）尚未在此登记——需要时按同一套纪律补一篇笔记，再回填到这里。
+
+## 常驻规则：微信里的「提醒」走 ios-notify
+
+用户在微信里要求「提醒 / 通知 / 别让我忘了 / 设个日程提醒」时，**必须**调用 ios-notify skill（.agents/skills/ios-notify/SKILL.md），把提醒真正写进他的 iPhone 日历，而不是只用文字答应。
