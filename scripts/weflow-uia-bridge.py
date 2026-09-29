@@ -2504,6 +2504,7 @@ class BridgeState:
                 baseline_available = False
                 before = set()
             dispatched_after = int(time.time()) - 2
+            _send_timing_log("pre-foreground", getattr(self, "_request_started_at", None))
             with foreground_return(), uia_com_apartment():
                 if desktop_input_lease_request is not None or desktop_input_lease is not None:
                     target = self._dispatch_text(
@@ -2522,6 +2523,7 @@ class BridgeState:
                         require_desktop_idle_seconds=require_desktop_idle_seconds,
                         exact_contact=exact_contact,
                     )
+            _send_timing_log("typed", getattr(self, "_request_started_at", None))
             deadline = time.monotonic() + max(1.0, timeout)
             last_error = ""
             while time.monotonic() < deadline:
@@ -2665,8 +2667,10 @@ class BridgeState:
                 before = set()
 
             dispatched_after = int(time.time()) - 2
+            _send_timing_log("pre-foreground", getattr(self, "_request_started_at", None))
             with foreground_return(), uia_com_apartment():
                 self._dispatch_image(contact, image_bytes)
+            _send_timing_log("typed", getattr(self, "_request_started_at", None))
             deadline = time.monotonic() + max(1.0, timeout)
             last_error = ""
             while time.monotonic() < deadline:
@@ -2961,6 +2965,17 @@ def set_clipboard_dib(dib_bytes: bytes) -> None:
         time.sleep(0.05)
     raise RuntimeError(f"Windows clipboard could not be opened: {last_error}")
 
+
+def _send_timing_log(mark: str, started: float | None) -> None:
+    """Phase marks for one /api/send (see bridge-timing.log)."""
+    if started is None:
+        return
+    try:
+        elapsed = int((time.monotonic() - started) * 1000)
+        with open(r"C:\ProgramData\cwin-probe\bridge-timing.log", "a", encoding="utf-8") as handle:
+            handle.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {mark} {elapsed}ms\n")
+    except OSError:
+        pass
 
 class BridgeHandler(BaseHTTPRequestHandler):
     server_version = "CyberbossWeFlowUIA/1.0"
