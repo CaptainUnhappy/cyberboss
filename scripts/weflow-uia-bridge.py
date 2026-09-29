@@ -2482,6 +2482,7 @@ class BridgeState:
         desktop_input_lease: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self.send_lock:
+            _send_timing_log("pre-asserts", globals().get("_last_send_request_at"))
             if exact_contact:
                 if normalize_text(expected_contact) != contact:
                     raise TargetNotConfirmedError("exact contact identity did not match the requested contact")
@@ -2550,6 +2551,7 @@ class BridgeState:
                                 "verified": True,
                                 "localId": message_id,
                             }
+                            _send_timing_log("pre-asserts", globals().get("_last_send_request_at"))
                             if exact_contact:
                                 result.update({
                                     "targetVerified": True,
@@ -2570,6 +2572,7 @@ class BridgeState:
                 "uncertain": True,
                 "verificationError": f"outgoing message was not observed in WeFlow before timeout{detail}",
             }
+            _send_timing_log("pre-asserts", globals().get("_last_send_request_at"))
             if exact_contact:
                 result.update({
                     "targetVerified": True,
@@ -2814,6 +2817,7 @@ class BridgeState:
                 _send_timing_log("fastpath-used", globals().get("_last_send_request_at"))
             else:
                 root, input_control = select_exact_contact_session(window_handle, contact)
+            _send_timing_log("pre-asserts", globals().get("_last_send_request_at"))
             if exact_contact:
                 # Reconfirm both exact labels after selection, then watch a
                 # quiet gap for competing desktop input before writing.
@@ -2836,6 +2840,7 @@ class BridgeState:
             # UIA ValuePattern is the only supported text-write path.  It avoids
             # reading, replacing, or restoring the user's multi-format Windows
             # clipboard and proves the exact editor value before Enter.
+            _send_timing_log("pre-write", globals().get("_last_send_request_at"))
             input_value_pattern = write_chat_input_without_clipboard(input_control, text)
             input_value_patterns.append(input_value_pattern)
             input_control = confirm_current_chat_target(root, contact)
@@ -3151,6 +3156,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     return
                 resolved = self.state.resolve_target_names(contact, talker)
                 if resolved is not None:
+                    _send_timing_log("pre-asserts", globals().get("_last_send_request_at"))
                     if exact_contact:
                         # The caller asserts who it believes it is messaging.  With a
                         # remark set that assertion may be written in either the
