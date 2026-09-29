@@ -99,6 +99,11 @@ const STALE_TEMP_FILE_SWEEP_INTERVAL_MS = 60 * 60_000;
 const WEFLOW_PENDING_REVOKE_GATE_POLL_MS = 100;
 const WEFLOW_UIA_INBOUND_ACK_TEXT = "处理中";
 const REMINDER_INBOUND_ACK_TEXT = "已记录";
+// Consecutive messages from one chat each claimed their own acknowledgement, so a
+// burst answered every message with "处理中". The first ack is what tells the user the
+// bot is working; repeats inside this window are noise (operator request 2026-09-29).
+// Suppression runs before the claim so no message is left half-handled.
+const WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS = 60_000;
 const SILENT_DELIVERY_POLICY = "silent";
 
 function createRuntimeAdapter(config) {
@@ -2446,6 +2451,17 @@ class CyberbossApp {
   async acknowledgeBufferedInboundOnce({ buffered, prepared }) {
     if (!shouldAcknowledgeInbound(prepared)) {
       return false;
+    }
+    const ackSuppressionKey = normalizeText(buffered?.scopeKey) || normalizeText(prepared?.senderId);
+    if (ackSuppressionKey) {
+      if (!(this.inboundAckSentAtMs instanceof Map)) {
+        this.inboundAckSentAtMs = new Map();
+      }
+      const ackSentAtMs = Number(this.inboundAckSentAtMs.get(ackSuppressionKey) || 0);
+      if (ackSentAtMs && Date.now() - ackSentAtMs < WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS) {
+        return false;
+      }
+      this.inboundAckSentAtMs.set(ackSuppressionKey, Date.now());
     }
     const scopeKey = normalizeText(buffered?.scopeKey);
     const pendingId = normalizeText(buffered?.message?.pendingId)
