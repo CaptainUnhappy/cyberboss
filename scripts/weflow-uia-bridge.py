@@ -50,7 +50,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 MIN_CANARY_DESKTOP_IDLE_SECONDS = 300
-MIN_SEARCH_SELECTION_CONFIRM_SECONDS = 1.0
+MIN_SEARCH_SELECTION_CONFIRM_SECONDS = 2.0
 # How long to wait for two consecutive identical ordered-search snapshots before
 # deriving a Down count.  This only waits for Weixin's search popup to stop
 # re-rendering; every fail-closed condition (foreground/focus loss, ambiguous or
@@ -65,7 +65,7 @@ MAX_SEARCH_RESULT_STABILIZATION_SECONDS = 12.0
 # the bridge refused to press Enter with "ordered search content identity had not
 # repeated yet (polls=1, window=2.0s)" - a fail-closed refusal to send at all.
 # The floor keeps at least this much time for the repeat, whatever the caller asks.
-MIN_SEARCH_RESULT_STABILIZATION_SECONDS = 1.0
+MIN_SEARCH_RESULT_STABILIZATION_SECONDS = 2.0
 MAX_SEARCH_NAVIGATION_DOWNS = 10
 CHAT_INPUT_VALUE_VERIFY_TIMEOUT_SECONDS = 1.0
 GA_ROOT = 2
