@@ -2791,6 +2791,21 @@ class BridgeState:
         activate_window(window_handle)
         time.sleep(0.25)
         try:
+            try:
+                _probe_root = automation.ControlFromHandle(window_handle)
+                if _probe_root is not None and is_wechat_main_window_identity(
+                    class_name=normalize_text(_probe_root.ClassName),
+                    control_type_name=normalize_text(_probe_root.ControlTypeName),
+                ):
+                    confirm_current_chat_target(_probe_root, contact)
+                    _probe_verdict = "yes"
+                else:
+                    _probe_verdict = "root-mismatch"
+            except TargetNotConfirmedError:
+                _probe_verdict = "not-target"
+            except Exception as _probe_error:  # a probe must never break the send path
+                _probe_verdict = "error:" + type(_probe_error).__name__
+            _send_timing_log("fastpath-probe=" + _probe_verdict, globals().get("_last_send_request_at"))
             root, input_control = select_exact_contact_session(window_handle, contact)
             if exact_contact:
                 # Reconfirm both exact labels after selection, then watch a
@@ -2899,6 +2914,21 @@ class BridgeState:
         activate_window(window_handle)
         time.sleep(0.25)
         try:
+            try:
+                _probe_root = automation.ControlFromHandle(window_handle)
+                if _probe_root is not None and is_wechat_main_window_identity(
+                    class_name=normalize_text(_probe_root.ClassName),
+                    control_type_name=normalize_text(_probe_root.ControlTypeName),
+                ):
+                    confirm_current_chat_target(_probe_root, contact)
+                    _probe_verdict = "yes"
+                else:
+                    _probe_verdict = "root-mismatch"
+            except TargetNotConfirmedError:
+                _probe_verdict = "not-target"
+            except Exception as _probe_error:  # a probe must never break the send path
+                _probe_verdict = "error:" + type(_probe_error).__name__
+            _send_timing_log("fastpath-probe=" + _probe_verdict, globals().get("_last_send_request_at"))
             root, input_control = select_exact_contact_session(window_handle, contact)
             input_control.Click(waitTime=0.05)
             confirm_current_chat_target(root, contact)
