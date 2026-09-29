@@ -2188,6 +2188,29 @@ class CyberbossApp {
     try {
       await this.channelAdapter.sendText(payload);
       console.log(`[cyberboss] inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
+      if (isInboundTimestampRequest(prepared?.text)) {
+        // "[test]" → deterministic reply with the three timestamps the operator asked for
+        // (received → 处理中 sent → this report). Sent as its own message so it never
+        // depends on the runtime turn finishing.
+        const ackSentAtMs = Date.now();
+        const receivedAtText = normalizeText(prepared?.receivedAt);
+        const receivedAtMs = Date.parse(receivedAtText) || 0;
+        const replyAtMs = Date.now();
+        const delta = (value) => (receivedAtMs ? ` (+${value - receivedAtMs} ms)` : "");
+        const reportText = [
+          "【测试】时间戳",
+          `收到消息：${receivedAtText || "(未知)"}` ,
+          `处理中已发出：${new Date(ackSentAtMs).toISOString()}${delta(ackSentAtMs)}`,
+          `正式回复发出：${new Date(replyAtMs).toISOString()}${delta(replyAtMs)}`,
+        ].join("\\n");
+        await this.channelAdapter.sendText(applyWeFlowInboundReplyRoute({
+          userId: prepared.senderId,
+          text: reportText,
+          contextToken: prepared.contextToken,
+          provider: prepared.provider,
+          messageKind: "inbound_timestamp_report",
+        }, prepared));
+      }
       return true;
     } catch (error) {
       if (error?.deliveryUncertain === false) {
@@ -4076,6 +4099,12 @@ const TEST_SESSION_KEY = "test-session";
  * conversation's context, so the marker is the operator's way of saying "this
  * turn is a drill".
  */
+function isInboundTimestampRequest(text) {
+  // Operator probe: sending "[test]" makes the bot answer with the three timestamps of
+  // that very message instead of going through the model.
+  return normalizeText(text).toLowerCase() === "[test]";
+}
+
 function isTestSessionRequest(text) {
   return /\[test\]/iu.test(normalizeText(text));
 }
