@@ -2821,7 +2821,9 @@ class BridgeState:
             if exact_contact:
                 # Reconfirm both exact labels after selection, then watch a
                 # quiet gap for competing desktop input before writing.
-                input_control = confirm_current_chat_target(root, contact)
+                if _probe_input is None:
+                    # Fast path already confirmed this exact chat a moment ago; skip the duplicate.
+                    input_control = confirm_current_chat_target(root, contact)
                 input_control.Click(waitTime=0.05)
                 selected_tick = get_last_input_tick()
                 _send_timing_log("pre-idle-assert", globals().get("_last_send_request_at"))
