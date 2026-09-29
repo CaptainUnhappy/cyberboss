@@ -2971,6 +2971,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         started = getattr(self, "_request_started_at", None)
+        if started is not None and "/api/send" in str(getattr(self, "path", "")):
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            try:
+                with open(r"C:\ProgramData\cwin-probe\bridge-timing.log", "a", encoding="utf-8") as handle:
+                    handle.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] send took {elapsed_ms}ms\n")
+            except OSError:
+                pass
+        print(f"[weflow-uia] {self.address_string()} {fmt % args}", flush=True)
 
     def send_json(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -3010,6 +3018,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        self._request_started_at = time.monotonic()
         path = urllib.parse.urlparse(self.path).path
         try:
             payload = self.read_json()
