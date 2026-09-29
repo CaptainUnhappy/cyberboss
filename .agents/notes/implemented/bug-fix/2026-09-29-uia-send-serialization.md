@@ -116,3 +116,32 @@ send took      7563 / 7436 ms
 - 剩下的 `typed ≈ 5.3 s` 才是下一块大头（含 2 s 搜索稳定 + 2 s 选中确认两份固定等待）。
   治本方案"目标会话已打开时跳过搜索+选中"预计省 ~4 s，但**必须先把"当前会话 == 目标会话"的判定做成
   可靠断言**（判定不了就退回慢路径）：发错窗口属于不可接受的失败模式，宁可慢。
+## 追加（同日，13:22）：快路径与分段定位的最终结果
+
+开关与快路径都落地后，一次真实发送的完整分段（`bridge-timing.log`，投递 `verified`）：
+
+```
+pre-foreground      108 ms
+fastpath-probe=yes  875 ms   确认"当前会话就是目标"
+fastpath-used       875 ms   → 跳过 select_exact_contact_session
+pre-asserts         875 ms
+pre-write          2125 ms   写入前断言段（两次 confirm + Click + 三个 require_*）≈1.25 s
+typed              3313 ms   写入 + 断言 + 回车 ≈1.19 s
+send took          5531 ms   回车后观察 ≈2.2 s（受 SEND_VERIFY_SECONDS=2 约束）
+```
+
+**累计曲线**：36 250 ms → 13 266 → 9 936 → 7 436 → **5 531 ms**（−85%）。
+
+一个重要修正：跳过"搜索+选中"**没有**带来预期的 4.8 s 收益。原因是 `select_exact_contact_session`
+开头先按 `session_item_<contact>` 在会话列表里直接找行（L1803），**当前会话已打开时本来就是直接命中**，
+并不走搜索框。真正的成本在写入前后的断言与回车后观察：
+
+- 探针 0.9 s（快路径的依据，不算浪费）
+- 写入前断言 1.25 s（两次 `confirm_current_chat_target` + `Click` + `require_no_competing_desktop_input`
+  + `require_foreground_continuity` + `require_focused_chat_input`）
+- 写入+回车 1.19 s
+- 回车后观察 2.2 s（已是 2 s 上限）
+
+后续可选（按收益/风险）：① 复用探针的确认结果、省掉写入前的重复确认（~0.5-0.8 s，但要先确认那两次
+确认是否仍防着"选中后渲染竞态"）；② 把回车后观察改成异步（~2 s，收益最大，属并发模型改动，风险最高）。
+两者都没做——当前 5.5 s 已在"不动并发模型、不删安全断言"的前提下接近地板。
