@@ -3027,6 +3027,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 talker = normalize_text(payload.get("talker"))
                 text = payload.get("text") if isinstance(payload.get("text"), str) else ""
                 timeout = float(payload.get("timeout", 30))
+                # The post-Enter verification loop is bounded by this timeout and holds send_lock for
+                # its whole duration (measured 2026-09-29: a send held the bridge 36.25s while the
+                # message was already visible after 12.4s). The bot verifies delivery from its own
+                # ledger, so let an operator cap the bridge-side wait. Unset = old behaviour.
+                _verify_cap = os.environ.get("CYBERBOSS_WEFLOW_SEND_VERIFY_SECONDS", "").strip()
+                if _verify_cap:
+                    try:
+                        timeout = min(timeout, max(1.0, float(_verify_cap)))
+                    except ValueError:
+                        pass
                 exact_contact = payload.get("exactContact", False)
                 if not isinstance(exact_contact, bool):
                     raise ValueError("exactContact must be a boolean")
