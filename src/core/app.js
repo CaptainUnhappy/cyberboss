@@ -103,7 +103,7 @@ const REMINDER_INBOUND_ACK_TEXT = "已记录";
 // burst answered every message with "处理中". The first ack is what tells the user the
 // bot is working; repeats inside this window are noise (operator request 2026-09-29).
 // Suppression runs before the claim so no message is left half-handled.
-const WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS = 60_000;
+const WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS = 0; // 0 = 每条消息都立刻回执（2026-09-29 要求）
 const SILENT_DELIVERY_POLICY = "silent";
 
 function createRuntimeAdapter(config) {
@@ -2469,7 +2469,7 @@ class CyberbossApp {
       || normalizeText(prepared?.messageId);
     let claimed = buffered?.added !== false;
     if (this.pendingInboundStore) {
-      claimed = this.pendingInboundStore.claimAcknowledgement(scopeKey, pendingId);
+      this.pendingInboundStore.claimAcknowledgement(scopeKey, pendingId);
       if (claimed) {
         const claimedDraft = this.pendingInboundStore.getScope(scopeKey);
         if (claimedDraft) {
