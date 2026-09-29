@@ -4656,7 +4656,7 @@ function resolveInboundActivityTime(activity) {
 
 function resolvePendingInboundQuietWindowMs(app) {
   const configured = Number(app?.config?.pendingInboundQuietWindowMs);
-  return Number.isSafeInteger(configured) && configured >= 0 ? configured : 15_000;
+  return Number.isSafeInteger(configured) && configured >= 0 ? configured : 5_000;
 }
 
 function normalizeIsoTime(value) {
