@@ -105,9 +105,17 @@ Cyberboss assumes none of that. It treats the user as someone who may drift, dis
 **Core (always needed)**
 
 - Node.js `>= 22`
-- An agent runtime: `codex` or `claude` on your `PATH` (or `dsh`, see `CYBERBOSS_RUNTIME`)
+- An agent runtime, chosen with `CYBERBOSS_RUNTIME`:
+  - `codex` (default) — the `codex` CLI must be on your `PATH`
+  - `claudecode` — the `claude` CLI must be on your `PATH`
+  - `dsh` / `dsh-acp` — **nothing to install**: the DeepSeek Harness binary comes from this
+    repository's own dependency (`@deepseek-ai/dsh`) and is resolved out of `node_modules`.
+    Override with `CYBERBOSS_DSH_BIN`, pick a profile with `CYBERBOSS_DSH_PROFILE` (default `sdk`).
+    Model access comes from that profile's provider configuration, not from this repo.
+  - Its own model credentials/endpoint (Codex app-server, Claude CLI login, or the DSH profile) — this project does not ship any.
 - Chrome / Chromium / Edge if you want screenshot features
 - Python `>= 3.11` **only if** you enable the personal-account channel (see below)
+- Windows **only if** you enable the personal-account channel; everything else runs cross-platform
 
 **Message channels: pick one or both**
 
