@@ -531,10 +531,13 @@ async function executeRun(config, run, { fetchImpl, sleepImpl, now }) {
             targetFingerprint: manifest.targetFingerprint,
             triggerLocalId: milestones.triggerLocalId,
             replyLocalId: milestones.replyLocalId,
+            replyReconciledFromEcho: milestones.replyReconciledFromEcho === true,
             quietWindowMs: config.quietWindowMs,
             cursorCommittedAt: drain.cursorCommittedAt,
             elapsedMs: Math.max(0, now() - run.startedAtMs),
-            detail: "trigger and reply were unique, observed, quiet, and absent from the durable inbox queue",
+            detail: milestones.replyReconciledFromEcho
+              ? "trigger and reply were unique, observed, quiet, and absent from the durable inbox queue; the dispatch receipt was uncertain and was reconciled from the authenticated reply echo"
+              : "trigger and reply were unique, observed, quiet, and absent from the durable inbox queue",
           };
         }
         lastDetail = drain.detail;
@@ -580,14 +583,37 @@ function validateMilestones({
   if (!resolvedTriggerId || !ingestedTriggerId || resolvedTriggerId !== ingestedTriggerId) {
     return { ok: false, detail: "trigger localId is missing or inconsistent" };
   }
-  if (!resolvedReplyId || !dispatchedReplyId || !observedReplyId
-    || resolvedReplyId !== dispatchedReplyId || resolvedReplyId !== observedReplyId) {
+  // An "uncertain" dispatch receipt is the bridge's own confirmation window
+  // expiring, not proof that nothing was sent: the reply echo is authenticated by
+  // this run's ledger messageKind, its exact text and its outgoing direction, so
+  // an observed reply row after the trigger proves the send landed. 2026-09-30 run
+  // 92e6a629: reply-dispatched stayed {status:uncertain, replyLocalId:""} while
+  // reply-observed carried replyLocalId 15 and the durable canary cursor had
+  // committed local:15 - every probe still died at CANARY_TIMEOUT because the
+  // milestone check demanded a dispatched id that the uncertain send never wrote.
+  const dispatchUncertain = (
+    normalizeText(replyDispatched.status).toLowerCase() === "uncertain"
+    || normalizeText(replyDispatched.ledgerStatus).toLowerCase() === "failed_uncertain"
+  )
+    && normalizeText(replyObserved.status).toLowerCase() === "observed"
+    && normalizeText(replyObserved.direction).toLowerCase() === "outgoing";
+  const replyReconciledFromEcho = dispatchUncertain && !dispatchedReplyId && Boolean(observedReplyId);
+  if (!resolvedReplyId
+    || !observedReplyId
+    || (!dispatchedReplyId && !replyReconciledFromEcho)
+    || (dispatchedReplyId && resolvedReplyId !== dispatchedReplyId)
+    || resolvedReplyId !== observedReplyId) {
     return { ok: false, detail: "reply localId is missing or inconsistent" };
   }
   if (BigInt(resolvedReplyId) <= BigInt(resolvedTriggerId)) {
     return { ok: false, detail: "reply localId did not follow the trigger localId" };
   }
-  return { ok: true, triggerLocalId: resolvedTriggerId, replyLocalId: resolvedReplyId };
+  return {
+    ok: true,
+    triggerLocalId: resolvedTriggerId,
+    replyLocalId: resolvedReplyId,
+    replyReconciledFromEcho,
+  };
 }
 
 function inspectCanaryMessages(messages, manifest) {

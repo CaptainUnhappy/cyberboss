@@ -708,7 +708,12 @@ test("milestones require matching stable localIds in strict trigger then reply o
     triggerLocalId: "101",
     replyLocalId: "102",
   });
-  assert.deepEqual(valid, { ok: true, triggerLocalId: "101", replyLocalId: "102" });
+  assert.deepEqual(valid, {
+    ok: true,
+    triggerLocalId: "101",
+    replyLocalId: "102",
+    replyReconciledFromEcho: false,
+  });
 
   assert.equal(validateMilestones({
     manifest,
@@ -720,8 +725,71 @@ test("milestones require matching stable localIds in strict trigger then reply o
   }).ok, false);
 });
 
-test("cursor drain requires the dedicated talker schema and a committed reply localId, not only fresh mtime", (t) => {
-  const stateDir = createTempDir(t);
+test("an uncertain dispatch receipt is reconciled from the authenticated reply echo", () => {
+  // 2026-09-30 run 92e6a629: the bridge's confirmation window expired, so the
+  // dispatch receipt stayed uncertain with no localId while the reply was
+  // observed on the read side (localId 15) and the durable cursor committed it.
+  const manifest = { runId: "123e4567-e89b-42d3-a456-426614174000" };
+  const ingested = { version: 1, runId: manifest.runId, triggerLocalId: "14" };
+  const observed = {
+    version: 1,
+    runId: manifest.runId,
+    status: "observed",
+    direction: "outgoing",
+    replyLocalId: "15",
+  };
+  const uncertain = {
+    version: 1,
+    runId: manifest.runId,
+    status: "uncertain",
+    ledgerStatus: "failed_uncertain",
+    replyLocalId: "",
+  };
+  const reconciled = validateMilestones({
+    manifest,
+    ingested,
+    replyDispatched: uncertain,
+    replyObserved: observed,
+    triggerLocalId: "14",
+    replyLocalId: "15",
+  });
+  assert.deepEqual(reconciled, {
+    ok: true,
+    triggerLocalId: "14",
+    replyLocalId: "15",
+    replyReconciledFromEcho: true,
+  });
+
+  // Reconciliation only covers a missing dispatched id: a *different* dispatched
+  // id stays a mismatch, and the observation must be a real outgoing row.
+  assert.equal(validateMilestones({
+    manifest,
+    ingested,
+    replyDispatched: { ...uncertain, replyLocalId: "12" },
+    replyObserved: observed,
+    triggerLocalId: "14",
+    replyLocalId: "15",
+  }).ok, false);
+  assert.equal(validateMilestones({
+    manifest,
+    ingested,
+    replyDispatched: uncertain,
+    replyObserved: { ...observed, status: "pending" },
+    triggerLocalId: "14",
+    replyLocalId: "15",
+  }).ok, false);
+  // Without an observed localId there is still nothing to reconcile from.
+  assert.equal(validateMilestones({
+    manifest,
+    ingested,
+    replyDispatched: uncertain,
+    replyObserved: { ...observed, replyLocalId: "" },
+    triggerLocalId: "14",
+    replyLocalId: "",
+  }).ok, false);
+});
+
+test("cursor drain requires the dedicated talker schema and a committed reply localId, not only fresh mtime", (t) => {  const stateDir = createTempDir(t);
   const cursorFile = path.join(stateDir, "weflow-canary-inbox-cursor.json");
   const replyObserved = { recordedAt: new Date(Date.now() - 5_000).toISOString() };
   const manifest = { talker: "wxid_canary_self" };
