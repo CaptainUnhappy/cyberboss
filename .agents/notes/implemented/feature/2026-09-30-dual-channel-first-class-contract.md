@@ -6,7 +6,7 @@ Status: implemented
 
 两条消息通道**早就在跑**，但没有任何一处"声明"它们的存在：
 
-1. **官方 iLink bot 通道**：HTTPS 打 `ilinkai.weixin.qq.com`（`ilink/bot/getupdates` 长轮询、`ilink/bot/sendmessage`、`ilink/bot/getuploadurl` + CDN 上传），出站**必须携带入站带来的 `context_token`**，否则 `ret: -2 prepare failed`（[实测契约](../../architecture/2026-09-30-ilink-bot-api-observed-contract.md)）。身份来自 `~/.cyberboss/accounts/<id>-im.bot.json`。
+1. **官方 iLink bot 通道**：HTTPS 打 `ilinkai.weixin.qq.com`（`ilink/bot/getupdates` 长轮询、`ilink/bot/sendmessage`、`ilink/bot/getuploadurl` + CDN 上传），出站**必须携带入站带来的 `context_token`**，否则 `ret: -2 prepare failed`（[实测契约](../../implemented/architecture/2026-09-30-ilink-bot-api-observed-contract.md)）。身份来自 `~/.cyberboss/accounts/<id>-im.bot.json`。
 2. **个人号通道**：本地 UI 自动化，`provider === "weflow-uia"` → 写侧 `scripts/weflow-uia-bridge.py`（HTTP 8776）驱动微信，读侧 WeFlow（HTTP 5051）提供消息库。**没有回复窗口**，所以可以主动多发（[小号发送限制取消](2026-09-30-weixin-xiaohao-no-send-limits.md)）。
 
 问题是**"哪条在跑"只活在 `provider` 字符串里**：`weixin/index.js` 的 `sendTextChunks` 按 `provider === "weflow-uia"` 二选一，`app.js` / `stream-delivery.js` / `system-message-dispatcher.js` / `reply-obligation-store.js` 各有分支。后果是具体的：
@@ -38,14 +38,14 @@ Status: implemented
 | 通道 | 探测步骤（全部只读） | 判据来源 |
 |---|---|---|
 | `ilink` | ① `accounts/` 里有已配对账号且 token 非空；② `ilink/bot/getconfig`（**只读会话检查**）的返回码 | `ret: 0` ⇒ 就绪；`-14` ⇒ `stale-token`（需重新扫码）；网络失败 ⇒ `unreachable`。**不发消息**（`sendmessage` 会消耗 `context_token`，绝不能当探针） |
-| `weflow-uia` | ① 配置开关 + token 齐备；② 读侧 `/api/v1/health` 必须 200；③ 读侧 `/api/v1/messages` 用真实 token 查一次必须 200（**只有 health 通不算通**）；④ 写侧 `/readyz` 200；⑤ 写侧 `/api/probe` 且 `foreground != 0` | 判据全部抄自 [RDPWrap 隔离会话部署契约](../../process/2026-09-18-rdpwrap-isolated-session-deployment.md)（读侧 500 与客户端最小化的失败签名都在那里实测过） |
+| `weflow-uia` | ① 配置开关 + token 齐备；② 读侧 `/api/v1/health` 必须 200；③ 读侧 `/api/v1/messages` 用真实 token 查一次必须 200（**只有 health 通不算通**）；④ 写侧 `/readyz` 200；⑤ 写侧 `/api/probe` 且 `foreground != 0` | 判据全部抄自 [RDPWrap 隔离会话部署契约](../../implemented/process/2026-09-18-rdpwrap-isolated-session-deployment.md)（读侧 500 与客户端最小化的失败签名都在那里实测过） |
 `app.printDoctor()` 是 `async`：先打印原来的静态快照，再打印逐通道结论；`bin/cyberboss.js doctor` 的退出码为 **0 当且仅当所有 enabled 通道 `ready === true`**（`summarizeChannels()` 算这个结论，`enabled=false` 的通道不参与判定）。
 
 ### 3. 结构化输出优先
 
 `doctor` 的人类可读输出保持简洁，但结论以 JSON 打印（与现有 `printDoctor` 的做法一致），便于脚本化：迁移手册里那条"新机 doctor 全绿"因此可以被机器判定，而不是靠人看日志。
 
-## Acceptance criteria
+## Verification
 
 1. `node bin/cyberboss.js doctor` 在**两条通道都不通**时输出两条 `ready=false` 且各带 `reason=`，退出码非 0；两条都通时输出两条 `ready=true`，退出码 0。
 2. **探测不发消息**：`ilink` 分支只允许 `notifystart`；可在测试里用假的 `fetchImpl` 断言"没有以 `ilink/bot/sendmessage` 为路径的请求"。

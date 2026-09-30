@@ -1,0 +1,33 @@
+# Byte format is part of this repository's contract, so it must not depend on
+# the contributor's `core.autocrlf`. Two concrete reasons:
+#
+#   1. `.agents/notes/archived/**` is sealed by SHA-256 over the file's raw
+#      bytes. With no attributes and `core.autocrlf=true` (the Git for Windows
+#      default), a fresh clone rewrites LF to CRLF and every seal fails — the
+#      first thing a new contributor sees is a red `npm run verify-notes`.
+#   2. Windows recipes here are PowerShell/bash/VBS scripts whose encoding
+#      matters (PowerShell 5.1 reads BOM-less files as the ANSI code page), and
+#      the WCDB/registry recipes hash file content.
+#
+# So: text is LF, always, everywhere.
+
+* text=auto eol=lf
+
+# Sealed content: hashed over raw bytes, so the working tree must reproduce the
+# repository bytes exactly, on every platform and whatever `core.autocrlf` says.
+.agents/notes/archived/** -text
+
+# Binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
