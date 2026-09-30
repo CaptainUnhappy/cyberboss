@@ -49,7 +49,16 @@ if (-not $token -or -not $talker) {
 # because cwin-s1-bot only fires on logon (plus manual runs) and the heartbeat
 # watchdog's repair budget was in cooldown. Nothing else watched the bot itself.
 # Start it again if it is gone; never touch a live one.
-$botPattern = 'bin\\cyberboss\.js\s+start'
+#
+# 2026-10-01 fix: the pattern was 'bin\\cyberboss\.js\s+start' (literal
+# backslash). The live bot was started as `node.exe ./bin/cyberboss.js start
+# --checkin` - forward slash - so this guard reported "bot missing" every 15
+# minutes and re-triggered cwin-s1-bot while the bot was alive (measured: the
+# pattern matched none of the cyberboss node processes). Same identity-pattern
+# lesson as the service and the watchdog on 2026-09-27 (RDPWrap contract
+# constraint 8): accept both separators and a relative-path prefix, and keep the
+# three copies identical.
+$botPattern = '(?:^|[\s\\/])bin[\\/]cyberboss\.js\s+start(?:\s|$)'
 $botAlive = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
   Where-Object { $_.CommandLine -match $botPattern -and $_.CommandLine -notmatch 'runner\.js' })
 if ($botAlive.Count -gt 0) {

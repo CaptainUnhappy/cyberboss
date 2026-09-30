@@ -24,6 +24,16 @@ WeFlow 自带错误参考页（`analysis\weflow620\asar-src\dist\assets\ErrorRef
 
 把「token + health 200 + 端口唯一属主」当成身份证明、或接受「带 `错误码: -N` 的 500」当身份证据，都能让机械修复继续跑；但继续跑的下一步是 `FullRestart` **整栈**——而 `docs/remediation-plan-2026-09-11.md` §修复F 明确要求读侧故障「只重启 WeFlow，绝不 FullRestart 整个栈」。在「只重读侧」的修复模式做出来之前，让它 fail-closed 反而挡住了更糟的动作。这条作为已知缺口记录。
 
+## 同轮附带修复：守卫的 bot 存活判据也只认反斜杠
+
+`scripts/isolated-session/weflow-guard.ps1` 用 `$botPattern = 'bin\\cyberboss\.js\s+start'` 判断机器人是否活着。2026-10-01 实测：活着的机器人命令行是 `"node.exe" ./bin/cyberboss.js start --checkin`（**正斜杠**），该模式对全部 cyberboss 进程 `match=False` ⇒ 守卫每 15 分钟报一次 `bot missing -> triggered cwin-s1-bot`，而机器人一直活着（pid 6788、看门狗 `identityVerified=true`）。这与 09-27 在**服务**和**看门狗**里修过的是同一个坑（RDPWrap 硬约束 8 要求"两处必须保持一致"——现在是第三处）。已把模式统一成 `'(?:^|[\s\\/])bin[\\/]cyberboss\.js\s+start(?:\s|$)'`（与 `cyberboss-service.ps1:134`、`cyberboss-watchdog.ps1:113` 逐字一致），并用当时活的命令行验证 `match=True`、其余 cyberboss 进程全为 False。效果：不再每 15 分钟触发一次注定被单例锁拒绝的 `cwin-s1-bot`（顺便少 96 次/天的日志噪声）。
+
+## 环境取证的结论（为什么不是本地状态问题）
+
+同一轮在 session 3 里做了只读取证，逐项排除了"本地可修"的可能：锚点三件套**齐全且一致**（`Runtime\anchor-v7-…bin` 310B、`State\native-anchor-v7-…bin` 310B，mtime 10-01 00:08；注册表 `AnchorV7-e1c84b9f06d1237a-…` 在位）、`Security\device-root-v1.bin` 在位；`%LOCALAPPDATA%\WeFlow` 对 `Unhappy\cwinprobe` 是 FullControl 且**写测试通过**；WeFlow 6.2.0 的进程里**没有任何非 Windows/非 WeFlow 模块**（注入类判据排除）；配置完整（`myWxid=wxid_s3178hwvzsl922_9e02`、`dbPath` 存在且含该 wxid 目录）。所以 `-101` 只可能来自组件对**机器/安全环境**的判断（Defender 排除项目前无法读取，需要管理员），这也正是官方 action 指向的方向。
+
+
+
 ## Alternatives considered
 
 - **改功能身份判据，让 500 也能证明身份**：见上，会重新打开「读侧坏了就把整个栈重启」的闸门；而且真正的病（环境/杀软）不会因此好转。等「只重读侧」模式落地后再做。
