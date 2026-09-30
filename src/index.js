@@ -115,7 +115,14 @@ async function main() {
   }
 
   if (command === "doctor") {
-    getApp().printDoctor();
+    const ready = await getApp().printDoctor();
+    // `doctor` doubles as the migration/acceptance gate, so its exit code has to
+    // carry the verdict: 0 only when every enabled channel can actually deliver.
+    // Nothing in the service or watchdog paths calls `doctor` (they use their own
+    // functional probes), so this cannot break existing automation.
+    if (!ready) {
+      process.exitCode = 1;
+    }
     return;
   }
 

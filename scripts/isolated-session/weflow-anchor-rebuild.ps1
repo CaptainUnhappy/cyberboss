@@ -1,4 +1,4 @@
-﻿# weflow-anchor-rebuild.ps1 - cure WeFlow's `-105` (WCDB bootstrap / anti-rollback
+# weflow-anchor-rebuild.ps1 - cure WeFlow's `-105` (WCDB bootstrap / anti-rollback
 # anchor) in the isolated session, reversibly.
 #
 # Signature it fixes: `/api/v1/health` 200 but `/api/v1/messages` 500 with body
@@ -84,8 +84,15 @@ for ($i = 1; $i -le 40; $i++) {
 
 $envLines = Get-Content $envFile -Encoding utf8
 $token = (($envLines | Where-Object { $_ -match '^CYBERBOSS_WEFLOW_TOKEN=' }) -replace '^CYBERBOSS_WEFLOW_TOKEN=', '').Trim()
+# Which talker to verify against is configuration, not a literal: a real wxid
+# baked into a recipe is both a portability bug and a privacy leak.
+$verifyTalker = (($envLines | Where-Object { $_ -match '^CYBERBOSS_WEFLOW_INBOX_CHAT=' }) -replace '^CYBERBOSS_WEFLOW_INBOX_CHAT=', '').Trim()
+if (-not $verifyTalker) {
+  $verifyTalker = (($envLines | Where-Object { $_ -match '^CYBERBOSS_WEFLOW_CANARY_CHAT=' }) -replace '^CYBERBOSS_WEFLOW_CANARY_CHAT=', '').Trim()
+}
+if (-not $verifyTalker) { throw "no CYBERBOSS_WEFLOW_INBOX_CHAT / CYBERBOSS_WEFLOW_CANARY_CHAT in $envFile; cannot verify the reader" }
 $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-$url = "http://127.0.0.1:5051/api/v1/messages?talker=wxid_ubo0cy5xh4px22&limit=2&start=$($now-86400)&end=$now"
+$url = "http://127.0.0.1:5051/api/v1/messages?talker=$verifyTalker&limit=2&start=$($now-86400)&end=$now"
 $ok = $false
 foreach ($attempt in 1..6) {
   try {

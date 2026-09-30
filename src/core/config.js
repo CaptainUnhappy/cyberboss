@@ -29,6 +29,12 @@ function readConfig() {
     userGender: readTextEnv("CYBERBOSS_USER_GENDER") || "female",
     allowedUserIds: readListEnv("CYBERBOSS_ALLOWED_USER_IDS"),
     channel: readTextEnv("CYBERBOSS_CHANNEL") || "weixin",
+    // Optional *declaration* of which message channels this machine is meant to
+    // run (`ilink`, `weflow-uia`). Empty means "do not filter": every channel
+    // stays eligible and availability is derived from the existing keys, so
+    // setting this can never change what the bot does — only what `doctor`
+    // reports on. See the dual-channel contract note.
+    enabledChannels: readListEnv("CYBERBOSS_ENABLED_CHANNELS").map((item) => item.toLowerCase()),
     runtime: readTextEnv("CYBERBOSS_RUNTIME") || "codex",
     timelineCommand: readTextEnv("CYBERBOSS_TIMELINE_COMMAND") || "timeline-for-agent",
     accountId: readTextEnv("CYBERBOSS_ACCOUNT_ID"),

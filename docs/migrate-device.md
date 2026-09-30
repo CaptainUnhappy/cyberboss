@@ -65,15 +65,31 @@ npm run migrate:import -- --from E:\cb-migrate
 - 有三个任务的动作指向 **`C:\ProgramData\cwin-probe\` 下从未入库的脚本**（`bot-direct.cmd`、`s1-restack.ps1`、`s1-mstsc-offscreen2.ps1`）。在把它们入库之前，"从仓库重建"这句话对新机器不成立 —— 这是当前最大的一处迁移缺口。
 - `.ps1` 里**含非 ASCII 的必须带 UTF-8 BOM**，否则 PowerShell 5.1 按 GBK 解析、整个脚本报废（本仓库已经踩过两次）。新增/改写脚本后跑 `node scripts/verify-portable.js` 之外，最好再做一次 BOM + 解析扫描。
 
-## 5. 验收：`npm run doctor` 与可移植性闸门
+## 5. 验收：`doctor` 的逐通道结论 + 两条闸门
 
 ```powershell
+npm run doctor             # 配置快照 + 每条通道的只读就绪结论（退出码 0 = 全部 enabled 通道就绪）
+npm run test:doctor        # 探测逻辑的离线测试（不发消息、不动光标）
 npm run verify-portable    # 静态闸门：代码树里不得出现新的机器绑定（基线在 scripts/portable-baseline.json）
 npm run test:migrate       # 迁移工具的离线往返测试（路径改写 / 凭据 opt-in / 篡改拦截）
-npm run doctor             # 打印 stateDir / channel / runtime / timeline / threads 的解析结果
 ```
 
-`doctor` 目前是**配置快照**，不是**通道探测**：它不告诉你"官方通道现在能不能发"。逐通道的只读能力探测（`ilink` 的 `notifystart`、`weflow-uia` 的 `messages` 200 + `/readyz` + `/api/probe`）是待办，判据沿用隔离会话契约里已经验证过的那几条。
+`doctor` 现在是**逐通道探测**，不是单纯的配置快照。它输出的结论形如：
+
+```
+"channels": [
+  { "channel": "ilink",      "enabled": true, "ready": true,  "reason": "", "detail": "getconfig ok (read-only session check)" },
+  { "channel": "weflow-uia", "enabled": true, "ready": true,  "reason": "", "detail": "reader=ok writer=ready foreground=1639902 desktopIdleSeconds=362" }
+],
+"channelsSummary": { "enabled": ["ilink","weflow-uia"], "ready": ["ilink","weflow-uia"], "notReady": [], "ok": true }
+```
+
+四条使用要点：
+
+- **退出码有含义了**：0 当且仅当所有 `enabled` 通道 `ready=true`。脚本化验收直接看退出码，不用读日志。未配置的通道（`enabled=false`）不会让验收失败。
+- **它不发任何消息**：`ilink` 只做一次只读的 `ilink/bot/getconfig`（**不碰 `sendmessage`**，因为那要消耗 `context_token`）；`weflow-uia` 走读侧 `/api/v1/health` + 一次真实 `/api/v1/messages` 查询、写侧 `/readyz` + **只读形式**的 `/api/probe`（不带 `?move=1`，绝不 `SetCursorPos`）。
+- **`ilink` 的结论是软判据**：机器人正在长轮询时，并发探测可能让它偏悲；`ready=true` 也只证明账号与会话还在，**不代表现在能发**（官方通道每条出站都要消耗入站带来的 `context_token`）。
+- 排查时可用 `CYBERBOSS_ENABLED_CHANNELS=ilink`（或 `weflow-uia`）只探测一条；**不设置时两条都探测**，所以这个键不需要长期留在 `.env` 里。
 
 ## 6. 顺序（别把顺序搞反）
 

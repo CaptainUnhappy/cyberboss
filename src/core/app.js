@@ -3,6 +3,7 @@ const path = require("path");
 const crypto = require("crypto");
 const fs = require("fs");
 const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
+const { probeChannels, summarizeChannels } = require("./doctor-probes");
 const { DEFAULT_MIN_WEIXIN_CHUNK, MAX_MIN_WEIXIN_CHUNK } = require("../adapters/channel/weixin/config-store");
 const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin/media-receive");
 const { createCodexRuntimeAdapter } = require("../adapters/runtime/codex");
@@ -248,14 +249,30 @@ class CyberbossApp {
     });
   }
 
-  printDoctor() {
+  /**
+   * Static configuration snapshot + read-only channel readiness.
+   *
+   * The snapshot answers "where is this pointing"; the probe answers "which
+   * channel can actually deliver right now". Both are printed because a
+   * mismatch between them is the interesting case (correct config, dead
+   * reader). Returns true when every enabled channel is ready.
+   */
+  async printDoctor() {
+    const channels = await probeChannels(this.config);
+    const summary = summarizeChannels(channels);
     console.log(JSON.stringify({
       stateDir: this.config.stateDir,
       channel: this.channelAdapter.describe(),
+      channels,
+      channelsSummary: summary,
       runtime: this.runtimeAdapter.describe(),
       timeline: this.timelineIntegration.describe(),
       threads: this.threadStateStore.snapshot(),
     }, null, 2));
+    if (!summary.ok) {
+      console.error(`[cyberboss] doctor: channel(s) not ready: ${summary.notReady.join(", ")}`);
+    }
+    return summary.ok;
   }
 
   async login() {
