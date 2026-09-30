@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -105,7 +106,10 @@ TASKS: dict[str, dict] = {
     },
     "cwin-s1-bot": {
         "trigger": ("interval", "PT1H"),
-        "execute": _q("bot-direct.cmd"),
+        # The launcher now lives in the repository (it used to exist only as
+        # C:\ProgramData\cwin-probe\bot-direct.cmd, which made this task
+        # impossible to rebuild on another machine).
+        "execute": _r("scripts", "isolated-session", "bot-direct.cmd"),
         "arguments": "",
         "run_level": "Limited",
         "description": "Start the bot directly (bypasses shared-start.js bridge verification) every hour; the bot is single-instance.",
@@ -181,6 +185,26 @@ TASKS: dict[str, dict] = {
 #   cwin-session0-probe  -> action pointed into the gitignored tmp/ directory
 #   cwin-s4-worker       -> superseded by cwin-s1-session-bootstrap
 RETIRED = ["cwin-session0-probe", "cwin-s4-worker"]
+
+
+def validate_targets() -> list[str]:
+    """Every path a task would launch must exist on THIS machine, now.
+
+    Why this is a hard check and not a warning: a task whose action points at a
+    missing file fails silently at 3am and looks exactly like "the bot is dead".
+    Both real bugs this script was written to prevent were of that shape.
+    """
+    problems: list[str] = []
+    for name, spec in TASKS.items():
+        execute = spec["execute"]
+        if execute.lower() in {"powershell.exe", "wscript.exe", "python.exe", "pythonw.exe"}:
+            continue
+        if not Path(execute).exists():
+            problems.append("%s: command does not exist: %s" % (name, execute))
+        for token in re.findall(r'"([^"]+)"', spec["arguments"]):
+            if not Path(token).exists():
+                problems.append("%s: argument path does not exist: %s" % (name, token))
+    return problems
 
 
 def stamp(msg: str) -> None:
@@ -326,6 +350,15 @@ def main() -> int:
     stamp("python    : %s" % PYTHON)
     stamp("pythonw   : %s" % PYTHONW)
     stamp("node      : %s" % NODE)
+
+    problems = validate_targets()
+    if problems:
+        for problem in problems:
+            stamp("INVALID   %s" % problem)
+        stamp("refusing to register: %d task target(s) do not exist" % len(problems))
+        return 1
+    stamp("validated : every task target exists")
+
     for name in names:
         spec = TASKS[name]
         xml = build_xml(name, spec)
