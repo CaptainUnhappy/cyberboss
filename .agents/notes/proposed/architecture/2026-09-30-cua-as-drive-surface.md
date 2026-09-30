@@ -38,7 +38,8 @@ Status: proposed
 - **`Disc`（已断开）的 RDP 会话也算数**，所以 mstsc **不必**保持连接/不最小化 —— 这直接削掉现状最脆的一条约束（"客户端一断、一最小化就发不出去"）。
 - Windows 上 Cua Driver **不需要任何 OS 权限授予**（TCC 是 macOS 的事），安装不落 MSI/winget，npm 包 `@trycua/cua-driver` 带 win32-x64/arm64 原生件 —— 对一个 CommonJS 项目来说**不需要引入 Python**。
 - 许可干净：根仓 **MIT**（[LICENSE.md](https://github.com/trycua/cua/blob/main/LICENSE.md)），唯二例外是已弃用的 `libs/python/som`（AGPL-3.0-or-later）与**可选**的 `cua-perception` 扩展（OmniParser 图标检测器 AGPL-3.0-only，不重分发即可）。没有 BSL/商用限制条款；本地路径不要 API key，Cloud Fleet 按用量计费。
-- 成熟度：27.5k stars、最新提交 2026-09-29、release-please 分组件发版；但**pre-1.0 抖动是真的**（契约清单自称 experimental、09-29 有移除 `element_index`/`snapshot_id` 的 `!` 破坏性变更、0.13.0 被撤回、三天里五个 0.30.x）。
+- **可部署性已核实（决定 Option A 的成本量级）**：Docker Hub 的 `trycua` 组织有 16 个公开镜像，`trycua/xfce-cua:latest` 匿名可拉；**但没有独立的 `computer-server` 镜像**（它被烤进 xfce/qemu 系列镜像里）。仓库里没有 Helm chart，自建 Fleet 控制面无文档；唯一的官方 IaC 是一个 Terraform provider（`fleets_pool`）。也就是说 **Option A 走"Linux 宿主 + Docker 化 Windows guest"这条路时，镜像是现成的，但控制面要自建。**
+- 成熟度：27.5k stars、最新提交 2026-09-29、release-please 分组件发版；但**pre-1.0 抖动是真的**（契约清单自称 experimental、09-29 有移除 `element_index`/`snapshot_id` 的 `!` 破坏性变更、0.13.0 被撤回、三天里五个 0.30.x）。另外**仓库级 `v0.1.x` 标签是过期的**（最新那个指向 2025-03-17），真正的发版线是分组件标签（`cua-driver-rs-v*` 等）。
 
 ### 4. 因此本轮的落地决定
 
@@ -48,7 +49,7 @@ Status: proposed
    - **POC-1（决定 Option B 生死）**：在现有隔离会话里装 Cua Driver，`get_window_state` 打微信主窗口，看 UIA 树是否**非空且可寻址**（微信自绘控件多，AX 树可能是空的；若为空，Cua 的语义路径失效，只剩像素路径）。
    - **POC-2（决定 Option B 生死）**：`type_text` 往微信搜索框打字，验证 issue #2083 是否命中本机的 RDPWrap 回环会话；失败且必须前台 ⇒ 与防抢占目标直接冲突。
    - **POC-3（只影响 Option A）**：Windows guest 里跑微信 + WeFlow（`wcdb_api.dll` 引导、扫码登录、风控）能不能活。
-4. **真正"杀掉 RDPWrap"的只有 Option A**（微信 + 机器人整体搬进 Linux 宿主机上的 Windows guest VM），而它是一次架构迁移：需要自建镜像、Windows 授权、重新验证微信登录与风控，并且要把 WeFlow 的读侧一起搬进去。**它的收益是真实的**（mstsc 保活、跨账号、控制台闪窗、会话号漂移四类问题一起消失，迁移也变成"搬一个镜像"），但成本与风险都不是本轮能顺手承担的。
+4. **真正"杀掉 RDPWrap"的只有 Option A**（微信 + 机器人整体搬进 Linux 宿主机上的 Windows guest VM），而它是一次架构迁移：需要自建镜像、Windows 授权、重新验证微信登录与风控，并且要把 WeFlow 的读侧一起搬进去。**它的收益是真实的**（mstsc 保活、跨账号、控制台闪窗、会话号漂移四类问题一起消失，迁移也变成"搬一个镜像"），而且上游**已经提供 Windows guest 的容器镜像与 noVNC 通路**（`libs/qemu-docker/windows`，Win11 Enterprise **eval**、8G/8 核/30G、`:5000` computer-server、`:8006` noVNC），所以"自建镜像"不是从零开始 —— 但 eval 授权、微信风控、WeFlow 的 `wcdb_api.dll` 引导三件事都还没验证。成本与风险都不是本轮能顺手承担的。
 
 ## 依据（一手来源）
 

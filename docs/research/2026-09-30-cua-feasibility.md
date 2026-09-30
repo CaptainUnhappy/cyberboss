@@ -30,7 +30,7 @@
 https://api.github.com/repos/trycua/cua/contents/libs
 
 **重要结构变化：已合并为单一 monorepo。** 旧的独立仓库**不存在**了——`api.github.com/repos/trycua/lume` 与 `/cua-bench` 都返回同一个 repo id `925270205`（即 302 到 `trycua/cua`）；`trycua/cua-train` 为 404。Lume 现在在 `libs/lume`（Swift，`VERSION` = **0.5.3**）。根目录**没有** `pnpm-workspace.yaml`（404），根 `package.json` 没有 `workspaces` 字段，真正的 TS workspace 是嵌套的 `libs/typescript/package.json`；Python 侧由根 `pyproject.toml` 的 `[tool.uv.workspace]` 管理（注意：release-please 跟踪的 `libs/python/cua-sandbox` **不在** members 列表里）。
-`release-please` 按组件独立发版，manifest 记录：`cua-perception 0.2.1`、**`cua-driver 0.30.4`**、`lume 0.5.3`、`cua-sandbox 0.8.0`。
+`release-please` 按组件独立发版，manifest 记录：`cua-perception 0.2.1`、**`cua-driver 0.30.4`**、`lume 0.5.3`、`cua-sandbox 0.8.0`。**注意仓库级 `v0.1.x` tag 已废弃**——最新的 `v0.1.13` 指向 2025-03-17 的 commit；真正的发行线是组件 tag（`cua-driver-rs-v*`、`lume-v*`、`sandbox-v*`、`computer-server-v*`）。
 
 | 组件 | 作用 | 版本 / 日期 |
 |---|---|---|
@@ -227,7 +227,7 @@ https://cua.ai/docs/reference/sandbox-sdk/os-image-catalog
 
 - **可以**。Cua Driver 官方支持 Linux（x86_64 桌面会话 + X11/XWayland + AT-SPI 2；最小 Debian/Ubuntu 需先装 `libxi6`、`at-spi2-core`）。https://cua.ai/docs/how-to-guides/driver/install
 - **Kubernetes**：Fleet 后端是 KubeVirt（PR #3125 引用了 `virt-launcher` 日志与 VMI phase），仓库里有 Kustomize 与 CRD `images.images.cua.ai`（`clusters/base/cua-images/crd.yaml`；其 recipe `osType` 枚举**只有 linux**、`kind` 只有 vm、`build.diskSize` 默认 40Gi），但**全仓库没有任何 Helm chart**，**控制面是否可自托管未文档化** → `未证实`。官方 IaC 路径是 **Terraform provider**（`libs/fleet/terraform-provider-fleets`，资源 `fleets_pool`，另有公开镜像仓库 https://github.com/trycua/terraform-provider-fleets ）。
-- **Docker 镜像确有**：Docker Hub 组织 `trycua` 共 **16 个公开仓库**，`trycua/xfce-cua:latest` 已核实可**匿名 pull**（约 450 MB；`trycua/cua-xfce:latest` 达 7.1 GB）；**没有**名为 `computer-server` 的独立镜像——它是**烤进** xfce-cua / cua-xfce / cua-ubuntu / qemu-* 镜像里的。公有 ECR `public.ecr.aws/k5j5w0x5` 也可匿名 pull（`cua-ubuntu-24.04` 的 tags/list 已验证）。`libs/qemu-docker/{linux,windows,android}` 里的 Windows 镜像 build 标签是 `trycua/cua-qemu-windows:latest`，base `trycua/windows-local:latest`（自述 "forked and simplified from dockurr/windows"，见 PR #551）。
+- **Docker 镜像确有**：Docker Hub 组织 `trycua` 共 **16 个公开仓库**（`lumier`、`cua-ubuntu`、`cua-xfce`、`xfce-cua`、`windows-local`、`qemu-local`、`cua-linux`、`cua-windows`、`cua-qemu-{linux,windows,android}`、`cua-droid`、`cua-android-docker`、`winarena`、`winarena-base`、`cuabot`）；`trycua/xfce-cua:latest` 已核实可**匿名 pull**（约 450 MB；`trycua/cua-xfce:latest` 达 7.1 GB）。**没有**名为 `computer-server` 的独立镜像——它是**烤进** xfce-cua / cua-xfce / cua-ubuntu / qemu-* 镜像里的。公有 ECR `public.ecr.aws/k5j5w0x5` 也可匿名 pull（`cua-ubuntu-24.04` 的 tags/list 已验证）。`libs/qemu-docker/{linux,windows,android}` 里的 Windows 镜像 build 标签是 `trycua/cua-qemu-windows:latest`，base `trycua/windows-local:latest`（自述 "forked and simplified from dockurr/windows"，见 PR #551）。
 - **`ghcr.io/trycua/*`（macOS sandbox 镜像）无法匿名拉取**（manifest 404 / token 403）→ 可能为私有，`未证实`。
 - **API key / 托管服务**：只有 **Fleet 云**需要凭据（`CUA_CLIENT_ID` / `CUA_CLIENT_SECRET`，或 `FLEETS_TOKEN`，或 GitHub OIDC `cua wif-token github`），且建 pool 可能需要付款方式。**两个陷阱**：`CUA_API_KEY` 是 **legacy**，其默认 host `https://api.cua.ai` **已退役**，带上它反而会把调用**绕开** Fleet；`cua sb launch <image>` 不带 `--pool` 走旧 VM API，「today 不可用」。本地 Cua Driver、computer-server、QEMU 容器**不需要**任何 key。另有一个 headless 陷阱：无 Secret Service 的 Linux 上 `cua auth login` 会在浏览器授权**之后**失败（"No secure credential store is available"）。
   https://cua.ai/docs/reference/cua-cli/authentication · https://cua.ai/docs/tutorials/your-first-cloud-fleet
