@@ -15,9 +15,10 @@
 # host reads BOM-less files as the ANSI code page.
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\ProgramData\cwin-probe'
+# Machine bindings: dot-source the shared header instead of hardcoding the
+# checkout path (a moved checkout used to keep reading the old `.env`).
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
 $exe = Join-Path $root 'WeFlow\WeFlow.exe'
-$envFile = 'D:\Projects\cyberboss\.env'
 $port = 5051
 $report = Join-Path $root 's4\weflow-restart-report.txt'
 Start-Transcript -Path $report -Force | Out-Null
@@ -45,9 +46,10 @@ $before = @(Get-Process WeFlow -ErrorAction SilentlyContinue | Where-Object { # 
 # host reads BOM-less files as the ANSI code page.
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\ProgramData\cwin-probe'
+# Machine bindings: dot-source the shared header instead of hardcoding the
+# checkout path (a moved checkout used to keep reading the old `.env`).
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
 $exe = Join-Path $root 'WeFlow\WeFlow.exe'
-$envFile = 'D:\Projects\cyberboss\.env'
 $port = 5051
 $report = Join-Path $root 's4\weflow-restart-report.txt'
 Start-Transcript -Path $report -Force | Out-Null
@@ -75,9 +77,10 @@ $before = @(Get-Process WeFlow -ErrorAction SilentlyContinue | Where-Object { # 
 # host reads BOM-less files as the ANSI code page.
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\ProgramData\cwin-probe'
+# Machine bindings: dot-source the shared header instead of hardcoding the
+# checkout path (a moved checkout used to keep reading the old `.env`).
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
 $exe = Join-Path $root 'WeFlow\WeFlow.exe'
-$envFile = 'D:\Projects\cyberboss\.env'
 $port = 5051
 $report = Join-Path $root 's4\weflow-restart-report.txt'
 Start-Transcript -Path $report -Force | Out-Null
@@ -105,9 +108,10 @@ $before = @(Get-Process WeFlow -ErrorAction SilentlyContinue | Where-Object { # 
 # host reads BOM-less files as the ANSI code page.
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\ProgramData\cwin-probe'
+# Machine bindings: dot-source the shared header instead of hardcoding the
+# checkout path (a moved checkout used to keep reading the old `.env`).
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
 $exe = Join-Path $root 'WeFlow\WeFlow.exe'
-$envFile = 'D:\Projects\cyberboss\.env'
 $port = 5051
 $report = Join-Path $root 's4\weflow-restart-report.txt'
 Start-Transcript -Path $report -Force | Out-Null

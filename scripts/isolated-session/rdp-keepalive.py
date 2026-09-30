@@ -7,17 +7,20 @@ import time
 import urllib.request
 from ctypes import wintypes
 
-PROBE_DIR = r"C:\ProgramData\cwin-probe\s4"
-PROBE_SCRIPT = os.path.join(PROBE_DIR, "in", "keepalive-probe.ps1")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from machine_paths import HOLD_FILE as _HOLD, QUEUE_IN, SUSPEND_FILE as _SUSPEND, log_file  # noqa: E402
+
+PROBE_DIR = str(QUEUE_IN.parent)
+PROBE_SCRIPT = os.path.join(str(QUEUE_IN), "keepalive-probe.ps1")
 PROBE_OUT = os.path.join(PROBE_DIR, "keepalive-probe.txt")
-LOG = r"D:\Projects\cyberboss\tmp\cwin-lab\rdp-keepalive.log"
-HOLD_FILE = r"C:\ProgramData\cwin-probe\rdp-client-hold.txt"
+LOG = str(log_file("rdp-keepalive.log"))
+HOLD_FILE = str(_HOLD)
 # The remote-control guard parks this file while ToDesk/GameViewer is being
 # controlled: the RDP client has to stay down so the remote tool binds to the
 # console session (session 1) instead of the isolated one.  It is treated as
 # "still wanted" only while it keeps being refreshed, so a guard that dies
 # cannot keep the client down forever.
-SUSPEND_FILE = r"C:\ProgramData\cwin-probe\rdp-client-suspend.txt"
+SUSPEND_FILE = str(_SUSPEND)
 SUSPEND_FRESH_SECONDS = 600.0
 # The bridge runs inside the isolated session, so it can answer the injectability
 # question in-process; the shared file queue only serves as the fallback.

@@ -344,8 +344,12 @@ function createTokenImage({ imagePath, runId, imageToken }) {
     "out, run_id, token = sys.argv[1:4]",
     "img = Image.new('RGB', (1400, 900), 'white')",
     "draw = ImageDraw.Draw(img)",
-    "font_path = 'C:/Windows/Fonts/arial.ttf'",
-    "bold_path = 'C:/Windows/Fonts/arialbd.ttf'",
+    "import os",
+    // Fonts come from the running system, not from a literal path: this e2e has
+    // to survive being run on a checkout that lives somewhere else.
+    "font_dir = os.environ.get('CYBERBOSS_E2E_FONT_DIR') or os.path.join(os.environ.get('SystemRoot', 'C:\\\\Windows'), 'Fonts')",
+    "font_path = os.path.join(font_dir, 'arial.ttf')",
+    "bold_path = os.path.join(font_dir, 'arialbd.ttf')",
     "title = ImageFont.truetype(bold_path, 72)",
     "token_font = ImageFont.truetype(bold_path, 104)",
     "body = ImageFont.truetype(font_path, 44)",

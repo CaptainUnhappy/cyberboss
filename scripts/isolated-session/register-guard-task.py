@@ -18,13 +18,22 @@
 """
 import argparse
 import datetime
+import os
 import sys
+from pathlib import Path
 
 TASK_NAME = "cwin-s1-rdp-remote-guard"
 TASK_PATH = "\\"
-PYTHONW = r"D:\Tools\miniconda3\pythonw.exe"
-SCRIPT = r"D:\Projects\cyberboss\scripts\isolated-session\rdp-remote-guard.py"
-WORKDIR = r"D:\Projects\cyberboss"
+
+# Machine bindings are derived, never literal: this file used to hardcode both
+# the interpreter and the checkout, so registering the task on a second machine
+# silently produced a task pointing at a directory that does not exist there.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+PYTHONW = os.environ.get("CYBERBOSS_PYTHONW") or str(
+    Path(sys.executable).with_name("pythonw.exe")
+)
+SCRIPT = str(REPO_ROOT / "scripts" / "isolated-session" / "rdp-remote-guard.py")
+WORKDIR = str(REPO_ROOT)
 
 TASK_CREATE_OR_UPDATE = 6
 TASK_LOGON_INTERACTIVE_TOKEN = 3

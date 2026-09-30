@@ -1,4 +1,4 @@
-# weflow-anchor-rebuild.ps1 - cure WeFlow's `-105` (WCDB bootstrap / anti-rollback
+﻿# weflow-anchor-rebuild.ps1 - cure WeFlow's `-105` (WCDB bootstrap / anti-rollback
 # anchor) in the isolated session, reversibly.
 #
 # Signature it fixes: `/api/v1/health` 200 but `/api/v1/messages` 500 with body
@@ -22,7 +22,9 @@
 # BOM-less files as the ANSI code page.
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\ProgramData\cwin-probe'
+# Machine bindings: dot-source the shared header instead of hardcoding the probe
+# root and the checkout path.
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
 $report = Join-Path $root 's4\weflow-anchor-rebuild-report.txt'
 Start-Transcript -Path $report -Force | Out-Null
 
@@ -80,7 +82,7 @@ for ($i = 1; $i -le 40; $i++) {
   if (Get-NetTCPConnection -LocalPort 5051 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1) { "  port 5051 up after $($i * 3)s"; break }
 }
 
-$envLines = Get-Content 'D:\Projects\cyberboss\.env' -Encoding utf8
+$envLines = Get-Content $envFile -Encoding utf8
 $token = (($envLines | Where-Object { $_ -match '^CYBERBOSS_WEFLOW_TOKEN=' }) -replace '^CYBERBOSS_WEFLOW_TOKEN=', '').Trim()
 $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 $url = "http://127.0.0.1:5051/api/v1/messages?talker=wxid_ubo0cy5xh4px22&limit=2&start=$($now-86400)&end=$now"

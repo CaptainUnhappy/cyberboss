@@ -13,11 +13,11 @@
 # and a non-ASCII character in a .ps1 silently breaks the whole script's parse.
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\ProgramData\cwin-probe'
-$queueIn = Join-Path $root 's4\in'
-$recipe = 'D:\Projects\cyberboss\scripts\isolated-session\weflow-restart.ps1'
+# Machine bindings come from the environment or from this script's own location:
+# a checkout that moved must not silently keep writing to the old queue.
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
+$recipe = Join-Path $repoRoot 'scripts\isolated-session\weflow-restart.ps1'
 $queuedName = 'weflow-restart.ps1'
-$envFile = 'D:\Projects\cyberboss\.env'
 $logDir = Join-Path $root 'repair'
 $logFile = Join-Path $logDir 'weflow-guard.log'
 $port = 5051

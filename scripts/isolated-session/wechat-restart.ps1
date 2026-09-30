@@ -18,9 +18,11 @@
 # *isolated* session has a usable, logged-in WeChat main window.
 
 $ErrorActionPreference = 'Continue'
-$root = 'C:\ProgramData\cwin-probe'
+# Machine bindings: dot-source the shared header instead of hardcoding the probe
+# root; the client path stays overridable because installs differ per machine.
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
 $report = Join-Path $root 's4\wechat-restart-report.txt'
-$exe = 'C:\Program Files\Tencent\Weixin\Weixin.exe'
+$exe = if ($env:CYBERBOSS_WECHAT_EXE) { $env:CYBERBOSS_WECHAT_EXE } else { Join-Path ${env:ProgramFiles} 'Tencent\Weixin\Weixin.exe' }
 $bridgeReadyz = 'http://127.0.0.1:8776/readyz'
 $loginWindowClass = 'mmui::LoginWindow'
 # "jin ru wei xin" = the resume button on the remembered-session screen.

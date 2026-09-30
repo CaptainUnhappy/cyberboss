@@ -1,10 +1,12 @@
 ﻿param([ValidateSet('show','hide','status')][string]$Mode = 'status')
 $ErrorActionPreference = 'Continue'
-$out = "C:\ProgramData\cwin-probe\rdp-client-$Mode-report.txt"
+# Machine bindings: dot-source the shared header instead of hardcoding the probe root.
+. (Join-Path $PSScriptRoot 'queue-root.ps1')
+$out = Join-Path $root "rdp-client-$Mode-report.txt"
 $o = New-Object System.Collections.Generic.List[string]
 function L($m) { [void]$o.Add([string]$m) }
 
-$HOLD = 'C:\ProgramData\cwin-probe\rdp-client-hold.txt'
+$HOLD = Join-Path $root 'rdp-client-hold.txt'
 $OFF_X = 1930
 $OFF_Y = 0
 $ON_X = 0
