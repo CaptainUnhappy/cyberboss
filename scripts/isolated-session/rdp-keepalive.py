@@ -13,6 +13,9 @@ from machine_paths import HOLD_FILE as _HOLD, QUEUE_IN, SUSPEND_FILE as _SUSPEND
 PROBE_DIR = str(QUEUE_IN.parent)
 PROBE_SCRIPT = os.path.join(str(QUEUE_IN), "keepalive-probe.ps1")
 PROBE_OUT = os.path.join(PROBE_DIR, "keepalive-probe.txt")
+# The probe script is PowerShell source with this path baked in, so it needs
+# PowerShell escaping (a lone backslash is an escape character there).
+PROBE_OUT_PS = PROBE_OUT.replace("\\", "\\\\").replace("'", "''")
 LOG = str(log_file("rdp-keepalive.log"))
 HOLD_FILE = str(_HOLD)
 # The remote-control guard parks this file while ToDesk/GameViewer is being
@@ -130,7 +133,7 @@ public class KA {
 }
 "@
 Add-Type -TypeDefinition $src -ErrorAction SilentlyContinue
-[KA]::Probe() | Out-File 'C:\ProgramData\cwin-probe\s4\keepalive-probe.txt' -Encoding utf8
+[KA]::Probe() | Out-File '__PROBE_OUT__' -Encoding utf8
 '''
 
 
@@ -146,7 +149,7 @@ def queue_probe(timeout=75):
     except OSError:
         pass
     with open(PROBE_SCRIPT, "w", encoding="utf-8-sig") as fh:
-        fh.write(PROBE_BODY)
+        fh.write(PROBE_BODY.replace("__PROBE_OUT__", PROBE_OUT_PS))
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(PROBE_OUT):

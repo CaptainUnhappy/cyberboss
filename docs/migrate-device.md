@@ -70,7 +70,7 @@ npm run migrate:import -- --from E:\cb-migrate
 ```powershell
 npm run doctor             # 配置快照 + 每条通道的只读就绪结论（退出码 0 = 全部 enabled 通道就绪）
 npm run test:doctor        # 探测逻辑的离线测试（不发消息、不动光标）
-npm run verify-portable    # 静态闸门：代码树里不得出现新的机器绑定（基线在 scripts/portable-baseline.json）
+npm run verify-portable    # 静态闸门：代码树里 0 处机器绑定（唯一允许的字面量是 env 查找的兜底默认值）
 npm run test:migrate       # 迁移工具的离线往返测试（路径改写 / 凭据 opt-in / 篡改拦截）
 ```
 

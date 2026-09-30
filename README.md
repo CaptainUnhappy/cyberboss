@@ -373,7 +373,10 @@ The exporter never includes `.env`; `accounts/*context-tokens.json` (a live bear
 - `npm run migrate:list` / `migrate:export` / `migrate:verify` / `migrate:import`
   Move the unreproducible state to another machine; see [Migrating an existing install](#migrating-an-existing-install-to-another-machine)
 - `npm run verify-portable` / `npm run verify-portable:list`
-  Static gate: no new machine-specific absolute paths in the code trees (known ones are baselined in `scripts/portable-baseline.json`)
+  Static gate: the code trees must contain **no** machine-specific absolute paths. There is no
+  allowlist — a literal is accepted only as the documented fallback of an environment lookup
+  (`os.environ.get("CYBERBOSS_QUEUE_ROOT") or r"C:\ProgramData\cwin-probe"`), so a moved checkout
+  and a new machine both keep working. Any other drive-rooted literal fails the gate.
 - `npm run test:doctor` / `npm run test:migrate`
   Offline tests for the channel probes and the migration tool
 

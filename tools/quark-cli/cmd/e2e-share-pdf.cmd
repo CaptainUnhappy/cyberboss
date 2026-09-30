@@ -4,10 +4,14 @@ rem link, save it to the drive, verify it landed, then report the download step.
 rem
 rem usage: e2e-share-pdf.cmd [share-url] [.pdf]
 setlocal
-cd /d D:\Projects\cyberboss\tools\quark-cli
+rem Derive the tool directory from this file instead of a literal checkout path,
+rem and take the interpreter from the environment like quarkctl.cmd does.
+pushd "%~dp0.."
 set OPS=cdp-ops.js
 set REV=quarkctl.py
-set PY=D:\Tools\miniconda3\python.exe
+set "PY=%CYBERBOSS_PYTHON%"
+if not defined PY if exist "D:\Tools\miniconda3\python.exe" set "PY=D:\Tools\miniconda3\python.exe"
+if not defined PY for /f "delims=" %%i in ('where python 2^>nul') do if not defined PY set "PY=%%i"
 set URL=%~1
 set EXT=%~2
 if "%EXT%"=="" set EXT=.pdf

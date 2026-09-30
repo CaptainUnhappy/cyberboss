@@ -184,6 +184,44 @@ function resolveApprovalPatchPath(dirname = __dirname) {
   return path.resolve(dirname, "..", "..", "..", "..", "dsh-plugins", "cyberboss-approval", "main.patch.yml");
 }
 
+/** Placeholder the committed overlay uses instead of a machine-specific path. */
+const APPROVAL_PLUGIN_PLACEHOLDER = "__CYBERBOSS_PLUGIN__";
+
+/**
+ * Turn the committed overlay into a per-machine one.
+ *
+ * The overlay has to name the plugin by absolute path (cordis resolves insert
+ * names from the profile directory), but a committed absolute path breaks every
+ * other checkout: a clone on another drive makes DSH exit 5 and the runtime
+ * becomes unusable. So the committed file carries a placeholder and this
+ * function writes the resolved copy into the state directory.
+ *
+ * Idempotent by content: an unchanged file is not rewritten, so restarting the
+ * runtime does not churn the disk. Returns the template path unchanged when it
+ * contains no placeholder, which keeps a hand-edited overlay working.
+ */
+function materializeApprovalPatch({ templatePath, stateDir, pluginEntry, writeFileSync = fs.writeFileSync, readFileSync = fs.readFileSync, mkdirSync = fs.mkdirSync } = {}) {
+  const source = readFileSync(templatePath, "utf8");
+  if (!source.includes(APPROVAL_PLUGIN_PLACEHOLDER)) {
+    return templatePath;
+  }
+  const entry = normalizeText(pluginEntry) || path.join(path.dirname(templatePath), "src", "index.js");
+  const rendered = source.split(APPROVAL_PLUGIN_PLACEHOLDER).join(entry.replace(/\\/g, "/"));
+  const target = path.join(stateDir, "dsh-patches", "cyberboss-approval.main.patch.yml");
+  try {
+    if (readFileSync(target, "utf8") === rendered) {
+      return target;
+    }
+  } catch {
+    // first run, or the state directory was cleaned
+  }
+  mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = `${target}.tmp-${process.pid}`;
+  writeFileSync(tmp, rendered, "utf8");
+  fs.renameSync(tmp, target);
+  return target;
+}
+
 /**
  * Path to the overlay that widens DSH's attachment admission limits.
  *
@@ -284,7 +322,13 @@ function createDshRuntimeAdapter(config = {}) {
   // answerer at all, which DSH resolves to `unavailable` (fail closed).
   const approvalMode = normalizeText(config.dshApprovalMode).toLowerCase();
   const approvalEnabled = approvalMode === "session" || approvalMode === "never";
-  const approvalPatchPath = approvalEnabled ? resolveApprovalPatchPath() : "";
+  const approvalPatchPath = approvalEnabled
+    ? materializeApprovalPatch({
+      templatePath: resolveApprovalPatchPath(),
+      stateDir: config.stateDir,
+      pluginEntry: path.resolve(__dirname, "..", "..", "..", "..", "dsh-plugins", "cyberboss-approval", "src", "index.js"),
+    })
+    : "";
   // Always applied: the shipped 8192-per-side default refuses ordinary long
   // screenshots before the model ever sees them.
   const attachmentLimitsPatchPath = resolveAttachmentLimitsPatchPath();
@@ -847,5 +891,7 @@ module.exports = {
   imageMimeForPath,
   buildDshContentBlocks,
   resolveApprovalPatchPath,
+  materializeApprovalPatch,
+  APPROVAL_PLUGIN_PLACEHOLDER,
   resolveAttachmentLimitsPatchPath,
 };

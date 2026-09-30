@@ -56,14 +56,17 @@ import time
 from ctypes import wintypes
 
 # ---------------------------------------------------------------- paths / knobs
-HOLD_FILE = r"C:\ProgramData\cwin-probe\rdp-client-hold.txt"
-# 远控期间真正的"按住"信号：保活脚本看到它既新又新鲜时不触发重连。
+# Machine bindings come from machine_paths.py (environment first, then the
+# historical defaults) so this resident guard works from a moved checkout.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from machine_paths import HOLD_FILE, LOG_DIR, QUEUE_ROOT, REMOTE_LOG_DIRS, SUSPEND_FILE  # noqa: E402
+
 # 为什么不复用 HOLD_FILE：那是运维/保活共用的"窗口摆位"开关（操作员 -show 也会写它），
 # 拿它当"禁止重连"会让操作员看会话桌面时把 RDP 客户端永久挡在门外。
-SUSPEND_FILE = r"C:\ProgramData\cwin-probe\rdp-client-suspend.txt"
-LOG = r"C:\ProgramData\cwin-probe\rdp-remote-guard.log"
-STATE = r"C:\ProgramData\cwin-probe\rdp-remote-guard.state.json"
-ONCE_REPORT = r"C:\ProgramData\cwin-probe\rdp-remote-guard-once.json"
+# SUSPEND_FILE 才是远控期间真正的"按住"信号：保活脚本看到它既存在又新鲜时不触发重连。
+LOG = str(LOG_DIR / "rdp-remote-guard.log")
+STATE = str(QUEUE_ROOT / "rdp-remote-guard.state.json")
+ONCE_REPORT = str(QUEUE_ROOT / "rdp-remote-guard-once.json")
 BRIDGE_PROBE_URL = "http://127.0.0.1:8776/api/probe"
 
 # 被让出的对象：回环 RDP 客户端
@@ -112,8 +115,9 @@ NO_RESTART = False
 # 因此目前只保留 ToDesk 的 `session*`：实测只在被控期间增长（远控时 ~10s/行）。
 # **UU远程（= GameViewer）目前没有可信的会话级信号 → 让它漏判**（回退到手动关 RDP），
 # 因为误判会永久按住 RDP，代价比漏判大得多。找到 UU 的可信信号后再加回来。
+# 日志目录是"每台机器的事实"，所以可配置：REMOTE_LOG_DIRS 的第一个存在项生效。
 REMOTE_LOG_RULES = [
-    (r"D:\Program Files\ToDesk\Logs", r"(?i)^session.*\.(log|xlog)$"),
+    (str(d), r"(?i)^session.*\.(log|xlog)$") for d in REMOTE_LOG_DIRS
 ]
 
 # 名字级别的强信号：只认**刚启动**的实例（本机常驻服务/常驻被控端不算）

@@ -47,6 +47,12 @@ WECHAT_PROCESS_NAMES = {"wechat.exe", "weixin.exe"}
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SW_RESTORE = 9
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# Where the per-phase timing marks go. Machine-specific by nature (it is read by
+# an operator on that box), so both the root and the file are configurable
+# instead of literals - and the fallback is stated once, in one place.
+QUEUE_ROOT = Path(os.environ.get("CYBERBOSS_QUEUE_ROOT") or r"C:\ProgramData\cwin-probe")
+TIMING_LOG = os.environ.get("CYBERBOSS_WEFLOW_UIA_TIMING_LOG") or str(QUEUE_ROOT / "bridge-timing.log")
+
 DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 MIN_CANARY_DESKTOP_IDLE_SECONDS = 300
@@ -3029,7 +3035,7 @@ def _send_timing_log(mark: str, started: float | None) -> None:
         return
     try:
         elapsed = int((time.monotonic() - started) * 1000)
-        with open(r"C:\ProgramData\cwin-probe\bridge-timing.log", "a", encoding="utf-8") as handle:
+        with open(TIMING_LOG, "a", encoding="utf-8") as handle:
             handle.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {mark} {elapsed}ms\n")
     except OSError:
         pass
@@ -3046,7 +3052,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if started is not None and "/api/send" in str(getattr(self, "path", "")):
             elapsed_ms = int((time.monotonic() - started) * 1000)
             try:
-                with open(r"C:\ProgramData\cwin-probe\bridge-timing.log", "a", encoding="utf-8") as handle:
+                with open(TIMING_LOG, "a", encoding="utf-8") as handle:
                     handle.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] send took {elapsed_ms}ms\n")
             except OSError:
                 pass

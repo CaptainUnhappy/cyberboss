@@ -1,6 +1,7 @@
 # rdp-autologin.py —— 自动完成 loopback RDP 登录：处理证书警告框 / 凭据框 / 错误框，并等待探针证据文件
 import os, sys, time, ctypes, subprocess
 from ctypes import wintypes
+from pathlib import Path
 import win32gui, win32process, win32con
 from PIL import Image
 
@@ -62,14 +63,31 @@ def kill_by_name(name):
             kernel32.CloseHandle(handle)
     return killed
 
-RDP   = r'D:\Projects\cyberboss\tmp\session0-probe\connect-cwinprobe.rdp'
-EV    = r'C:\ProgramData\cwin-probe\evidence-rdp.txt'
-DN    = r'C:\ProgramData\cwin-probe\done-rdp.txt'
-ER    = r'C:\ProgramData\cwin-probe\probe-error.txt'
-LOGP  = r'D:\Projects\cyberboss\tmp\cwin-lab\rdp-autologin.log'
-SHOT  = r'D:\Projects\cyberboss\tmp\cwin-lab\rdp-error.png'
-PW    = 'CwinProbe#2026'
+# Every machine binding in one place, so the fallback is stated once instead of
+# repeated in six path expressions. `CYBERBOSS_QUEUE_ROOT` is the documented knob.
+QUEUE_ROOT = Path(os.environ.get('CYBERBOSS_QUEUE_ROOT') or r'C:\ProgramData\cwin-probe')
+LOG_DIR = Path(os.environ.get('CYBERBOSS_LOG_DIR') or QUEUE_ROOT / 'logs')
+
+RDP   = os.environ.get('CYBERBOSS_RDP_FILE') or str(QUEUE_ROOT / 'connect-cwinprobe.rdp')
+EV    = str(QUEUE_ROOT / 'evidence-rdp.txt')
+DN    = str(QUEUE_ROOT / 'done-rdp.txt')
+ER    = str(QUEUE_ROOT / 'probe-error.txt')
+LOGP  = str(LOG_DIR / 'rdp-autologin.log')
+SHOT  = str(LOG_DIR / 'rdp-error.png')
+# The isolated account's password is a SECRET, not a constant. It used to be a
+# literal here, which meant shipping a working credential with the source; a
+# missing value now fails loudly instead of silently attempting an empty login.
+PW    = os.environ.get('CYBERBOSS_ISOLATED_ACCOUNT_PASSWORD') or ''
 DEADLINE = float(sys.argv[1]) if len(sys.argv) > 1 else 130.0
+
+# Fail before touching the desktop: an empty password means every credential
+# dialog is answered with nothing, and the failure would surface minutes later
+# as "the reconnect did not work".
+if not PW and os.environ.get('CYBERBOSS_RDP_ALLOW_EMPTY_PASSWORD') != '1':
+    print('CYBERBOSS_ISOLATED_ACCOUNT_PASSWORD is required (the isolated Windows '
+          'account password). Set CYBERBOSS_RDP_ALLOW_EMPTY_PASSWORD=1 only for an '
+          'account that genuinely has no password.', flush=True)
+    sys.exit(2)
 
 buf = []
 def L(m):

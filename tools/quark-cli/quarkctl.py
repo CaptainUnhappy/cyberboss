@@ -116,6 +116,11 @@ MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_MOVE = 0x0001
 
+# Where the Quark desktop client is installed is a per-machine fact, so it is
+# configuration: CYBERBOSS_QUARK_EXE wins, and the historical location is only
+# the fallback. A committed literal here made `restart` unusable elsewhere.
+DEFAULT_CLIENT_EXE = os.environ.get("CYBERBOSS_QUARK_EXE") or r"D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe"
+
 
 # ---------------------------------------------------------------- logging
 
@@ -1275,7 +1280,8 @@ def build_parser():
     s.set_defaults(func=cmd_wheel)
 
     s = sub.add_parser("restart", help="restart the client, optionally with a DevTools port")
-    s.add_argument("--exe", default=r"D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe")
+    # Per-machine install path: environment first, then the historical default.
+    s.add_argument("--exe", default=DEFAULT_CLIENT_EXE)
     s.add_argument("--debug-port", type=int, default=0)
     s.add_argument("--url", default=None)
     s.add_argument("--wait", type=float, default=25.0)

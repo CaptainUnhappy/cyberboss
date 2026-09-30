@@ -7,11 +7,20 @@ rem   quark-share-save.cmd <share-url> [name-filter] [--enter <folder>] [--only]
 rem Example:
 rem   quark-share-save.cmd "https://pan.quark.cn/s/3a7aac9d4f7c#/list/share" ".pdf" --enter 跨境电商 --only
 setlocal enabledelayedexpansion
-set EXE=D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe
+rem The client path is a per-machine fact: CYBERBOSS_QUARK_EXE wins, then the
+rem historical install location. It used to be a literal, which made this recipe
+rem unusable on any other machine and leaked one box's layout into the repo.
+set "EXE=%CYBERBOSS_QUARK_EXE%"
+if not defined EXE if exist "D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe" set "EXE=D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe"
 set OPS=%~dp0..\cdp-ops.js
 set URL=%~1
 set FILTER=%~2
 if "%FILTER%"=="" set FILTER=.pdf
+
+if not defined EXE (
+  echo quark-share-save: set CYBERBOSS_QUARK_EXE to quark_cloud_drive.exe
+  exit /b 2
+)
 
 if "%URL%"=="" (
   echo usage: quark-share-save.cmd ^<share-url^> [name-filter] [--enter folder] [--only]
