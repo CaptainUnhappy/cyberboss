@@ -251,6 +251,39 @@ What these do:
 - `CYBERBOSS_LOCATION_BATTERY_HISTORY_LIMIT`
   Number of battery observations to retain. Default is `100`.
 
+#### Operational overrides (only if your machine differs)
+
+Everything below already has a working default derived from the checkout location, so an ordinary
+install never sets them. They exist so a second machine, another drive, or a different interpreter
+does not require editing source. **The only hardcoded paths left in the repository are these
+fallbacks**, and `npm run verify-portable` enforces that.
+
+| Variable | Used by | Default |
+|---|---|---|
+| `CYBERBOSS_REPO_ROOT` | isolated-session recipes | two levels above the recipe |
+| `CYBERBOSS_QUEUE_ROOT` | file-queue recipes, guards, probe root | `C:\ProgramData\cwin-probe` |
+| `CYBERBOSS_PYTHON` / `CYBERBOSS_PYTHONW` | bridge + resident recipes | the interpreter running the recipe |
+| `CYBERBOSS_NODE_EXE` | `bot-direct.cmd`, `s1-restack.ps1` | `node` from `PATH` |
+| `CYBERBOSS_WECHAT_EXE` | WeChat restart recipes | `%ProgramFiles%\Tencent\Weixin\Weixin.exe` |
+| `CYBERBOSS_ISOLATED_ACCOUNT_PASSWORD` | `rdp-autologin.py` | **none — the recipe refuses to run without it** |
+| `CYBERBOSS_RDP_FILE` | `rdp-autologin.py` | `<queue root>\connect-cwinprobe.rdp` |
+| `CYBERBOSS_LOG_DIR` | `rdp-autologin.py`, keepalive | `<queue root>\logs` |
+| `CYBERBOSS_WEFLOW_UIA_TIMING_LOG` | `scripts/weflow-uia-bridge.py` | `<queue root>\bridge-timing.log` |
+| `CYBERBOSS_TODESK_LOG_DIR` / `CYBERBOSS_GAMEVIEWER_LOG_DIR` | remote-control guard | `D:\Program Files\ToDesk\Logs`, `C:\Program Files\GameViewer\Logs` |
+| `CYBERBOSS_QUARK_EXE` | `tools/quark-cli` | `D:\Tools\QuarkCloudDrive\quark_cloud_drive.exe` |
+
+Rebuilding the Windows task set on a new machine:
+
+```powershell
+python scripts/isolated-session/register-tasks.py --show     # read back, change nothing
+python scripts/isolated-session/register-tasks.py            # register/update all 11 tasks
+python scripts/isolated-session/register-tasks.py --dry-run  # print the XML instead
+```
+
+It registers through `Schedule.Service` COM rather than `schtasks.exe`: this host hands console
+creation to Windows Terminal, so a console child would flash a terminal window on the user's own
+desktop. Registration needs no administrator rights (`InteractiveToken` + least privilege).
+
 Why this matters:
 
 - the first `cyberboss` command auto-generates `~/.cyberboss/weixin-instructions.md`

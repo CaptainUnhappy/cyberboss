@@ -25,6 +25,14 @@ Status: proposed
 - 文档里没有 Windows 的 headless / 虚拟显示 / 分辨率配置页（`headless` 页 404），源码里也没有对应组件。也就是说 **"Windows 上没有虚拟显示"是文档 + 源码双重缺席**，属于强否定证据。
 - 唯一真正的"独立桌面"是 **guest VM**：`Image.windows()`（Server 2022，本地走 Hyper-V → Docker 包 QEMU → 裸 QEMU）与 `libs/qemu-docker/windows`（Windows 11 Enterprise **eval**，8G/8 核/30G，:5000 `computer-server`、:8006 noVNC）。这与 RDPWrap 是**同一类东西的另一种实现**（造一个别人的桌面），不是替代品。
 
+**本机实测（2026-09-30，比文档更硬的一条）**：这台机器上 Cua Driver 早就装着并在跑 —— `C:\Users\79388\.cua-driver\packages\releases\0.3.2-x86_64-pc-windows-msvc\cua-driver.exe`，进程 13664 自 09-24 常驻，另有登录任务 `cua-driver-serve`。只读调用直接印证了上面的结构性结论：
+
+- `cua-driver status` → `daemon is running`，socket = `\\.\pipe\cua-driver`（**同 SID 的命名管道**：与双账号结构冲突这条是实打实的）。
+- `cua-driver call list_windows` → **38 个窗口，全部属于 session 1**（Chrome / ToDesk / GameViewer / 任务管理器…）。
+- 同一时刻 `Get-Process Weixin` → **6 个进程全在 session 3**、`MainWindowHandle = 0`；Cua 的窗口列表里**没有任何微信窗口**，`list_apps` 里也**没有 Weixin**。
+
+也就是说：**Cua 看不到它需要驱动的那个窗口**。RDPWrap 造的隔离会话对 Cua 不是"可替代"，而是"前提" —— 要让它够到微信，就得在隔离会话里再起一个 daemon，而那条路又卡在命名管道跨账号与 `type_text` / RDP 两个未知上（见 §2）。这是**一次可复现的现场测量**而非推测，所以 §4 第 1 条（不动驱动面）在本机属于**已验证**，而不是"暂时不动"。
+
 换句话说：**Cua Driver 与 RDPWrap 不是竞争关系。** RDPWrap 解决"没有第二个桌面"，Cua Driver 解决"在已有桌面上操作得更讲卫生"。现状的 RDPWrap 会话对 Cua Driver 而言恰好是它需要的前提。
 
 ### 2. 即便把 Cua Driver 装进现有隔离会话，也有两个 veto 级未知
