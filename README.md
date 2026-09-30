@@ -102,16 +102,33 @@ Cyberboss assumes none of that. It treats the user as someone who may drift, dis
 
 ### Requirements
 
+**Core (always needed)**
+
 - Node.js `>= 22`
-- `codex` or `claude` installed locally
+- An agent runtime: `codex` or `claude` on your `PATH` (or `dsh`, see `CYBERBOSS_RUNTIME`)
 - Chrome / Chromium / Edge if you want screenshot features
+- Python `>= 3.11` **only if** you enable the personal-account channel (see below)
+
+**Message channels: pick one or both**
+
+Cyberboss can talk to you through two independent channels. They have very different requirements, and neither is a prerequisite for the other.
+
+| | `ilink` — official WeChat bot API | `weflow-uia` — personal WeChat account |
+|---|---|---|
+| How it works | HTTPS to `ilinkai.weixin.qq.com` | Local UI automation of the WeChat desktop client |
+| Needs | A paired bot account (`npm run login`) | **Windows host only**: WeChat desktop client, [WeFlow](https://github.com/WenXiaoWendy) local reader API, Python with the automation deps below, and an input desktop the bridge may drive |
+| Can start a conversation | No — every outbound reply consumes the `context_token` carried by an inbound message | Yes — there is no reply window, so the bot may send proactively |
+| Login | QR pairing once | WeChat stays logged in on that machine |
+| Extra setup | none | see [Personal-account channel](#personal-account-channel-weflow-uia) |
+
+If you only run the official channel, a plain Linux/macOS box with Node is enough. The personal-account channel is the part that ties you to a Windows desktop.
 
 ### Get the source and install dependencies
 
-This project is not published as an npm package. Clone the repo and install inside the project directory:
+This project is not published as an npm package. Clone your fork and install inside the project directory:
 
 ```bash
-git clone https://github.com/WenXiaoWendy/cyberboss.git
+git clone https://github.com/<you>/cyberboss.git
 cd cyberboss
 npm install
 ```
@@ -260,6 +277,75 @@ Build that file from your existing Codex model catalog and add entries for your 
 
 When `CYBERBOSS_RUNTIME=claudecode`, Cyberboss also upserts a workspace-local `.mcp.json` entry for `cyberboss_tools` before starting Claude, and launches Claude with that MCP config explicitly attached. That is how Claude discovers the Cyberboss project tools without any global registration.
 
+### Personal-account channel (`weflow-uia`)
+
+This channel sends by driving the WeChat desktop client through Windows UI Automation, and reads by querying a local WeFlow instance that indexes that client's message database. It is the only way to let the bot *start* a conversation, and it is also the most machine-bound part of the project — read this section before you enable it.
+
+**What it needs**
+
+1. **Windows host with an interactive desktop session.** The bridge activates the WeChat window and injects input, so it must run where a real input desktop exists. A service session (Session 0) cannot do it.
+2. **A logged-in WeChat desktop client** on that machine, for the account the bot should speak as. Use a dedicated account, not your main one.
+3. **A local WeFlow instance installed and answering on loopback**, exposing `/api/v1/health` and `/api/v1/messages` with a bearer token. The bot's read side is entirely this API. (WeFlow is a separate local app that indexes the WeChat desktop message database; it is not part of this repository.)
+4. **Python 3.11+ with `pyperclip`, `uiautomation`, `pywin32` (`win32clipboard`), `Pillow`** — these are what `scripts/weflow-uia-bridge.py` imports. On this project's reference machine: `python -m pip install pyperclip uiautomation pywin32 pillow`.
+5. **A writer bridge on `127.0.0.1`** (`CYBERBOSS_WEFLOW_BRIDGE_BASE_URL`). `npm run shared:start` starts `scripts/weflow-uia-bridge.py` for you when the channel is enabled and the interpreter is right; you can also run that file yourself.
+
+**Why you may want to isolate it**
+
+By default the bridge drives the desktop you are using, which means the bot can steal focus and the cursor while it sends. This project's reference deployment avoids that by running the WeChat client, WeFlow, and the bridge inside a *separate Windows interactive session* (a second Windows account plus a loopback RDP session), so the user's own desktop is never touched. That arrangement has its own hard constraints and is documented in [`docs/`](./docs) and `.agents/notes/implemented/process/2026-09-18-rdpwrap-isolated-session-deployment.md`; the helper recipes live in `scripts/isolated-session/`. **You do not need it to try the channel** — but if you dislike losing focus, plan for it.
+
+**Enable it**
+
+```dotenv
+CYBERBOSS_ENABLE_WEFLOW_INBOX=true
+CYBERBOSS_WEFLOW_TOKEN=<the same token your WeFlow instance requires>
+CYBERBOSS_WEFLOW_BASE_URL=http://127.0.0.1:5051
+CYBERBOSS_WEFLOW_BRIDGE_BASE_URL=http://127.0.0.1:8766
+CYBERBOSS_WEFLOW_INBOX_CHATS=wxid_you,wxid_someone_else
+CYBERBOSS_WEFLOW_INBOX_DISPLAY_NAME=you
+# optional: interpreter for the bridge when `python` is not the right one
+CYBERBOSS_WEFLOW_UIA_PYTHON=C:\path\to\python.exe
+```
+
+**Verify it without sending anything**
+
+```bash
+npm run doctor
+```
+
+`doctor` probes each channel read-only and exits non-zero if an enabled channel is not ready:
+
+```json
+{ "channel": "weflow-uia", "enabled": true, "ready": true, "reason": "", "detail": "reader=ok writer=ready foreground=1639902 desktopIdleSeconds=362" }
+{ "channel": "ilink",      "enabled": true, "ready": true, "reason": "", "detail": "getconfig ok (read-only session check)" }
+```
+
+Common `reason` values and what they mean:
+
+| `reason` | Meaning |
+|---|---|
+| `disabled` | the channel is not configured in this process (some `CYBERBOSS_WEFLOW_*` key is missing) |
+| `reader-unreachable` / `reader-unhealthy` | WeFlow is not running, or not on `CYBERBOSS_WEFLOW_BASE_URL` |
+| `reader-messages-failed` | WeFlow answers `/health` but its message query fails — the bot reads nothing. `-105` in the detail means the WCDB anchor state needs rebuilding, and a restart will not fix it |
+| `writer-unreachable` / `writer-not-ready` | the bridge is down, or it cannot see a logged-in WeChat main window |
+| `writer-desktop-unavailable` | the session lost its input desktop (typically a minimized/disconnected remote desktop client) |
+| `no-paired-account` | the official channel has no saved account: run `npm run login` |
+| `stale-token` | the official bot token looks stale; re-run `npm run login` |
+
+Probing both channels is the default; `CYBERBOSS_ENABLED_CHANNELS=ilink` (or `weflow-uia`) narrows it when you are debugging one side. It is a debugging switch, not a required setting.
+
+### Migrating an existing install to another machine
+
+```bash
+npm run migrate:list                       # what is unreproducible, what is just cache
+npm run migrate:export -- --to E:\cb-migrate
+# ... on the new machine, after clone + npm install:
+npm run migrate:verify -- E:\cb-migrate    # sha256 check first
+npm run migrate:import -- --from E:\cb-migrate
+npm run doctor                             # exit code 0 == every enabled channel is ready
+```
+
+The exporter never includes `.env`; `accounts/*context-tokens.json` (a live bearer token for the official channel) is excluded unless you pass `--with-credentials`. Absolute workspace paths stored inside the runtime's thread bindings are rewritten on import. Full checklist, including what must be done by hand: [`docs/migrate-device.md`](./docs/migrate-device.md).
+
 ### Terminal commands for end users
 
 - `npm run login`
@@ -273,9 +359,15 @@ When `CYBERBOSS_RUNTIME=claudecode`, Cyberboss also upserts a workspace-local `.
 - `npm run shared:status`
   Check the shared runtime process, shared bridge, and `readyz`
 - `npm run doctor`
-  Inspect current config, channel/runtime boundaries, and thread status
+  Print the resolved config **and** a read-only readiness verdict for every enabled channel. Exit code 0 means every enabled channel can deliver; it never sends a message
 - `npm run help`
   Show stable command entrypoints
+- `npm run migrate:list` / `migrate:export` / `migrate:verify` / `migrate:import`
+  Move the unreproducible state to another machine; see [Migrating an existing install](#migrating-an-existing-install-to-another-machine)
+- `npm run verify-portable` / `npm run verify-portable:list`
+  Static gate: no new machine-specific absolute paths in the code trees (known ones are baselined in `scripts/portable-baseline.json`)
+- `npm run test:doctor` / `npm run test:migrate`
+  Offline tests for the channel probes and the migration tool
 
 Here, `checkin` means the random wake-up mechanism, not a fixed periodic reminder.
 
