@@ -85,19 +85,28 @@ function normalizeSystemMessage(message) {
   const workspaceRoot = normalizeText(message.workspaceRoot);
   const text = normalizeText(message.text);
   const createdAt = normalizeIsoTime(message.createdAt);
+  // Optional reply route. A trigger without one keeps the historical shape exactly
+  // (the dispatcher then falls back to `senderId` + the official bot channel); a
+  // trigger that carries `chatId: "weflow:<talker>"` + `provider: "weflow-uia"` is
+  // delivered over the personal-account bridge, which has no reply window.
+  const chatId = normalizeText(message.chatId);
+  const provider = normalizeText(message.provider);
 
   if (!id || !accountId || !senderId || !workspaceRoot || !text) {
     return null;
   }
 
-  return {
-    id,
-    accountId,
-    senderId,
-    workspaceRoot,
-    text,
-    createdAt: createdAt || new Date().toISOString(),
-  };
+  const normalized = { id, accountId, senderId };
+  if (chatId) {
+    normalized.chatId = chatId;
+  }
+  if (provider) {
+    normalized.provider = provider;
+  }
+  normalized.workspaceRoot = workspaceRoot;
+  normalized.text = text;
+  normalized.createdAt = createdAt || new Date().toISOString();
+  return normalized;
 }
 
 function normalizeIsoTime(value) {

@@ -36,11 +36,21 @@ class SystemMessageDispatcher {
   }
 
   buildPreparedMessage(message, contextToken = "") {
+    // A trigger may carry its own reply route. Without one it stays exactly as
+    // before: `provider: "system"` + `chatId = senderId`, which the adapter sends
+    // over the official bot channel — a channel that can only reply inside a window
+    // opened by an inbound message, so a check-in fired while the user is silent is
+    // refused (`ret=-2 prepare failed`) and parked in the deferred queue. With
+    // `provider: "weflow-uia"` + `chatId: "weflow:<talker>"` the same trigger goes
+    // over the personal-account bridge, which has no reply window, and it rejoins
+    // that chat's session because the conversation key is derived from `chatId`.
+    const replyProvider = normalizeText(message?.provider) || "system";
+    const replyChatId = normalizeText(message?.chatId) || normalizeText(message?.senderId);
     return {
-      provider: "system",
+      provider: replyProvider,
       workspaceId: this.config.workspaceId,
       accountId: this.accountId,
-      chatId: message.senderId,
+      chatId: replyChatId,
       threadKey: `system:${message.senderId}`,
       senderId: message.senderId,
       messageId: message.id,

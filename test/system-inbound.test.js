@@ -5,6 +5,9 @@ const os = require("os");
 const path = require("path");
 
 const { CyberbossApp } = require("../src/core/app");
+const { SystemMessageDispatcher } = require("../src/core/system-message-dispatcher");
+const { SystemMessageQueueStore } = require("../src/core/system-message-queue-store");
+const { resolveCheckinReplyRoute } = require("../src/app/system-checkin-poller");
 const {
   assembleRuntimeTurnText,
   buildImplicitReferencedPrepared,
@@ -1138,4 +1141,121 @@ test("location leave_home trigger and major move both enqueue system action mess
   assert.equal(queued[0].text, "User leaves home.");
   assert.equal(queued[1].id, "location-move:move-1");
   assert.match(queued[1].text, /location appears to have changed significantly/i);
+});
+test("the system queue persists an optional personal-account reply route", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-system-queue-"));
+  const filePath = path.join(dir, "system-message-queue.json");
+  const store = new SystemMessageQueueStore({ filePath });
+  store.enqueue({
+    id: "routed",
+    accountId: "account-1",
+    senderId: "platform-user@im.wechat",
+    chatId: "weflow:wxid-chat",
+    provider: "weflow-uia",
+    workspaceRoot: "/workspace",
+    text: "check-in",
+    createdAt: "2026-09-30T09:31:00.000Z",
+  });
+  store.enqueue({
+    id: "unrouted",
+    accountId: "account-1",
+    senderId: "platform-user@im.wechat",
+    workspaceRoot: "/workspace",
+    text: "check-in",
+    createdAt: "2026-09-30T09:32:00.000Z",
+  });
+
+  const drained = new SystemMessageQueueStore({ filePath }).drainForAccount("account-1");
+  assert.equal(drained.length, 2);
+  assert.equal(drained[0].chatId, "weflow:wxid-chat");
+  assert.equal(drained[0].provider, "weflow-uia");
+  // No route means no extra keys at all, so an old queue file stays byte-identical.
+  assert.equal("chatId" in drained[1], false);
+  assert.equal("provider" in drained[1], false);
+});
+
+test("a system trigger keeps the reply route it was queued with", () => {
+  const dispatcher = new SystemMessageDispatcher({
+    queueStore: null,
+    config: { workspaceId: "default" },
+    accountId: "account-1",
+  });
+  const base = {
+    id: "checkin-1",
+    accountId: "account-1",
+    senderId: "platform-user@im.wechat",
+    workspaceRoot: "/workspace",
+    text: "check-in",
+    createdAt: "2026-09-30T09:31:00.000Z",
+  };
+
+  const routed = dispatcher.buildPreparedMessage({
+    ...base,
+    chatId: "weflow:wxid-chat",
+    provider: "weflow-uia",
+  }, "ctx-1");
+  assert.equal(routed.provider, "weflow-uia");
+  assert.equal(routed.chatId, "weflow:wxid-chat");
+  assert.equal(routed.senderId, "platform-user@im.wechat");
+  assert.equal(routed.contextToken, "ctx-1");
+
+  const unrouted = dispatcher.buildPreparedMessage(base, "");
+  assert.equal(unrouted.provider, "system");
+  assert.equal(unrouted.chatId, "platform-user@im.wechat");
+});
+
+test("a routed system trigger reaches the turn with its route intact", async () => {
+  let captured = null;
+  const dispatcher = new SystemMessageDispatcher({
+    queueStore: null,
+    config: { workspaceId: "default" },
+    accountId: "account-1",
+  });
+  const dispatched = await CyberbossApp.prototype.dispatchSystemMessage.call({
+    channelAdapter: {
+      getKnownContextTokens() {
+        return {};
+      },
+    },
+    systemMessageDispatcher: dispatcher,
+    runtimeAdapter: {
+      getSessionStore() {
+        return { buildBindingKey: () => "binding-1" };
+      },
+    },
+    isTurnDispatchBlocked() {
+      return false;
+    },
+    async dispatchPreparedTurn(payload) {
+      captured = payload;
+      return true;
+    },
+  }, {
+    id: "checkin-1",
+    accountId: "account-1",
+    senderId: "platform-user@im.wechat",
+    chatId: "weflow:wxid-chat",
+    provider: "weflow-uia",
+    workspaceRoot: "/workspace",
+    text: "check-in",
+    createdAt: "2026-09-30T09:31:00.000Z",
+  });
+
+  assert.equal(dispatched, true);
+  assert.equal(captured.prepared.provider, "weflow-uia");
+  assert.equal(captured.prepared.chatId, "weflow:wxid-chat");
+});
+
+test("the check-in reply route only accepts a personal-account chat", () => {
+  assert.deepEqual(resolveCheckinReplyRoute({}), { chatId: "", provider: "" });
+  assert.deepEqual(
+    resolveCheckinReplyRoute({ CYBERBOSS_CHECKIN_CHAT: " weflow:wxid-chat " }),
+    { chatId: "weflow:wxid-chat", provider: "weflow-uia" },
+  );
+  // A route that cannot leave the official channel is refused instead of silently
+  // falling back to the channel that needs a reply window.
+  assert.throws(
+    () => resolveCheckinReplyRoute({ CYBERBOSS_CHECKIN_CHAT: "o9cq@im.wechat" }),
+    /weflow:/,
+  );
 });

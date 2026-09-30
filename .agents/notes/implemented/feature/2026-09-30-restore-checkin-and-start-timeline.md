@@ -39,12 +39,10 @@ return enabled === true || hasArgFlag(argv, "--checkin");
 
 **未通过的一半（见下节）**：第一条主动消息"今天过得咋样"被 agent 生成了，但**没有送达** —— 官方通道返回 `sendMessage ret=-2 errmsg=prepare failed`（= 缺有效 `context_token`），已进 `deferred-system-replies.json` 重试（实测 4 次退避后仍在队列，`exhausted=false`），要等用户下次开口时的"下一次入站补发"路径才可能出去。
 
-## 两个未修的发现
+## 首轮验证暴露的两个缺口（当日已修其一）
 
-1. **系统触发的投递只走官方通道，而它需要回复窗口。** `SystemMessageDispatcher.buildPreparedMessage`（`src/core/system-message-dispatcher.js:38`）把 `provider` 固定为 `"system"`、`chatId` 取 `senderId`（= 官方 bot openid）。而 `src/adapters/channel/weixin/index.js:97` 只有 `provider === "weflow-uia"` 才走个人号桥（无窗口限制），否则一律走官方通道 + `contextToken`。`context_token` 只能由入站消息产生（见 [iLink 实测契约](../architecture/2026-09-30-ilink-bot-api-observed-contract.md)），所以用户不开口时主动消息发不出去 —— 本次实测就是 42 分钟前的旧 token 直接 `ret=-2`。
-2. **系统触发解析到陈旧工作区，并自成会话。** `resolveConversationKeyForSource`（`app.js:4237`）取 `chatId`，系统触发的 `chatId = senderId` ⇒ 它是**独立会话**（本次实测新建 `52ee56a6-…`），拿不到用户的聊天上下文；`runSystemCheckinPoller` 还用 `SessionStore({filePath: config.sessionsFile})`（codex 时代的 `sessions.json`）解析目标，那里该 binding 的 `activeWorkspaceRoot` 停在 `D:/Projects/cyberboss/user/Unhappy`（DSH 时代的 `dsh-sessions.json` 写的是 `user/cyberboss`）。两个因素叠加的结果就是那条不具体的"今天过得咋样"。
-
-改法（把系统触发带上个人号聊天路由）已写成提案：[系统触发应落在用户自己的会话与投递路由](../../proposed/bug-fix/2026-09-30-system-trigger-personal-account-route.md)。
+1. **系统触发的投递只走官方通道，而它需要回复窗口。** `SystemMessageDispatcher.buildPreparedMessage`（`src/core/system-message-dispatcher.js:38`）把 `provider` 固定为 `"system"`、`chatId` 取 `senderId`（= 官方 bot openid）。而 `src/adapters/channel/weixin/index.js:97` 只有 `provider === "weflow-uia"` 才走个人号桥（无窗口限制），否则一律走官方通道 + `contextToken`。`context_token` 只能由入站消息产生（见 [iLink 实测契约](../architecture/2026-09-30-ilink-bot-api-observed-contract.md)），所以用户不开口时主动消息发不出去 —— 首轮实测就是 42 分钟前的旧 token 直接 `ret=-2`。**已修**：系统触发可以携带自己的投递路由（`chatId: "weflow:<talker>"` + `provider: "weflow-uia"`），check-in 由 `CYBERBOSS_CHECKIN_CHAT` 配置；次日实测 `localId=422 verified`，`deferred-system-replies.json` 保持空。见 [系统触发带上个人号聊天路由](../bug-fix/2026-09-30-system-trigger-personal-account-route.md)。
+2. **系统触发解析到陈旧工作区，并自成会话。** `resolveConversationKeyForSource`（`app.js:4237`）取 `chatId`，而系统触发的 `chatId = senderId` ⇒ 它是**独立会话**，拿不到用户的聊天上下文；`runSystemCheckinPoller` 还用 `SessionStore({filePath: config.sessionsFile})`（codex 时代的 `sessions.json`）解析目标，那里该 binding 的 `activeWorkspaceRoot` 停在 `D:/Projects/cyberboss/user/Unhappy`。**部分已修**：check-in 现在带 `chatId = weflow:<talker>` ⇒ 会话键变成用户窗口（实测 `dsh-acp resumed session d6a60ead-… for window weflow:wxid_ubo0cy5xh4px22`），工作区用 `CYBERBOSS_CHECKIN_WORKSPACE` 钉到 `user/cyberboss`；**遗留**：legacy `sessions.json` 仍是 poller 与 project tooling 的默认解析源（见上面那篇的 Decision 第 5 条，未实施）。
 
 ## Alternatives considered
 
@@ -57,5 +55,5 @@ return enabled === true || hasArgFlag(argv, "--checkin");
 ## Consequences
 
 - **收益**：主动唤醒重新成为可观察的事实（poller 日志 + `checkin queued` + 回合完成时间三处可查）；时间轴从演示数据切到真实数据（`isDemoData=false`），写入走的是机器人的生产工具路径，因此"以后能继续记"这件事有据可依；恢复流程与验证协议写成了可复现步骤。
-- **代价与已知上限**：`.env` 与 `checkin-config.json` 都在状态目录、不进版本库，换机器要重做；短区间验证期间会真的产生主动消息（本次 2 次触发、1 条待发）；**主动消息在用户不开口时仍然发不出去**（发现 1），以及系统触发仍跑在与用户聊天无关的独立会话里（发现 2）—— 这两条不修的话，"恢复唤醒"只恢复到"会醒、会想说、说不出去"。
-- **重访信号**：若用户反馈"收到了补发的今天过得咋样"或"唤醒消息太泛"，说明发现 1/2 需要按提案动手；若 `deferred-system-replies.json` 里出现 `exhausted=true` 的 check-in 条目，说明官方通道长期没有可用窗口。
+- **代价与已知上限**：`.env` 与 `checkin-config.json` 都在状态目录、不进版本库，换机器要重做；短区间验证期间会真的产生主动消息（本次 2 次触发、1 条待发）；主动消息在用户不开口时**曾经**发不出去（缺口 1，当日已修，修复后实测 `localId=422 verified`）；legacy `sessions.json` 仍是 poller 与 tooling 的默认目标解析源（缺口 2 的遗留部分），工作区靠 `CYBERBOSS_CHECKIN_WORKSPACE` 显式钉住。
+- **重访信号**：若 `deferred-system-replies.json` 里再次出现 `ret=-2` 的 check-in 条目，说明投递路由没生效或被改回官方通道；若用户反馈"唤醒消息太泛"，检查该次回合是否还落在用户窗口会话（日志 `dsh-acp resumed session … for window weflow:…`）。

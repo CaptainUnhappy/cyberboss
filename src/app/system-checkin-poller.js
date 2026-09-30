@@ -14,10 +14,19 @@ async function runSystemCheckinPoller(config) {
   const checkinConfigStore = new CheckinConfigStore({ filePath: config.checkinConfigFile });
   const sessionStore = new SessionStore({ filePath: config.sessionsFile });
   const target = resolvePollerTarget({ config, account, sessionStore });
+  const replyRoute = resolveCheckinReplyRoute();
   const defaultRange = resolveDefaultCheckinRange();
   let currentRange = checkinConfigStore.getRange(defaultRange);
 
   console.log(`[cyberboss] checkin poller ready user=${target.senderId} workspace=${target.workspaceRoot}`);
+  // Without a route a check-in can only go out over the official bot channel, whose
+  // reply window is opened by an inbound message — so a wake-up during a silent
+  // stretch is composed, refused (`ret=-2 prepare failed`) and parked in the
+  // deferred queue. With a route it goes out over the personal-account bridge.
+  console.log(
+    `[cyberboss] checkin reply route ${replyRoute.chatId || "(official bot channel)"}`
+    + ` provider=${replyRoute.provider || "system"}`
+  );
   console.log(`[cyberboss] checkin interval range ${formatRangeMinutes(currentRange)}`);
 
   while (true) {
@@ -36,6 +45,8 @@ async function runSystemCheckinPoller(config) {
       id: crypto.randomUUID(),
       accountId: account.accountId,
       senderId: target.senderId,
+      chatId: replyRoute.chatId,
+      provider: replyRoute.provider,
       workspaceRoot: target.workspaceRoot,
       text: buildCheckinTrigger(config),
       createdAt: new Date().toISOString(),
@@ -76,6 +87,33 @@ function pickRandomDelayMs(minIntervalMs, maxIntervalMs) {
   return minIntervalMs + Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1));
 }
 
+/**
+ * Where a check-in's message is delivered.
+ *
+ * `CYBERBOSS_CHECKIN_CHAT` is a personal-account chat route (`weflow:<talker>`, the
+ * same shape the WeFlow inbox puts on an inbound turn). It buys two things at once:
+ * the trigger is sent over the UIA bridge, which needs no reply window, and its
+ * conversation key becomes that chat, so the wake-up continues the user's own
+ * session instead of opening a context-free side session.
+ *
+ * Unset keeps the historical behaviour (official bot channel, `chatId = senderId`).
+ * A value that is not a `weflow:` route is refused at startup rather than silently
+ * falling back to the channel that cannot deliver it.
+ */
+function resolveCheckinReplyRoute(env = process.env) {
+  const chatId = normalizeText(env?.CYBERBOSS_CHECKIN_CHAT);
+  if (!chatId) {
+    return { chatId: "", provider: "" };
+  }
+  if (!chatId.startsWith("weflow:")) {
+    throw new Error(
+      `CYBERBOSS_CHECKIN_CHAT must be a personal-account route like weflow:wxid_xxx `
+      + `(got: ${chatId}). Leave it unset to keep using the official bot channel.`
+    );
+  }
+  return { chatId, provider: "weflow-uia" };
+}
+
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
@@ -110,4 +148,4 @@ function buildCheckinTrigger(config) {
   return INTERNAL_CHECKIN_TRIGGER_TEMPLATE.replace("%USER%", userName);
 }
 
-module.exports = { runSystemCheckinPoller };
+module.exports = { resolveCheckinReplyRoute, runSystemCheckinPoller };
