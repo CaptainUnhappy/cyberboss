@@ -30,8 +30,27 @@ Cua 通道跑通并验收（见 `implemented/feature/2026-10-01-cua-wechat-write
 5. **释放磁盘**：`C:\ProgramData\cwin-probe` 整目录删除（1,157 MB）。删之前已确认**活的 WeFlow 用的是
    `%APPDATA%\weflow`**，这份是 cwinprobe 会话自己的安装副本（最后写入 9/17），不是共用数据。
 
-技术栈里**不动的**东西：WeFlow 应用本身（用户自己的工具，只是不再是机器人的读侧）、
-`scripts/isolated-session/` 里那些已经"去机器化"的配方脚本（属于仓库，属于历史记录）。
+技术栈里**不动的**东西：WeFlow 应用本身（用户自己的工具，只是不再是机器人的读侧）。
+
+### 代码侧退场：分两阶段（2026-10-01 第四轮）
+
+用户指示"去掉旧的 RDP 方案"。按依赖图分两阶段做，避免把仓库改成半坏状态：
+
+**阶段一（已完成）**：删除 `scripts/isolated-session/`（25 个配方脚本）。依据是实测的依赖图：
+
+- `verify-notes` 只校验笔记里的**相对链接**，而这些脚本在 15 篇笔记里只是**正文提及**（反引号或
+  路径文本），没有任何 markdown 链接指向它们 —— 删掉不会让链接闸门变红（`rg '\]\([^)]*(weflow-uia-bridge|isolated-session/)'` 为空）；
+- `src/` 与 `scripts/*.js` 里没有一处 spawn/require 这些配方，唯一命中是 `doctor-probes.js` 注释里
+  引用另一篇笔记；
+- 计划任务已全部禁用并撤注册，配方没有运行期消费者。
+
+**阶段二（待做，依赖已查清）**：`scripts/weflow-uia-bridge.py`（146 KB，旧 UIA 写侧实现）+
+`test/test_weflow_uia_bridge.py`（110 KB），以及 `weflow-uia` 这条 provider。**不能只删文件**：
+`scripts/shared-common.js:466` 会 spawn 这个桥（`shared-start.js` 的服务栈），删了要让那条启动链
+一起退场（含 `test/shared-common.test.js` 的期望）；`weflow-uia` 在 27 个文件里被引用（多数是测试），
+`probeWeFlowUia` 探针也要同批删除。另外 `scripts/repair-dispatch.js` 的维修工提示词里仍列着
+`scripts/isolated-session/` 的配方路径（阶段一删掉的那些），要么改指向 `cyberboss doctor` +
+CUA 配方，要么随阶段二一起清理。
 
 ### 执行状态（2026-10-01）
 
