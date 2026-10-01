@@ -40,12 +40,19 @@ Cua 通道跑通并验收（见 `implemented/feature/2026-10-01-cua-wechat-write
 - 十二个任务里 **11 个已禁用**（含正在运行的 `cwin-s1-rdp-remote-guard` 与 `cb-restart-weflow`）。
 - 正在跑的 `rdp-remote-guard.py` 已停止（0 个进程）。
 - `C:\ProgramData\cwin-probe` 已删除，**释放 1,157 MB**。
+- **第 12 个任务（`cwin-session0-probe`）已就地失效**：它没有触发器、以 `79388 / Limited`
+  运行（不是 SYSTEM），指向 `D:\Projects\cyberboss\tmp\session0-probe\probe.ps1` —— 一个 9/17 的
+  session-0 输入桌面实验。把那个目录**改名保留**为 `session0-probe.retired-<时间戳>`（11 个文件
+  一个没删），任务的动作路径从此解析不到，即使被手动启动也无事可做。禁用任务本身仍要管理员，
+  但"让它什么也做不了"不需要。
+- 顺带发现：那个目录里的 `.rdp` 文件带 `password 51:b:…`（DPAPI 加密的口令块）——属于凭证暴露面
+  的一部分，已随目录一起离开原位。**账号口令轮换后这些块自然作废**，这也是下面那次提权值得做的
+  另一个理由。
 
 **待一次提权**（UAC 需要用户点一次"是"；第一次弹窗被取消了，没有重试）：
 
-- `cwin-session0-probe` 仍是 `Ready`（该任务以 SYSTEM 运行，禁用需要管理员令牌）。
-- `ServiceDll` 仍是 `rdpwrap.dll`。
-- `cwinprobe` 仍在 Administrators、账号仍启用。
+- `ServiceDll` 仍是 `rdpwrap.dll`（注册未撤；文件保留在 `C:\Program Files\RDP Wrapper\`）。
+- `cwinprobe` 仍在 Administrators、账号仍启用、口令仍是泄漏的那个。
 
 一条命令就能收尾（提权窗口点"是"即可）：
 
@@ -63,7 +70,10 @@ Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolic
 - 磁盘：`Test-Path C:\ProgramData\cwin-probe` → `False`（删除前统计 1,157 MB）。
 - 回滚材料：`tmp/rdp-teardown-20261001-191005/`（12 份任务 XML + ServiceDll 原值 + Administrators 快照 + 脚本副本）。
 - **Cua 通道不受影响**：退场操作之后，生产配置（`deepRead=true`、方向校验开启）下的完整回合仍然通过 ——
-  注入 `PROD-E2E-191734 请回复：生产链路正常`，机器人回 `生产链路正常，PROD-E2E-191734`。
+  注入 `PROD-E2E-191734 请回复：生产链路正常`，机器人回 `生产链路正常，PROD-E2E-191734`；
+  随后又一次 `ROUND3-195147 请回复：链路仍在` → `链路仍在，ROUND3-195147`。
+- **失效性验证**：改名之后 `Test-Path D:\Projects\cyberboss\tmp\session0-probe\probe.ps1` → `False`，
+  11 个文件全部保留在新目录下。
 
 ## Consequences
 
