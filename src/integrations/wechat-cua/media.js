@@ -1,24 +1,40 @@
-// media.js - send an image or a file through Cua, the way WeChat accepts it.
+// media.js - send a FILE through Cua, the way WeChat accepts it.
 //
-// WeChat has no "attach" API: an image or a file gets in through the clipboard
-// and Ctrl+V, then Return - the same two-step the RDP-era bridge used.
+// WeChat has no "attach" API: an attachment gets in through the clipboard and
+// Ctrl+V, then Return - the same two-step the RDP-era bridge used.
 //
-// Measured interface facts that shape this file (Cua Driver 0.31.0):
+// ## What actually works on this client
 //
-//   clipboard_write  takes text, image_path (an image), or file_path (a file URL)
-//   hotkey           with modifiers does NOT use PostMessage: it does a brief
-//                    SetForegroundWindow + SendInput, because PostMessage cannot
-//                    update the OS-wide modifier state a Win32 app reads via
-//                    GetKeyState/TranslateAccelerator. So a paste costs a
-//                    foreground swap, and the driver says so.
+// Measured 2026-10-01 on WeChat desktop with Cua Driver 0.31.0:
 //
-// Therefore a media send costs one focus steal for the conversation switch plus
-// one for the paste. That is the price of not having RDP; it is measured, not
-// assumed (scripts/cua-wechat-media-live.js reports both).
+//   clipboard_write({ file_path })   -> CF_HDROP, supported, paste lands
+//   clipboard_write({ image_path })  -> REFUSED: error_code `clipboard_unavailable`,
+//                                       supported:false. The image never reaches the
+//                                       clipboard, so no paste can ever succeed.
+//   clipboard_write({ text })        -> CF_UNICODETEXT, supported
+//   hotkey ["ctrl","v"] background   -> PostMessage; the modifier is LOST and a
+//                                       literal "v" is typed into the composer
+//   hotkey ["ctrl","v"] foreground   -> SendInput; the payload really pastes
+//
+// Three rules follow, and they are the whole point of this file:
+//
+//  1. **Paste is always foreground.** The background route is not a weaker paste,
+//     it is a different action that types the letter "v".
+//  2. **An unconfirmed paste is never sent.** A pasted file/image leaves an object
+//     in the composer, which the UIA value reports as U+FFFC; text lands as text.
+//     Anything else means the paste failed, so the composer is wiped instead of
+//     pressing Return.
+//  3. **Verification is by content, not by counting.** The conversation list
+//     scrolls: a real file send was observed while the list length *dropped* by
+//     one ("文件\ncua-file-probe.txt\n29B" replaced an older item in the window).
+//     Counting would have called that a failure.
+//
+// Known limit: **images cannot be sent through this path at all** on this build,
+// because the driver refuses to put an image on the clipboard.
 
+const path = require("node:path");
 const { CuaSession, toTarget, ensureConversation, currentConversation } = require("./client");
 const { readConversation } = require("./inbound");
-const path = require("node:path");
 
 function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -38,112 +54,94 @@ function brief(res) {
 }
 
 /**
- * Put an image or a file on the clipboard and paste it into `chatLabel`.
- *
- * ## The rule this function exists to enforce
- *
- * A paste can fail while Return still succeeds - and then the chat receives
- * whatever the keys actually were. Measured 2026-10-01: `hotkey ["ctrl","v"]`
- * was reported as "Pressed ctrl+v via PostMessage", the modifier did not take
- * effect, and a literal `v` was typed; pressing Return published that `v` into a
- * real conversation. So this function never presses Return until the paste is
- * confirmed, and it reports `ok: false` with the box contents when it is not.
- *
- * Confirmation means one of:
- *   - the paste produced a message-bubble placeholder in the conversation
- *     (`[图片]` / `[文件]` / ...), or
- *   - the message box now shows the expected text (a file path, which WeChat
- *     pastes as text before sending).
- * Anything else is a failed paste: the box is left wiped and nothing is sent.
+ * Paste a file (or a text payload) into `chatLabel` and optionally send it.
  *
  * @param {object} options
- * @param {string} [options.imagePath] absolute path to an image
- * @param {string} [options.filePath]  absolute path to any file
+ * @param {string} [options.filePath]  absolute path to the file to attach (works)
+ * @param {string} [options.imagePath] absolute path to an image (refused today)
  * @param {boolean} [options.send]     press Return after a CONFIRMED paste (default true)
- * @param {boolean} [options.foregroundPaste] accept a focus steal for the paste
- * @returns {{ok:boolean, verify:string, sent:boolean, steps:Array}}
+ * @returns {{ok:boolean, sent:boolean, verify:string, steps:Array, focusCosts:string[]}}
  */
 function sendMedia(target, chatLabel, {
-  imagePath = "",
   filePath = "",
+  imagePath = "",
   session = new CuaSession(),
   send = true,
   settleMs = 2500,
-  foregroundPaste = false,
 } = {}) {
   const steps = [];
-  if (!imagePath && !filePath) {
-    throw new Error("sendMedia needs imagePath or filePath");
-  }
   const focusCosts = [];
+  if (!filePath && !imagePath) {
+    throw new Error("sendMedia needs filePath or imagePath");
+  }
   const opened = ensureConversation(session, toTarget(target), chatLabel, { settleMs: 1800 });
   steps.push({ step: "open", ...opened });
   if (opened.cost && opened.cost !== "none") focusCosts.push(`open:${opened.cost}`);
 
-  const clipArgs = imagePath ? { image_path: imagePath } : { file_path: filePath };
-  const clipped = session.call("clipboard_write", clipArgs);
+  const payloadName = path.basename(filePath || imagePath);
+  const clipped = session.call("clipboard_write", filePath ? { file_path: filePath } : { image_path: imagePath });
   steps.push({ step: "clipboard", outcome: clipped });
-  if (clipped.__failed) {
-    return { ok: false, sent: false, verify: "could not put the payload on the clipboard", steps, focusCosts };
+  if (clipped.__failed || clipped.supported === false) {
+    return {
+      ok: false,
+      sent: false,
+      verify: imagePath
+        ? `clipboard_write refused the image (${clipped?.error_code || "unknown"}); images are not supported on this build - pass filePath instead`
+        : `clipboard_write refused the payload (${clipped?.error_code || "unknown"})`,
+      steps,
+      focusCosts,
+    };
   }
   sleep(500);
 
-  const beforeMessages = readConversation(session, toTarget(target)).length;
-
-  // Ctrl+V. On this client the driver reaches it via a foreground swap; the
-  // background route is known to lose the modifier, which is why the paste is
-  // verified instead of trusted.
-  const pasteArgs = { ...toTarget(target), keys: ["ctrl", "v"] };
-  if (foregroundPaste) pasteArgs.delivery_mode = "foreground";
-  const pasted = session.call("hotkey", pasteArgs);
-  steps.push({ step: "paste", outcome: pasted, focusCosts: [...focusCosts] });
-  if (pasted.route === "global_input" || pasted.delivery?.mode === "foreground") {
-    focusCosts.push("paste:foreground");
-  }
+  // Foreground is mandatory: the background route types a literal "v".
+  const pasted = session.call("hotkey", { ...toTarget(target), keys: ["ctrl", "v"], delivery_mode: "foreground" });
+  steps.push({ step: "paste", outcome: pasted });
+  focusCosts.push("paste:foreground");
   sleep(settleMs);
 
   // --- confirmation gate -----------------------------------------------------
-  const afterPaste = readConversation(session, toTarget(target));
-  const grew = afterPaste.length > beforeMessages;
-  const newest = afterPaste.at(-1)?.text || "";
-  const mediaBubble = /\[(图片|视频|文件|动画表情|语音|位置|链接)\]/u.test(newest);
   const box = currentConversation(session, toTarget(target)).box;
   const boxValue = String(box?.value ?? "");
-  const expectedEcho = filePath || "";
-  const pastedAsText = Boolean(expectedEcho) && boxValue.includes(path.basename(expectedEcho));
-
-  if (!grew && !mediaBubble && !pastedAsText) {
-    // Never send on an unconfirmed paste: wipe whatever the keys produced.
+  const objectPasted = boxValue.includes("\uFFFC");
+  const textPasted = !filePath && boxValue.trim().length > 0;
+  if (!objectPasted && !textPasted) {
     const junk = boxValue.trim();
-    if (junk) {
+    if (junk && box.element_token) {
       session.call("set_value", { ...toTarget(target), element_token: box.element_token, value: "" });
     }
     return {
       ok: false,
       sent: false,
-      verify: `paste not confirmed (box held ${JSON.stringify(junk.slice(0, 40))}); cleared it and sent nothing`,
+      verify: `paste not confirmed (composer held ${JSON.stringify(junk.slice(0, 40))}); cleared it and sent nothing`,
       steps,
       focusCosts,
     };
   }
 
   if (!send) {
-    return { ok: true, sent: false, verify: `paste confirmed (${mediaBubble ? "media bubble" : "box text"}), not sent (--no-send)`, steps, focusCosts };
+    return {
+      ok: true,
+      sent: false,
+      verify: `paste confirmed in the composer (${objectPasted ? "object" : "text"}), not sent (--no-send)`,
+      steps,
+      focusCosts,
+    };
   }
 
-  const sent = session.call("press_key", { ...toTarget(target), key: "return" });
+  const sent = session.call("press_key", { ...toTarget(target), element_token: box.element_token, key: "return" });
   steps.push({ step: "return", outcome: sent });
-  sleep(2000);
+  sleep(3000);
 
-  const final = readConversation(session, toTarget(target));
-  const last = final.at(-1)?.text || "";
-  const finalBox = currentConversation(session, toTarget(target)).box;
-  const boxEmpty = !String(finalBox?.value ?? "").trim();
-  const ok = boxEmpty && (final.length >= afterPaste.length);
+  const conversation = readConversation(session, toTarget(target));
+  const composerNow = String(currentConversation(session, toTarget(target)).box?.value ?? "");
+  const appeared = conversation.some((m) => m.text.includes(payloadName));
   return {
-    ok,
+    ok: appeared && !composerNow.includes("\uFFFC"),
     sent: true,
-    verify: `newest conversation item = ${JSON.stringify(last.slice(0, 40))}; box ${boxEmpty ? "empty" : "still holds text"}`,
+    verify: appeared
+      ? `conversation now carries ${JSON.stringify(payloadName)}; composer ${composerNow.trim() ? "still holds something" : "empty"}`
+      : `no bubble mentioning ${JSON.stringify(payloadName)} appeared (newest: ${JSON.stringify((conversation.at(-1)?.text || "").slice(0, 40))})`,
     steps,
     focusCosts,
   };
