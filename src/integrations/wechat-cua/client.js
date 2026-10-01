@@ -23,11 +23,46 @@
 // each `cua-driver call` is its own process - so all calls for one operation run
 // inside a single labeled session, and re-snapshot after anything that changes
 // the view.
+//
+// A labeled session also has a *lifecycle*: it can be ended (`end_session`, the
+// daemon restarting, the transport lease going away), and every later call is
+// then refused with a plain-text message on stderr:
+//
+//   session has ended; tool call 'list_windows' was rejected. Call start_session
+//   with session '<label>' to start it again, or use a new session label.
+//
+// Measured 2026-10-01 against 0.31.0: exit code 1, stdout empty, stderr carries
+// that sentence, and `start_session` on the same label answers `revived: true`.
+// Two consequences are baked into `CuaSession` below: a refusal must be *legible*
+// (it arrives on stderr, not stdout), and a long-lived session must *heal itself*
+// rather than leave the bot permanently mute.
 
 const { execFileSync } = require("node:child_process");
 
 const DRIVER = process.env.CUA_DRIVER
   || "C:\\Users\\79388\\AppData\\Local\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe";
+
+/** The driver's refusal when a call arrives for a session that is no longer live. */
+const SESSION_ENDED = /session has ended/i;
+
+/** One `cua-driver call` process. Returns stdout; throws Node's child error shape. */
+function defaultExec(driver, args, input) {
+  return execFileSync(driver, args, {
+    input,
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 128 * 1024 * 1024,
+  });
+}
+
+/** Is this failure the "your session is gone" refusal (as opposed to a bad call)? */
+function isSessionEnded(res) {
+  if (!res?.__failed) return false;
+  const text = typeof res.payload === "string"
+    ? res.payload
+    : res.payload?.refusal?.message || res.payload?.message || "";
+  return SESSION_ENDED.test(String(text));
+}
 
 /** WeChat's desktop client window class is mmui; find it by title instead. */
 const WECHAT_TITLE = /微信|Weixin|WeChat/i;
@@ -55,25 +90,56 @@ function sleep(ms) {
 }
 
 class CuaSession {
-  constructor(label) {
+  /**
+   * @param {string} [label] session label; stable labels are what make a session
+   *   revivable rather than merely replaceable.
+   * @param {{exec?: Function, driver?: string}} [options] `exec` is the process
+   *   seam, injected by tests so the recovery logic runs without a desktop.
+   */
+  constructor(label, { exec = defaultExec, driver = DRIVER } = {}) {
     this.session = label || `cyberboss-${process.pid}-${Date.now()}`;
+    this.exec = exec;
+    this.driver = driver;
+    this.revivals = 0;
   }
 
-  call(tool, args) {
+  /** One raw call. Never throws: failures come back as `{__failed, payload}`. */
+  raw(tool, args) {
     try {
-      const out = execFileSync(DRIVER, ["call", tool], {
-        input: JSON.stringify({ ...args, session: this.session }),
-        encoding: "utf8",
-        windowsHide: true,
-        maxBuffer: 128 * 1024 * 1024,
-      });
+      const out = this.exec(this.driver, ["call", tool], JSON.stringify({ ...args, session: this.session }));
       return JSON.parse(out);
     } catch (error) {
+      // stdout first (refusals are usually JSON there), then stderr - which is
+      // where the session-ended sentence lives, and dropping it made the whole
+      // class of failures indistinguishable from "the tool said nothing".
       const stdout = error.stdout ? String(error.stdout) : "";
-      let payload = stdout.trim();
+      const stderr = error.stderr ? String(error.stderr) : "";
+      let payload = stdout.trim() || stderr.trim();
       try { payload = JSON.parse(payload); } catch { /* keep raw text */ }
-      return { __failed: true, payload };
+      return { __failed: true, payload, exit: error.status ?? null };
     }
+  }
+
+  /**
+   * A call that heals the session first if it has to.
+   *
+   * Retrying is safe precisely because the driver *rejects* the call instead of
+   * executing it - a refused `type_text` typed nothing - and it happens exactly
+   * once, so a genuinely dead driver cannot turn into an unbounded retry loop.
+   */
+  call(tool, args) {
+    const res = this.raw(tool, args);
+    if (tool === "start_session" || !isSessionEnded(res)) return res;
+    this.revive();
+    return this.raw(tool, args);
+  }
+
+  /** Bring this label back to life (or create it). Returns the driver's answer. */
+  revive() {
+    const res = this.raw("start_session", { session: this.session });
+    this.revivals += 1;
+    this.revived = Boolean(res?.revived);
+    return res;
   }
 
   snapshot(target, mode = "ax") {
@@ -90,10 +156,13 @@ const isEdit = (el) => el?.role === "Edit" && !/搜索/.test(labelOf(el));
 function outcome(res) {
   if (!res) return { failed: true, reason: "no response" };
   if (res.__failed) {
+    const text = typeof res.payload === "string" ? res.payload.trim() : "";
     return {
       failed: true,
-      reason: res.payload?.refusal?.code || "refused",
-      detail: typeof res.payload === "string" ? res.payload.slice(0, 200) : res.payload?.refusal?.message,
+      reason: res.payload?.refusal?.code
+        || (text ? (SESSION_ENDED.test(text) ? "session-ended" : "driver-error") : "refused"),
+      detail: text ? text.slice(0, 200) : res.payload?.refusal?.message,
+      exit: res.exit ?? undefined,
     };
   }
   return {
@@ -231,6 +300,7 @@ module.exports = {
   ensureConversation,
   sendMessage,
   outcome,
+  isSessionEnded,
   labelOf,
   elements,
 };

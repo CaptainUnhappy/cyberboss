@@ -117,8 +117,38 @@ talker 是 wxid 而会话行按**显示名**标注，所以映射必须显式给
 
 **顺带查清的既有运维问题**：`.env` 的 `CYBERBOSS_WEFLOW_BASE_URL=http://127.0.0.1:5051`，而 WeFlow 现在监听 **5031**（`/api/v1/health` → 200）。表现为日志刷 `WeFlow push/outgoing poll failed: fetch failed` 与 deferred 补发失败。实测 `deferred-system-replies.json` **0 条**，所以没有积压误发风险；但这说明"读侧端口"与配置不一致，切换前必须对齐（或按纯 CUA 配置把 `CYBERBOSS_ENABLE_WEFLOW_INBOX=false`）。
 
+### 7. 驱动会话**有生命周期**，会悄悄死掉（2026-10-01 第九轮）
+
+不是读文档读出来的，是环境自己撞出来的：一小时前用过的标签再次调用时，驱动回了一句
+
+```
+session has ended; tool call 'list_windows' was rejected. Call start_session with
+session '<label>' to start it again, or use a new session label.
+```
+
+实测这条拒绝的形状（0.31.0）：**退出码 1、stdout 为空、这句话在 stderr 上**；对同一标签调 `start_session` 得到 `revived: true`，随后调用恢复正常。`end_session` 可复现同一状态。
+
+这暴露两个独立缺陷，都在 `CuaSession`：
+
+1. **失败不可读**：原来的 `call()` 只读 `error.stdout`，而这句话在 stderr 上 —— 于是"会话死了"和"驱动什么都没说"在日志里长得一模一样（`reason: "refused"`、`detail: undefined`）。修：先 stdout 后 stderr；`outcome()` 认这句话为 `session-ended` 并带上退出码。
+2. **会长久失声**：入站轮询的会话是**按进程**建的（`cyberboss-inbox-<pid>`），要连续跑几小时。会话一死，之后每一次调用都被拒 —— 机器人还在跑，但永远不再回消息，而且看不出为什么。修：`call()` 认出这句话后 `start_session` 一次并**重放被拒的调用一次**。
+
+重放是安全的，理由不是"重试通常没事"，而是**驱动是拒绝执行而不是执行后报错**——被拒的 `type_text` 一个字符都没打进去。且只重放一次，所以真正死掉的驱动不会变成无限重试。
+
+为了让这段逻辑能离线验证，`CuaSession` 多了 `exec` 注入缝（默认仍是 `execFileSync`），测试可以复现"退出码 1 + stdout 空 + stderr 带这句话"的真实契约。
+
 ## Verification
 
+- 离线：`test/wechat-cua-session.test.js` 6/6（活会话零重放、会话死掉后复活并**恰好重放一次**、重放再失败就放弃、参数错误不赖会话、`start_session` 不自递归、stderr 拒绝在 `outcome()` 里可读）。**反证**：把恢复分支单独删掉（保留注入缝），该套件在第二条就红 —— 说明它真的在测这个缺陷，而不是恰好一起通过。
+- 真机（`scripts/cua-wechat-session-live.js`，只读，不点击）：
+  ```
+  1. list_windows on a live session: 22 window(s)
+  2. end_session -> {"active":false,...}
+  3. after end_session, raw call -> failed=true reason=session-ended exit=1
+  4. through CuaSession.call -> 22 window(s), revivals=1, revived=true
+  5. WeChat visible after recovery: pid 12920, window 25628362
+  PASS: an ended driver session is detected, revived once, and the refused call is repeated
+  ```
 - 离线：`test/wechat-cua-client.test.js` 7/7（写侧：已打开零成本、只在后台级失败后升级且用最新 token、点了没变化不算切换、以预览行验证发送、文字没落地绝不按回车、投递≠生效、搜索框不被误认为消息框）；`test/wechat-cua-inbound.test.js` 7/7（读侧：解析、首拍不回放、回声抑制、允许名单、未读徽标、纯重排、账本防自答）。
 - 真机（`scripts/cua-wechat-loop-live.js`）：
   ```
