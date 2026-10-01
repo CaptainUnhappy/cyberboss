@@ -74,6 +74,12 @@ function readConfig() {
     startWithWechatCliInbox: mode === "start"
       && readBoolEnv("CYBERBOSS_ENABLE_WECHAT_CLI_INBOX")
       && Boolean(readTextEnv("CYBERBOSS_WECHAT_CLI_INBOX_CHAT")),
+    // RDP-free outbound: drive the WeChat desktop client on THIS session through
+    // Cua Driver instead of the UIA bridge that lives in an isolated session.
+    // Off by default: it costs one foreground click per conversation switch, so it
+    // must be a deliberate operator choice.
+    wechatCuaEnabled: readBoolEnv("CYBERBOSS_ENABLE_WECHAT_CUA"),
+    wechatCuaChatByTalker: readTextEnv("CYBERBOSS_CUA_CHAT_BY_TALKER"),
     weflowBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BASE_URL") || "http://127.0.0.1:5031",
     weflowBridgeBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BRIDGE_BASE_URL") || "http://127.0.0.1:8766",
     weflowBridgeTimeoutMs: readIntEnv("CYBERBOSS_WEFLOW_BRIDGE_TIMEOUT_MS") || 30_000,

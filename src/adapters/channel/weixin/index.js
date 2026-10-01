@@ -9,6 +9,7 @@ const { sendWeixinMediaFile } = require("./media-send");
 const { loadSyncBuffer, saveSyncBuffer } = require("./sync-buffer-store");
 const { loadWeixinConfig, saveWeixinConfig, DEFAULT_MIN_WEIXIN_CHUNK } = require("./config-store");
 const { sendWeFlowUiaImage, sendWeFlowUiaText } = require("../../../integrations/weflow-outbound");
+const { sendWeChatCuaText } = require("../../../integrations/wechat-cua/outbound");
 
 const LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_WEIXIN_CHUNK = 4000;
@@ -94,7 +95,20 @@ function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {})
       const chunkIdempotencyKey = idempotencyKey
         ? (sendChunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk:${index + 1}`)
         : "";
-      if (provider === "weflow-uia") {
+      if (provider === "wechat-cua") {
+        // RDP-free path: Cua drives this session's WeChat client directly. It
+        // returns the same vocabulary as the bridge (dispatched / verified /
+        // localId), so the ledger and the stream layer below do not need to know
+        // which driver answered.
+        lastResult = await sendWeChatCuaText(config, {
+          text: deliveryChunk,
+          talker: weflowTalker || weflowContact || userId,
+          contact: weflowContact,
+          messageKind,
+          idempotencyKey: chunkIdempotencyKey,
+          messageLedger: weflowMessageLedger,
+        });
+      } else if (provider === "weflow-uia") {
         lastResult = await sendWeFlowUiaText(config, {
           text: deliveryChunk,
           timeoutMs: messageKind === "inbound_ack" ? 5_000 : 0,

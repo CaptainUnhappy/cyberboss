@@ -1123,8 +1123,15 @@ class CyberbossApp {
     // route; it rides chatId ("weflow:<talker>"), which every prepared-message hop
     // already carries. It deliberately does not reuse the canary's replyWeflow*
     // fields - stripModelCanaryPreparedFields removes those from ordinary turns.
+    //
+    // `wechat-cua` is the RDP-free driver (see src/integrations/wechat-cua): it
+    // drives the desktop client on this session instead of a bridge living in an
+    // isolated one. Opt-in, because it costs a foreground click whenever the
+    // conversation is not already open.
     const normalized = {
-      provider: sendSource === "azzy" ? "weflow-uia" : "weixin",
+      provider: sendSource === "azzy"
+        ? (this.config.wechatCuaEnabled ? "wechat-cua" : "weflow-uia")
+        : "weixin",
       accountId: this.activeAccountId,
       workspaceId: this.config.workspaceId,
       senderId: target.userId,
