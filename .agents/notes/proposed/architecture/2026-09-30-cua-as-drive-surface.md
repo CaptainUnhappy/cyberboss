@@ -33,6 +33,44 @@ Status: proposed
 
 也就是说：**Cua 看不到它需要驱动的那个窗口**。RDPWrap 造的隔离会话对 Cua 不是"可替代"，而是"前提" —— 要让它够到微信，就得在隔离会话里再起一个 daemon，而那条路又卡在命名管道跨账号与 `type_text` / RDP 两个未知上（见 §2）。这是**一次可复现的现场测量**而非推测，所以 §4 第 1 条（不动驱动面）在本机属于**已验证**，而不是"暂时不动"。
 
+### 5. 用户要求"彻底移除 RDPWrap、改用 Cua 操作微信输入"：实测判死（2026-10-01）
+
+用户明确选择"彻底改用 Cua 操作微信输入"，于是把微信从 session 3 拆出来、搬回用户的交互桌面（session 2）重做了一遍现场实验。**读侧结论极好，输入侧结论是死的**，而且死因与微信无关：
+
+**读侧（全部只读，后台完成）**：清掉 session 3 的栈后（拆机脚本见 `scripts/isolated-session/teardown-isolated-stack.ps1`，**跨账号杀不掉进程，只能靠会话内的文件队列**），在用户桌面启动微信，Cua 的 daemon 就在同一个会话（session 2）里。结果：
+
+- 登录窗 28 个元素，语义 id 齐全（`login_layout_.login_step_layout.auto_login_step_layout.*`）。
+- 主窗口 **81 个元素**，含 **`[51] Edit "搜索" [actions=[invoke,set_value,text]]`** 与逐个可寻址的会话行 `[58] ListItem "文件传输助手"`、`[59] ListItem "Azzy"`、`[60] ListItem "柳毓琳"`（`id=session_item_*`）。
+- 所以**"找到某个人/某个会话并读它"这件事，Cua 在后台做得比现状的桥更好**。
+
+**输入侧：三种方式实测全部无效或不可用。**
+
+| 方式 | Cua 的回报 | 真实结果 |
+|---|---|---|
+| `click`（`element_index` → UIA Invoke） | `✅ Performed UIA Invoke on [11]` | 窗口毫无变化（这与本仓库 2026-09-23 的实测一致：微信 mmui 按钮的 `Invoke()` "返回成功但什么都不做"） |
+| `click`（像素 + `dispatch:"background"` → UIA hit-test 后 PostMessage） | `✅ Posted click` | 窗口毫无变化（截图与树双重确认） |
+| `type_text`（PostMessage 到搜索框） | `✅ Typed 4 char(s)` | 搜索框仍显示占位符"搜索"，会话列表 8 项未变 |
+
+**关键证据：Cua 的 `✅` 表示"投递成功"，不表示"生效"** —— 它的响应里本来就有 `effect: confirmed/unverifiable` 与 `escalation` 两个字段来区分这件事，而这三个调用都只拿到了"投递成功"。
+
+**唯一剩下的路是 `dispatch:"foreground"`，而它被 Windows 的前台锁挡住**：
+
+```
+Foreground swap to target HWND 0x50d02 was rejected by Windows (actual foreground is HWND 0x201f8).
+This daemon is not at UIAccess integrity, so SetForegroundWindow is subject to the foreground-lock
+and the swap silently fails. Fix: install / spawn the cua-driver-uia worker (UIAccess-manifested PE)
+```
+
+那条 fix 在本机也走不通：**`cua-driver-uia.exe` 需要提权**（`The requested operation requires elevation`）。也就是说 Cua 在 Windows 上的前台输入路径要求 **UIAccess 完整性 / 管理员**，而机器人的进程没有、按本项目的安全姿态也不该有。代价实测：那次尝试 1829 ms 被拒，**用户的前台窗口全程没有被抢走**（Chrome 始终在前台）。
+
+**因此这一轮的结论比 §1 更强**：
+
+1. **Cua 是更好的"眼"，不是可用的"手"。** 读侧（树 + 截图 + 会话定位）可以直接用，而且不需要隔离会话、不需要 RDP、不需要第二账号。
+2. **写侧在非提权前提下没有可用路径**：语义投递被微信丢弃，前台升级被 Windows 拒绝。这与本仓库自己的 UIA 桥形成鲜明对照 —— 桥用的是 `AttachThreadInput` + `ShowWindow` + `BringWindowToTop` + `SetForegroundWindow` 这套**不需要提权**的手法（见 [RDPWrap 隔离会话部署契约](../../implemented/process/2026-09-18-rdpwrap-isolated-session-deployment.md) 里"点掉登录窗"那段），而 Cua 0.3.2 明确不走这条路。
+3. 所以"彻底移除 RDPWrap"**不是被微信挡住的，是被 Cua 的设计选择 + Windows 前台锁挡住的**。要继续就必须接受其中一个：给 Cua 提权（安全姿态倒退），或者保留一个不需要提权的自有输入实现（那就还是本仓库的桥，只是可以搬回 session 1 并用 Cua 做读侧）。
+
+**可复现性**：本节的每条都在 2026-10-01 12:4x–12:5x 之间、同一次会话内完成；拆机前后的备份与回滚步骤在 `tmp/cutover-<时间戳>/RESTORE.md`。
+
 换句话说：**Cua Driver 与 RDPWrap 不是竞争关系。** RDPWrap 解决"没有第二个桌面"，Cua Driver 解决"在已有桌面上操作得更讲卫生"。现状的 RDPWrap 会话对 Cua Driver 而言恰好是它需要的前提。
 
 ### 2. 即便把 Cua Driver 装进现有隔离会话，也有两个 veto 级未知
