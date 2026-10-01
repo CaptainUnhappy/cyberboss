@@ -151,7 +151,9 @@ class WeChatCuaInboxSource {
     });
     // Prime immediately: the first poll establishes the baseline and must not
     // replay the whole chat list as new messages.
-    this.source.poll({ isOwnEcho: (row) => Boolean(this.ledger && this.ledger.matches(row.peer, row.preview)) });
+    this.source.poll({
+      isOwnEcho: (row, text) => Boolean(this.ledger && this.ledger.matches(row.peer, text || row.preview)),
+    });
     this.running = true;
     this.timer = setInterval(() => {
       this.pollOnce().catch((error) => {
@@ -175,8 +177,8 @@ class WeChatCuaInboxSource {
     }
     this.stats.polls += 1;
     const events = this.source.poll({
-      isOwnEcho: (row) => {
-        const suppressed = Boolean(this.ledger && this.ledger.matches(row.peer, row.preview));
+      isOwnEcho: (row, text) => {
+        const suppressed = Boolean(this.ledger && this.ledger.matches(row.peer, text || row.preview));
         if (suppressed) {
           this.stats.suppressed += 1;
         }
@@ -203,11 +205,17 @@ class WeChatCuaInboxSource {
         provider: "wechat-cua",
         chatId: `weflow:${event.peer}`,
         text: event.text,
-        // Direction is not readable on this path (see inbound.js): an observed
-        // row is treated as inbound only because our own sends are suppressed by
-        // the echo ledger above. This is the weakest link in the design and is
-        // documented rather than hidden.
-        direction: "incoming",
+        // Who sent it, as far as this path can honestly tell:
+        //   incoming        a bubble on the peer's side (or a preview we cannot judge)
+        //   outgoing        this ACCOUNT's own bubble that our ledger does not know,
+        //                   i.e. the operator typing in this account (here or on
+        //                   another signed-in device). Recorded, never answered as if
+        //                   a peer had written - see inbound.js.
+        // `directionVerified` says whether a screenshot was actually read, so a
+        // consumer can tell "the peer sent this" from "we could not tell".
+        direction: event.direction === "outgoing" ? "outgoing" : "incoming",
+        directionVerified: event.confidence === "bubble-direction",
+        origin: event.origin || "",
         contentKind: "text",
         kind: "text",
         timestamp: Math.floor(Date.now() / 1000),

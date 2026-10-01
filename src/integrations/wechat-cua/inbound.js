@@ -20,6 +20,7 @@
 // by explicit rules below rather than by hope.
 
 const { CuaSession, findWeChatWindow, elements } = require("./client");
+const { decodePng, classifyBubbleDirection, greenShare } = require("./pixels");
 
 const ROW_SPLIT = /\n+/;
 
@@ -98,7 +99,7 @@ function readRows(session, target) {
 }
 
 /**
- * The message list of the OPEN conversation, in reading order.
+ * The message list of the OPEN conversation, in reading order, with direction.
  *
  * This corrects an earlier claim of mine ("bubble text is unreadable"): it is
  * readable. Measured 2026-10-01 on WeChat desktop, the bubbles come back as wide
@@ -108,13 +109,17 @@ function readRows(session, target) {
  *   y=245 w=722 "[probe] s4 bridge after fg fix"
  *   y=451 w=722 "9月18日 11:03"          <- a timestamp, not a message
  *
- * Sorting by `y` therefore yields the conversation in order. What is NOT
- * available is direction: outgoing and incoming bubbles are both full-width
- * children of the same list, with no alignment or role distinction in the tree.
- * So the caller must treat "is this mine?" as a separate question (the ledger in
- * loop.js), never infer it from the element.
+ * Sorting by `y` therefore yields the conversation in order. The UIA tree has no
+ * direction field - measured on a real 1:1 conversation, an incoming "hi" and an
+ * outgoing "处理中" are the same full-width ListItem - so direction is read from the
+ * screenshot (`pixels.js`), which is where the client actually says it: this
+ * account's messages are green, the peer's are white.
+ *
+ * `direction` is "unknown" when the frame or screenshot is missing. That is not a
+ * synonym for "incoming": callers that must not answer themselves have to treat
+ * "unknown" as untrusted.
  */
-function readConversation(session, target, { maxItems = 40 } = {}) {
+function readConversation(session, target, { maxItems = 40, withPixels = true } = {}) {
   const snap = session.snapshot(target);
   const all = elements(snap);
   const widths = all.filter((el) => el.frame?.w > 0).map((el) => el.frame.w);
@@ -123,10 +128,28 @@ function readConversation(session, target, { maxItems = 40 } = {}) {
   }
   const widest = Math.max(...widths);
   const timeOnly = /^(\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|昨天|星期[一二三四五六日]|周[一二三四五六日]|.{0,6}\d{1,2}月\d{1,2}日.*)$/u;
+  let image = null;
+  if (withPixels && snap.screenshot_png_b64) {
+    try {
+      image = decodePng(Buffer.from(snap.screenshot_png_b64, "base64"));
+    } catch {
+      image = null; // an undecodable screenshot degrades to "unknown", never to a guess
+    }
+  }
   return all
     .filter((el) => el.role === "ListItem" && el.frame && el.frame.w > widest * 0.4)
     .sort((a, b) => a.frame.y - b.frame.y)
-    .map((el) => ({ text: String(el.label || "").trim(), y: el.frame.y, token: el.element_token }))
+    .map((el) => ({
+      text: String(el.label || "").trim(),
+      y: el.frame.y,
+      token: el.element_token,
+      // `screenshot_frame` is the same region expressed in screenshot coordinates;
+      // `frame` is absolute screen coordinates and cannot index the image directly.
+      direction: classifyBubbleDirection(image, el.screenshot_frame),
+      greenShare: el.screenshot_frame && image
+        ? Number(greenShare(image, el.screenshot_frame).toFixed(3))
+        : null,
+    }))
     .filter((item) => item.text && !timeOnly.test(item.text))
     .slice(-maxItems);
 }
@@ -167,7 +190,7 @@ class PreviewInboundSource {
     this.seen = new Map(); // peer -> digest
     this.watermarks = new Map(); // peer -> last message text read from the conversation
     this.primed = false;
-    this.stats = { polls: 0, events: 0, skippedOwnEcho: 0, skippedNotAllowed: 0, deepReads: 0 };
+    this.stats = { polls: 0, events: 0, skippedOwnEcho: 0, skippedNotAllowed: 0, deepReads: 0, selfManual: 0 };
   }
 
   /** One read, no side effects. Returns the events observed since the last call. */
@@ -202,18 +225,54 @@ class PreviewInboundSource {
         this.stats.skippedOwnEcho += 1;
         continue;
       }
-      const text = this.deepRead ? this.expand(row) : [row.preview];
-      for (const piece of text) {
+      const pieces = this.deepRead ? this.expand(row) : [{ text: row.preview, direction: "unknown" }];
+      for (const piece of pieces) {
+        const text = typeof piece === "string" ? piece : piece.text;
+        const direction = typeof piece === "string" ? "unknown" : (piece.direction || "unknown");
+        // The screenshot is the only honest answer to "did the user send this?".
+        // When it says the bubble is this account's own, the message is NOT an
+        // inbound user message - either we sent it (ledger) or the operator typed it
+        // in this account (here or on another signed-in device), which is recorded
+        // as such instead of being answered like a peer's message.
+        if (direction === "outgoing") {
+          if (isOwnEcho(row, text)) {
+            this.stats.skippedOwnEcho += 1;
+            continue;
+          }
+          events.push({
+            direction: "outgoing",
+            origin: "self_manual",
+            peer: row.peer,
+            text,
+            time: row.time,
+            unread: row.unread,
+            replyTarget: row.peer,
+            confidence: "bubble-direction",
+            source: "cua-conversation",
+          });
+          this.stats.events += 1;
+          this.stats.selfManual += 1;
+          continue;
+        }
+        if (direction === "unknown" && isOwnEcho(row, text)) {
+          // No pixels to judge by (preview-only poll, or an undecodable capture):
+          // fall back to the ledger, which is what this path did before direction
+          // existed.
+          this.stats.skippedOwnEcho += 1;
+          continue;
+        }
         events.push({
           direction: "incoming",
           peer: row.peer,
-          text: piece,
+          text,
           time: row.time,
           unread: row.unread,
           // What the loop must answer *to*: the row is the only handle a UIA
           // writer has, and WeChat labels the message box with the peer's name.
           replyTarget: row.peer,
-          confidence: row.unread > 0 ? "unread-badge" : "preview-changed",
+          confidence: direction === "incoming"
+            ? "bubble-direction"
+            : (row.unread > 0 ? "unread-badge" : "preview-changed"),
           source: this.deepRead ? "cua-conversation" : "cua-preview",
         });
         this.stats.events += 1;
@@ -229,35 +288,44 @@ class PreviewInboundSource {
    * the last one we already emitted for that peer.
    *
    * This is what stops "the user sent three things quickly" from collapsing into
-   * one preview event. It needs the conversation open, which costs one foreground
-   * click - so it only runs for a peer whose row actually changed.
+   * one preview event, and it is also the only place where direction is knowable:
+   * the chat-list preview carries no alignment, the screenshot of the conversation
+   * does. It needs the conversation open, which costs one foreground click - so it
+   * only runs for a peer whose row actually changed, and only when enabled.
    */
   expand(row) {
     if (typeof this.openConversation !== "function") {
-      return [row.preview];
+      return [{ text: row.preview, direction: "unknown" }];
     }
     let opened;
     try {
       opened = this.openConversation(this.session, this.target, row.peer);
     } catch (error) {
       this.stats.deepReads += 1;
-      return [row.preview];
+      return [{ text: row.preview, direction: "unknown" }];
+    }
+    if (opened === false) {
+      this.stats.deepReads += 1;
+      return [{ text: row.preview, direction: "unknown" }];
     }
     this.stats.deepReads += 1;
-    const messages = readConversation(this.session, this.target).map((m) => m.text);
+    const messages = readConversation(this.session, this.target);
     if (!messages.length) {
-      return [row.preview];
+      return [{ text: row.preview, direction: "unknown" }];
     }
+    const texts = messages.map((m) => m.text);
     const mark = this.watermarks.get(row.peer);
     let fresh;
     if (!mark) {
       fresh = messages;
     } else {
-      const index = messages.lastIndexOf(mark);
+      const index = texts.lastIndexOf(mark);
       fresh = index >= 0 ? messages.slice(index + 1) : messages.slice(-1);
     }
-    this.watermarks.set(row.peer, messages[messages.length - 1]);
-    return fresh.length ? fresh : [row.preview];
+    this.watermarks.set(row.peer, texts[texts.length - 1]);
+    // A message whose direction could not be read must not be silently dropped:
+    // falling back to the preview keeps the previous behaviour for it.
+    return fresh.length ? fresh : [{ text: row.preview, direction: "unknown" }];
   }
 
   /** Forget a peer's baseline so its next change counts as new (after a send). */
