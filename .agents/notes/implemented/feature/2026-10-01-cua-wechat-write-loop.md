@@ -96,6 +96,27 @@ y=451 w=722 "9月18日 11:03"        ← 时间戳行，读的时候要剔除
 - **回声账本**（`SentLedger`）：这是**本设计最危险的失败模式**的闸门 —— 出站改变会话行 → 行变化就是入站信号 → 机器人自问自答。账本按对端记住"我刚发过什么"，`runLoop` 默认启用。RDP 时代的部署踩过同一个坑并用账本解决，UIA 读者信息更少，闸门只能更严。
 - **循环**（`src/integrations/wechat-cua/loop.js`）：`runOnce` 是单回合（读 → 决策 → 发 → 验证），`runLoop` 是常驻轮询；两端都可注入，因此能在不碰微信的情况下被测试，也能在真机上跑。
 
+### 6. 接入机器人本体（2026-10-01 第七、八轮）
+
+| 半边 | 位置 | 开关 | 默认 |
+|---|---|---|---|
+| 出站 | `provider === "wechat-cua"` → `sendWeChatCuaText`（契约与桥对等） | `CYBERBOSS_ENABLE_WECHAT_CUA` | 关 |
+| 入站 | `WeChatCuaInboxSource` → **复用** `handleWeFlowInboxMessage`（同一回合管线） | `CYBERBOSS_ENABLE_WECHAT_CUA_INBOX`（须 `mode=start`） | 关 |
+
+talker 是 wxid 而会话行按**显示名**标注，所以映射必须显式给（`CYBERBOSS_CUA_CHAT_BY_TALKER="wxid=显示名,..."`）；**没有映射就硬失败**，绝不回退猜测 —— 发错人是这里最严重的失败。
+
+**空允许名单 = 谁都不回**（`CYBERBOSS_WECHAT_CUA_ALLOW_PEERS`）：`PreviewInboundSource` 把 `null` 当作"不限制"，所以空名单会被换成一个永不匹配的哨兵值。这条是接线自检抓出来的漏洞，不是读代码读出来的。
+
+**冒烟实测**（安全配置：允许名单=`微信团队`，永不触发回合）：
+
+```
+[cyberboss] cua inbox enabled pollMs=3000 deepRead=false peers=["微信团队"]
+```
+
+机器人带两端启动成功、运行 40 秒无异常、**没有发出任何东西**（会话逐条核对过）。
+
+**顺带查清的既有运维问题**：`.env` 的 `CYBERBOSS_WEFLOW_BASE_URL=http://127.0.0.1:5051`，而 WeFlow 现在监听 **5031**（`/api/v1/health` → 200）。表现为日志刷 `WeFlow push/outgoing poll failed: fetch failed` 与 deferred 补发失败。实测 `deferred-system-replies.json` **0 条**，所以没有积压误发风险；但这说明"读侧端口"与配置不一致，切换前必须对齐（或按纯 CUA 配置把 `CYBERBOSS_ENABLE_WEFLOW_INBOX=false`）。
+
 ## Verification
 
 - 离线：`test/wechat-cua-client.test.js` 7/7（写侧：已打开零成本、只在后台级失败后升级且用最新 token、点了没变化不算切换、以预览行验证发送、文字没落地绝不按回车、投递≠生效、搜索框不被误认为消息框）；`test/wechat-cua-inbound.test.js` 7/7（读侧：解析、首拍不回放、回声抑制、允许名单、未读徽标、纯重排、账本防自答）。
