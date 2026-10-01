@@ -1,4 +1,5 @@
 # Agent Note: 退场 RDP 隔离会话栈
+
 Status: implemented
 
 ## Problem
