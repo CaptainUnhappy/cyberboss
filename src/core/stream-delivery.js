@@ -454,6 +454,16 @@ class StreamDelivery {
       return;
     }
 
+    // A reply window is a constraint of the official bot channel only. The
+    // personal-account bridge can put the leftover batch on the wire whenever it
+    // likes, so there it goes out as its own message and the reply that follows
+    // stays a plain reply - no "===== 本轮模型回复 =====" glue (operator's rule,
+    // 2026-09-30: 这条通道可以主动多发). Every other route keeps the prefix-merge
+    // shape it was built for.
+    if (state.deferredReplyPrefix && isWeFlowUiaReplyTarget(state.replyTarget)) {
+      await this.sendDeferredPrefixAsOwnMessage(state);
+    }
+
     if (state.replyTarget.provider === "system") {
       await this.flushSystemReply(state, { force });
       return;
@@ -779,6 +789,47 @@ class StreamDelivery {
         return;
       }
       throw error;
+    }
+  }
+
+  /**
+   * Put the drained leftover batch on the wire as one standalone message.
+   *
+   * Called only for routes that can send outside a reply window. `sendTextWithRetry`
+   * is the same call the normal reply makes, so a failure re-queues the batch with
+   * its own retry armed (nothing is lost); if even that fails the prefix is put back
+   * so the next flush can still carry it in front of a reply.
+   */
+  async sendDeferredPrefixAsOwnMessage(state) {
+    const text = state.deferredReplyPrefix;
+    if (!text) {
+      return;
+    }
+    state.deferredReplyPrefix = "";
+    const target = state.replyTarget;
+    const payload = {
+      userId: target.userId,
+      text,
+      contextToken: target.contextToken,
+      preserveBlock: true,
+    };
+    applyWeFlowReplyRoute(payload, target);
+    try {
+      const outcome = await this.sendTextWithRetry(state, payload, { kind: "plain_reply" });
+      if (outcome?.status === "sent") {
+        console.log(
+          `[cyberboss] deferred leftover sent on its own thread=${state.threadId} user=${target.userId}`
+        );
+        return;
+      }
+      console.warn(
+        `[cyberboss] deferred leftover back in the queue thread=${state.threadId} status=${outcome?.status || "unknown"}`
+      );
+    } catch (error) {
+      state.deferredReplyPrefix = text;
+      console.error(
+        `[cyberboss] deferred leftover could not be sent thread=${state.threadId}: ${error.message}`
+      );
     }
   }
 
@@ -1249,8 +1300,17 @@ function normalizePositiveIntegerText(value) {
   }
 }
 
+/**
+ * The personal-account route (WeFlow UIA bridge), as opposed to the official bot
+ * channel. It is the one route that needs no reply window, which is what decides
+ * whether a leftover batch can be sent as a message of its own.
+ */
+function isWeFlowUiaReplyTarget(target) {
+  return normalizeText(target?.provider) === "weflow-uia";
+}
+
 function applyWeFlowReplyRoute(payload, target) {
-  if (normalizeText(target?.provider) === "weflow-uia") {
+  if (isWeFlowUiaReplyTarget(target)) {
     payload.provider = "weflow-uia";
   }
   for (const key of ["weflowContact", "weflowTalker"]) {

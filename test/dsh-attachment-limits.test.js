@@ -5,7 +5,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const { defaultDshBin } = require("../src/adapters/runtime/dsh/rpc-client");
-const { resolveAttachmentLimitsPatchPath } = require("../src/adapters/runtime/dsh");
+const { resolveAttachmentLimitsPatchPath, resolveAcpModelPatchPath } = require("../src/adapters/runtime/dsh");
 
 /**
  * DSH's shipped `maxImageDimension` is 8192, and the sdk profile composes
@@ -26,6 +26,7 @@ const { resolveAttachmentLimitsPatchPath } = require("../src/adapters/runtime/ds
 const projectRoot = path.resolve(__dirname, "..");
 const overlays = [
   { label: "attachment limits", file: resolveAttachmentLimitsPatchPath() },
+  { label: "acp model pin", file: resolveAcpModelPatchPath() },
   { label: "approval answerer", file: path.join(projectRoot, "dsh-plugins", "cyberboss-approval", "main.patch.yml") },
 ];
 

@@ -457,6 +457,72 @@ test("a new message joins older durable work instead of overtaking it", async ()
   assert.equal(new PendingInboundStore({ filePath }).snapshotMap().size, 0);
 });
 
+test("one collected burst acknowledges once while messages keep arriving inside the window", async () => {
+  const { filePath } = createStore();
+  const baseTime = Date.parse("2026-09-29T08:00:00.000Z");
+  let nowMs = baseTime;
+  const store = new PendingInboundStore({
+    filePath,
+    quietWindowMs: 15_000,
+    now: () => nowMs,
+  });
+  const acknowledgements = [];
+  const appLike = {
+    config: { pendingInboundQuietWindowMs: 15_000 },
+    pendingInboundStore: store,
+    pendingInboundByScope: store.snapshotMap(),
+    pendingInboundFlushScopeKeys: new Set(),
+    channelAdapter: {
+      async sendTyping() {},
+      async sendText(payload) {
+        acknowledgements.push(payload);
+      },
+    },
+    isTurnDispatchBlocked() { return true; },
+    async dispatchPreparedTurn() {
+      throw new Error("blocked scope must not dispatch");
+    },
+    acknowledgeWeFlowUiaInbound: CyberbossApp.prototype.acknowledgeWeFlowUiaInbound,
+    acknowledgeBufferedInboundOnce: CyberbossApp.prototype.acknowledgeBufferedInboundOnce,
+    bufferPendingInboundMessage: CyberbossApp.prototype.bufferPendingInboundMessage,
+    isCompletedPendingInbound: CyberbossApp.prototype.isCompletedPendingInbound,
+    removePendingInboundScope: CyberbossApp.prototype.removePendingInboundScope,
+  };
+  const route = (messageId, ageMs) => CyberbossApp.prototype.routePreparedInbound.call(appLike, {
+    bindingKey: "binding-1",
+    workspaceRoot: "D:/workspace",
+    prepared: fixtureMessage({
+      messageId,
+      originalText: messageId,
+      text: messageId,
+      receivedAt: new Date(nowMs - ageMs).toISOString(),
+    }),
+  });
+
+  await route("weflow:601", 0);
+  assert.deepEqual(acknowledgements.map((payload) => payload.text), ["处理中"]);
+
+  // Same continuous message: 10s after the answered one, still inside the window.
+  nowMs = baseTime + 10_000;
+  await route("weflow:602", 0);
+  assert.deepEqual(acknowledgements.map((payload) => payload.text), ["处理中"]);
+
+  // The window slides with every message of the burst, so a follow-up that only
+  // overlaps the newest message still belongs to the same answer.
+  nowMs = baseTime + 16_000;
+  await route("weflow:603", 5_000);
+  assert.deepEqual(acknowledgements.map((payload) => payload.text), ["处理中"]);
+
+  // Past the window: a genuinely new message answers immediately.
+  nowMs = baseTime + 40_000;
+  await route("weflow:604", 0);
+  assert.deepEqual(acknowledgements.map((payload) => payload.text), ["处理中", "处理中"]);
+
+  // Replaying an already collected message never answers twice.
+  await route("weflow:604", 0);
+  assert.deepEqual(acknowledgements.map((payload) => payload.text), ["处理中", "处理中"]);
+});
+
 test("a failed direct handoff remains durable and dispatches after restart", async () => {
   const { filePath } = createStore();
   const prepared = fixtureMessage({ messageId: "weflow:501" });

@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const fs = require("fs");
 const fsPromises = require("fs/promises");
 const path = require("path");
@@ -13,6 +14,15 @@ const DEFAULT_OUTGOING_POLL_MAX_REQUESTS = 64;
 const DEFAULT_PENDING_RETRY_MAX_MS = 60_000;
 const DEFAULT_POLL_STALL_RETRY_MAX_MS = 60_000;
 const MEDIA_RETRY_DELAYS_MS = [0, 250, 750, 1_500];
+// The isolated WeFlow reader exports media into its own Windows profile, which this
+// process cannot read: `chooseMediaPath` drops unreadable candidates, so every image
+// waited out its whole export window and was dead-lettered (measured 2026-09-30).
+// The reader also serves the same bytes over its authenticated HTTP API, so an
+// unreadable local path is replaced by a copy in this account's state directory.
+const MEDIA_HTTP_FALLBACK_TIMEOUT_MS = 20_000;
+const MAX_MEDIA_HTTP_FALLBACK_BYTES = 64 * 1024 * 1024;
+const MAX_MEDIA_HTTP_FALLBACK_ROWS = 12;
+const MEDIA_HTTP_CACHE_DIR_NAME = "weflow-media-cache";
 const IMAGE_COMPANION_OBSERVATION_WINDOW_MS = 15_000;
 // A generic short caption is only structural evidence when it is effectively
 // adjacent in time. An explicit visual prompt (for example `图中有什么`) may
@@ -1075,6 +1085,113 @@ class WeFlowInboxSource {
     };
   }
 
+  /**
+   * Replace unusable exported media paths with copies downloaded over the reader's
+   * HTTP API.
+   *
+   * The reader's `mediaLocalPath` points into its own account profile, so
+   * `hasUsableMedia` is false for every row this process cannot stat. The reader
+   * exposes the same file through `mediaUrl`, which needs no shared filesystem.
+   * Rows are mutated in place, so pairing, attachment building, and the media
+   * deadline check all keep working on the cached path.
+   */
+  async materializeMediaLocally(rows, push = null) {
+    const targets = [...(Array.isArray(rows) ? rows : []), push]
+      .filter((row) => row && typeof row === "object")
+      .filter((row) => !hasUsableMedia(row) && normalizeText(row?.mediaUrl))
+      .slice(0, MAX_MEDIA_HTTP_FALLBACK_ROWS);
+    for (const row of targets) {
+      try {
+        const cachedPath = await this.cacheMediaOverHttp(row);
+        if (cachedPath) {
+          row.mediaLocalPath = cachedPath;
+        }
+      } catch (error) {
+        this.logger.warn?.(
+          `[cyberboss] WeFlow media HTTP fallback failed kind=${normalizeMediaKind(row?.mediaType) || "unknown"} `
+          + `url=${normalizeText(row?.mediaUrl)} error=${formatError(error)}`
+        );
+      }
+    }
+  }
+
+  async cacheMediaOverHttp(row) {
+    const mediaUrl = normalizeText(row?.mediaUrl);
+    if (!mediaUrl) {
+      return "";
+    }
+    let target = null;
+    try {
+      target = new URL(mediaUrl);
+    } catch {
+      return "";
+    }
+    const configuredBase = normalizeText(this.config.weflowBaseUrl);
+    if (!configuredBase) {
+      return "";
+    }
+    try {
+      // Only the configured reader may serve media: never follow a rewritten URL
+      // to another host just because a row said so.
+      if (target.origin !== new URL(configuredBase).origin) {
+        return "";
+      }
+    } catch {
+      return "";
+    }
+    const cachePath = buildMediaHttpCachePath({
+      stateDir: normalizeText(this.config.stateDir),
+      row,
+      mediaUrl: target,
+      chat: normalizeText(row?.sessionId || row?.talker) || normalizeText(this.config.weflowInboxChat),
+    });
+    if (!cachePath) {
+      return "";
+    }
+    // Cache by name: the reader derives the name from the file digest, so an
+    // existing copy is the same bytes and re-downloading only costs time.
+    if (isReadableFile(cachePath)) {
+      return cachePath;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MEDIA_HTTP_FALLBACK_TIMEOUT_MS);
+    let response = null;
+    try {
+      response = await this.fetchImpl(target.toString(), {
+        headers: buildHeaders(this.config),
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        throw new Error(`media download timed out after ${MEDIA_HTTP_FALLBACK_TIMEOUT_MS}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!response?.ok) {
+      throw new Error(`media endpoint returned HTTP ${response?.status || "error"}`);
+    }
+    const declaredBytes = Number(response.headers?.get?.("content-length"));
+    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_MEDIA_HTTP_FALLBACK_BYTES) {
+      throw new Error(`media content-length ${declaredBytes} exceeds the ${MAX_MEDIA_HTTP_FALLBACK_BYTES} byte cap`);
+    }
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length) {
+      throw new Error("media endpoint returned an empty body");
+    }
+    if (bytes.length > MAX_MEDIA_HTTP_FALLBACK_BYTES) {
+      throw new Error(`media body ${bytes.length} exceeds the ${MAX_MEDIA_HTTP_FALLBACK_BYTES} byte cap`);
+    }
+    await writeFileAtomic(cachePath, bytes);
+    this.logger.warn?.(
+      `[cyberboss] WeFlow media downloaded over HTTP kind=${normalizeMediaKind(row?.mediaType) || "unknown"} `
+      + `bytes=${bytes.length} file=${cachePath}`
+    );
+    return cachePath;
+  }
+
   async resolvePushMessage(push, { key = "", item = null } = {}) {
     let details = [];
     let matched = null;
@@ -1110,6 +1227,7 @@ class WeFlowInboxSource {
         await delay(Math.min(retryMs, remainingDeadlineMs));
       }
       details = await fetchMessageDetails(this.config, push, this.fetchImpl);
+      await this.materializeMediaLocally(details, push);
       matched = findPushedMessage(details, push);
       pairingResolution = resolveImageCompanionPairing({
         details,
@@ -1334,6 +1452,46 @@ class WeFlowInboxSource {
     const raw = matched || push;
     const directMediaKind = resolveDeadlineBoundDirectMediaKind(raw);
     if (directMediaKind && (!matched || !hasUsableMedia(matched))) {
+      const unsupportedReason = resolveUnexportableMediaReason(raw, directMediaKind);
+      if (unsupportedReason) {
+        // The reader exports image/voice/video over its media route, but an appmsg
+        // attachment (type 6) is never given a locator: no mediaType, no mediaUrl,
+        // no *LocalPath - and /api/v1/media/<talker>/files/<name> answers 404
+        // (probed 2026-09-30). Waiting the full window can therefore only produce a
+        // silent dead letter, so the event is delivered now with an explicit intake
+        // failure the model can explain to the operator.
+        const fileMessage = normalizeWeFlowMessage(raw);
+        const fileName = normalizeText(fileMessage.title) || "未命名文件";
+        const size = normalizeFileSize(extractXmlTag(normalizeText(raw?.rawContent), "totallen"));
+        const failure = {
+          code: "media_export_unavailable",
+          kind: directMediaKind,
+          messageId: normalizeText(raw?.serverId || raw?.rawid || push?.rawid),
+          sourceFileName: fileName,
+          reason: `${unsupportedReason}（${fileName}${size ? `, ${size}` : ""}）`,
+        };
+        const snapshot = {
+          chat: normalizeText(push.sourceName) || normalizeText(this.config.weflowInboxDisplayName),
+          chatUsername: normalizeText(push.sessionId) || normalizeText(this.config.weflowInboxChat),
+          messages: details,
+          failures: [failure],
+        };
+        this.logger.warn?.(
+          `[cyberboss] WeFlow media export unavailable; delivering the event with an intake failure `
+          + `message=${failure.messageId || "unknown"} kind=${directMediaKind} file=${fileName}`
+        );
+        return {
+          ready: true,
+          message: {
+            ...fileMessage,
+            // A placeholder-only body would reach the runtime as an empty turn; the
+            // note keeps "something arrived that could not be read" visible.
+            text: `[附件接收失败] ${failure.reason}`,
+            attachmentFailures: [failure],
+          },
+          snapshot,
+        };
+      }
       mediaDeadline = mediaDeadline || buildDirectMediaDeadline(raw, this.now(), directMediaKind);
       const snapshot = {
         chat: normalizeText(push.sourceName) || normalizeText(this.config.weflowInboxDisplayName),
@@ -2328,6 +2486,49 @@ function messageExpectsMedia(raw) {
     || [3, 34, 43].includes(Number(raw?.localType));
 }
 
+/**
+ * Why a media row can never become usable, or "" when waiting is still worthwhile.
+ *
+ * Scoped to appmsg attachments (`type 6` / kind `file`): they are the one kind the
+ * reader demonstrably cannot export (verified against the live reader: the row has no
+ * media field under any query flag and the file media route 404s), while images,
+ * voice, and video all resolve - either as a readable local path or through the HTTP
+ * fallback. A row that already carries a locator (any `*LocalPath` or `mediaUrl`) is
+ * left alone so a reader that learns to export files starts working without a change.
+ */
+function resolveUnexportableMediaReason(raw, kind) {
+  if (kind !== "file") {
+    return "";
+  }
+  if (normalizeText(raw?.mediaUrl) || normalizeText(raw?.fileLocalPath)) {
+    return "";
+  }
+  const hasLocalPathField = ["mediaLocalPath", "fileLocalPath", "imageLocalPath", "voiceLocalPath", "videoLocalPath"]
+    .some((key) => normalizeText(raw?.[key]));
+  if (hasLocalPathField) {
+    return "";
+  }
+  const appType = Number(extractXmlTag(normalizeText(raw?.rawContent), "type"));
+  if (appType !== 6 && Number(raw?.localType) !== 6) {
+    return "";
+  }
+  return "WeFlow 阅读器不提供文件导出，内容取不到";
+}
+
+function normalizeFileSize(value) {
+  const bytes = Number(normalizeText(value));
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "";
+  }
+  if (bytes < 1_024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1_048_576) {
+    return `${(bytes / 1_024).toFixed(1)} KB`;
+  }
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
+}
+
 function hasUsableMedia(raw) {
   const mediaPath = chooseMediaPath(raw);
   if (!mediaPath) {
@@ -2409,6 +2610,56 @@ function parseSseBlock(block) {
 function buildApiUrl(config, pathname) {
   const baseUrl = normalizeText(config?.weflowBaseUrl) || "http://127.0.0.1:5031";
   return new URL(pathname, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`).toString();
+}
+
+function isReadableFile(filePath) {
+  try {
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Local cache location for one media file served by the reader.
+ *
+ * The reader names exported files after their digest, so the name is the cache key;
+ * everything else (chat, kind) only keeps the tree readable. Returns "" when no safe
+ * name can be derived, because a media file must never be written outside the cache.
+ */
+function buildMediaHttpCachePath({ stateDir, row, mediaUrl, chat }) {
+  const root = normalizeText(stateDir);
+  if (!root) {
+    return "";
+  }
+  const rawName = normalizeText(row?.mediaFileName) || path.posix.basename(mediaUrl?.pathname || "");
+  let decoded = rawName;
+  try {
+    decoded = decodeURIComponent(rawName);
+  } catch {
+    decoded = rawName;
+  }
+  const safeName = decoded.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "").slice(0, 120);
+  if (!safeName || safeName === "." || safeName === "..") {
+    return "";
+  }
+  const chatSegment = (normalizeText(chat) || "chat").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) || "chat";
+  const kindRaw = normalizeMediaKind(row?.mediaType)
+    || inferContentKind(row?.parsedContent || row?.content, row?.rawContent);
+  const kindSegment = (kindRaw || "media").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 40) || "media";
+  return path.join(root, MEDIA_HTTP_CACHE_DIR_NAME, chatSegment, kindSegment, safeName);
+}
+
+async function writeFileAtomic(filePath, bytes) {
+  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}-${crypto.randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await fsPromises.writeFile(tempPath, bytes);
+    await fsPromises.rename(tempPath, filePath);
+  } catch (error) {
+    await fsPromises.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function buildHeaders(config, extra = {}) {

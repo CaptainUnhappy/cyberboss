@@ -7,6 +7,16 @@
 const HOST = process.env.CDP_HOST || '127.0.0.1';
 const PORT = Number(process.env.CDP_PORT || 9222);
 const [needle, want] = process.argv.slice(2);
+const norm = (s) =>
+  Array.from(s || '')
+    .filter((ch) => {
+      const c = ch.charCodeAt(0);
+      return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 0x4e00 && c <= 0x9fff);
+    })
+    .join('');
+const WANT_NORM = norm(want);
+console.log('# needle=' + JSON.stringify(needle) + '  want=' + JSON.stringify(want) +
+            '  normalized=' + JSON.stringify(WANT_NORM));
 
 (async () => {
   const list = await (await fetch(`http://${HOST}:${PORT}/json`)).json();
@@ -32,17 +42,32 @@ const [needle, want] = process.argv.slice(2);
 
   const box = await send('Runtime.evaluate', {
     expression: `(() => {
-      const norm = (s) => (s || '').replace(/\\s+/g, '').replace(/\\u200b/g, '');
-      const want = norm(${JSON.stringify(want)});
-      const items = Array.from(document.querySelectorAll('.auto-size-list-item, [class*="ColumnsFile__file-item"], [class*="file-click-wrap"], tr.ant-table-row'));
-      const hit = items.find((el) => norm(el.textContent).includes(want));
-      if (!hit) {
-        const sample = items.slice(0, 3).map((el) => norm(el.textContent).slice(0, 50));
-        return JSON.stringify({ miss: true, itemsSeen: items.length, sample });
+      // normalise hard: strip whitespace, zero-width chars and full/half width
+      // punctuation so a query like "夸克网盘免费领" matches regardless of how
+      // the list splits or decorates the label.
+      // No escapes whatsoever in this expression: the query is normalised on the
+      // Node side and injected as a plain string; the page only filters code points.
+      const keep = (ch) => {
+        const c = ch.charCodeAt(0);
+        return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 0x4e00 && c <= 0x9fff);
+      };
+      const norm = (s) => Array.from(s || '').filter(keep).join('');
+      const want = ${JSON.stringify(WANT_NORM)};
+      const items = Array.from(document.querySelectorAll(
+        '.auto-size-list-item, [class*="ColumnsFile__file-item"], [class*="file-click-wrap"], tr.ant-table-row'));
+      const cands = items.filter((el) => norm(el.textContent).includes(want));
+      if (!cands.length) {
+        const sample = items.slice(0, 6).map((el) => norm(el.textContent).slice(0, 70));
+        return JSON.stringify({ miss: true, itemsSeen: items.length, want: want, sample });
       }
+      // fewest characters = the tightest element around the match
+      cands.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+      const hit = cands[0];
       hit.scrollIntoView({ block: 'center' });
       const r = hit.getBoundingClientRect();
       return JSON.stringify({ tag: hit.tagName, cls: String(hit.className || '').slice(0, 50),
+                              text: (hit.textContent || '').trim().slice(0, 60),
+                              matched: cands.length,
                               rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
                               cx: r.left + r.width / 2, cy: r.top + r.height / 2 });
     })()`,

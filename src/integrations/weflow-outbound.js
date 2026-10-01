@@ -1,4 +1,15 @@
 const crypto = require("crypto");
+const path = require("path");
+
+/**
+ * Fallback media-verification window for file sends.
+ *
+ * Deliberately NOT `config.weflowBridgeTimeoutMs`: that is a short transport
+ * budget (30s here) and using it as the verification window silently defeats the
+ * caller's size-scaled window, which is how a 59 MiB send that had already gone
+ * out got reported as a transport failure.
+ */
+const DEFAULT_FILE_VERIFY_TIMEOUT_MS = 120_000;
 
 const CONTROL_COMMANDS = new Set(["/bot", "/azzy", "/mode", "/状态"]);
 const CONTROL_CONFIRMATIONS = new Set([
@@ -423,6 +434,183 @@ function describeExistingImageDelivery(operation, imageDigest) {
   return null;
 }
 
+/**
+ * Send one local file to the WeChat window as a real attachment.
+ *
+ * Why this exists separately from the image path: `/api/send-image` accepts PNG
+ * only, so every non-image file used to fall back to "upload it somewhere and
+ * paste a link". The bridge now offers `/api/send-file`, which puts the file on
+ * the Windows clipboard as a shell file list (CF_HDROP) and pastes it.
+ *
+ * The file must be readable by the bridge's Windows account, which is not the
+ * bot's account; callers are expected to stage it somewhere both can read
+ * (`config.generatedImageOutboundDir` already is such a directory).
+ */
+async function sendWeFlowUiaFile(
+  config,
+  {
+    filePath = "",
+    sha256 = "",
+    fileDigest = "",
+    timeoutMs = 0,
+    messageKind = "",
+    idempotencyKey = "",
+    messageLedger = null,
+  } = {},
+  fetchImpl = globalThis.fetch
+) {
+  const contact = normalizeText(config?.weflowInboxDisplayName);
+  const talker = normalizeText(config?.weflowInboxChat);
+  const resolvedPath = normalizeText(filePath);
+  const resolvedDigest = normalizeSha256(fileDigest) || normalizeSha256(sha256);
+  const fileName = resolvedPath ? path.basename(resolvedPath) : "";
+  const resolvedIdempotencyKey = normalizeText(idempotencyKey);
+  if (!contact || !talker || !resolvedPath || !resolvedDigest || !fileName) {
+    throw new Error("WeFlow UIA file send requires contact, talker, filePath, and sha256");
+  }
+
+  // Do NOT fall back to `config.weflowBridgeTimeoutMs` the way the text and image
+  // paths do. That value is a short transport budget (30s in this deployment) and
+  // using it as a media verification window silently defeats the caller's
+  // size-scaled window: the bridge was still busy with a 59 MiB video when the
+  // client gave up, so a send that had actually gone out surfaced as "fetch failed".
+  const verificationTimeoutMs = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+    ? Number(timeoutMs)
+    : DEFAULT_FILE_VERIFY_TIMEOUT_MS;
+  // The ledger keys non-image content by its text hash, and a file row's WeFlow
+  // text is raw appmsg XML. Recording the attachment name here is what lets the
+  // read side recognise the row the bridge already confirmed by localId.
+  const ledgerText = `[文件] ${fileName}`;
+  let operation = null;
+  let ownsDeliveryClaim = false;
+  let requestStarted = false;
+  try {
+    const ledgerClaim = await planAndClaimLedgerOperation(messageLedger, {
+      talker,
+      text: ledgerText,
+      messageKind,
+      expectedDirection: "outgoing",
+      contentKind: "file",
+      ...(resolvedIdempotencyKey ? { idempotencyKey: resolvedIdempotencyKey } : {}),
+    });
+    operation = ledgerClaim.entry;
+    if (ledgerClaim.atomic) {
+      if (!ledgerClaim.claimed) {
+        const existingDelivery = describeExistingFileDelivery(operation, resolvedDigest);
+        if (existingDelivery) {
+          return existingDelivery;
+        }
+        throw invalidLedgerClaimError("file", operation);
+      }
+      ownsDeliveryClaim = Boolean(operation);
+    } else {
+      const existingDelivery = describeExistingFileDelivery(operation, resolvedDigest);
+      if (existingDelivery) {
+        return existingDelivery;
+      }
+      if (operation) {
+        await messageLedger.markSending(operation);
+        ownsDeliveryClaim = true;
+      }
+    }
+
+    requestStarted = true;
+    // The bridge holds the request AND its send_lock for the whole verification
+    // window, so the transport budget must exceed the window but not by so much
+    // that a stuck request ties up the channel. Measured 2026-09-30: a 300s window
+    // let the bridge sit for five minutes on a send whose row had appeared after
+    // 14 seconds, and the client died first with "fetch failed" — reporting a
+    // delivered file as a transport error.
+    const bridgeRequestTimeoutMs = verificationTimeoutMs + 90_000;
+    const payload = await requestBridgeJson(config, "/api/send-file", {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify({
+        contact,
+        talker,
+        filePath: resolvedPath,
+        timeout: Math.max(1, Math.ceil(verificationTimeoutMs / 1000)),
+      }),
+    }, fetchImpl, { timeoutMs: bridgeRequestTimeoutMs });
+    const verifiedLocalId = normalizePositiveLocalId(payload?.localId);
+    if (payload?.dispatched === true && (payload?.verified !== true || !verifiedLocalId)) {
+      const verificationError = normalizeText(payload?.verificationError)
+        || "WeFlow UIA file dispatch was not observed with a stable local id";
+      if (operation && ownsDeliveryClaim) {
+        await Promise.resolve().then(() => messageLedger.markFailed(operation, {
+          uncertain: true,
+          error: verificationError,
+        })).catch(() => {});
+      }
+      // UI Automation already pressed Enter; reporting uncertainty keeps the
+      // caller from pasting the same file twice.
+      return {
+        ...payload,
+        verified: false,
+        uncertain: true,
+        fileDigest: resolvedDigest,
+        fileName,
+        verificationError,
+      };
+    }
+    if (payload?.dispatched !== true) {
+      const error = new Error("WeFlow UIA file send was not verified");
+      error.deliveryUncertain = false;
+      throw error;
+    }
+    if (operation && ownsDeliveryClaim) {
+      try {
+        await messageLedger.markVerified(operation, { localId: verifiedLocalId });
+      } catch (error) {
+        await Promise.resolve().then(() => messageLedger.markFailed(operation, {
+          uncertain: true,
+          error: error instanceof Error ? error.message : String(error),
+        })).catch(() => {});
+        return { ...payload, fileDigest: resolvedDigest, fileName, ledgerUncertain: true };
+      }
+    }
+    return { ...payload, fileDigest: resolvedDigest, fileName };
+  } catch (error) {
+    if (error && typeof error === "object" && error.deliveryUncertain == null) {
+      error.deliveryUncertain = requestStarted;
+    }
+    if (operation && ownsDeliveryClaim) {
+      await Promise.resolve().then(() => messageLedger.markFailed(operation, {
+        uncertain: Boolean(error?.deliveryUncertain),
+        error: error instanceof Error ? error.message : String(error),
+      })).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+function describeExistingFileDelivery(operation, fileDigest) {
+  const status = normalizeText(operation?.status).toLowerCase();
+  if (status === "verified") {
+    const localId = normalizePositiveLocalId(operation?.localId);
+    return {
+      dispatched: true,
+      verified: Boolean(localId),
+      uncertain: !localId,
+      deduplicated: true,
+      localId,
+      fileDigest,
+    };
+  }
+  if (status === "sending" || status === "failed_uncertain") {
+    return {
+      dispatched: true,
+      verified: false,
+      uncertain: true,
+      deduplicated: true,
+      localId: normalizePositiveLocalId(operation?.localId),
+      fileDigest,
+      verificationError: "an earlier file dispatch remains uncertain; duplicate paste suppressed",
+    };
+  }
+  return null;
+}
+
 async function planAndClaimLedgerOperation(messageLedger, payload) {
   if (!messageLedger) {
     return { entry: null, claimed: true, atomic: false };
@@ -537,6 +725,7 @@ module.exports = {
   isWeFlowControlConfirmation,
   isWeFlowControlCommand,
   resolveWeFlowSendSource,
+  sendWeFlowUiaFile,
   sendWeFlowUiaImage,
   sendWeFlowUiaText,
 };

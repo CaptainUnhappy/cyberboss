@@ -52,6 +52,8 @@ class AcpRpcClient extends DshRpcClient {
       : DEFAULT_CLIENT_INFO;
     this.agentCapabilities = null;
     this.agentInfo = null;
+    /** sessionId -> last advertised ACP config options (see getSessionConfigOptions). */
+    this.sessionConfigOptionsBySession = new Map();
     this.promptTimeoutMs = Number(options.promptTimeoutMs) || DEFAULT_PROMPT_TIMEOUT_MS;
   }
 
@@ -95,6 +97,21 @@ class AcpRpcClient extends DshRpcClient {
   }
 
   /**
+   * Whether the agent advertised one prompt-content capability at initialize.
+   *
+   * `promptCapabilities.image` is the agent's answer to "will the configured model
+   * accept inline images"; sending an image anyway is rejected as invalid params.
+   */
+  promptCapability(name) {
+    const key = normalizeText(name);
+    if (!key) {
+      return false;
+    }
+    const capabilities = this.agentCapabilities?.promptCapabilities;
+    return Boolean(capabilities && capabilities[key] === true);
+  }
+
+  /**
    * Create a session. ACP assigns the id (the client does not choose it), which is
    * why the conversation keeps the returned id in its own store.
    */
@@ -105,7 +122,47 @@ class AcpRpcClient extends DshRpcClient {
     if (!sessionId) {
       throw new DshProtocolError("session/new returned no sessionId");
     }
+    this.rememberSessionConfigOptions(sessionId, result?.configOptions);
     return sessionId;
+  }
+
+  /**
+   * Standard configuration state advertised for one session.
+   *
+   * ACP only hands these out with `session/new`, `session/resume` and
+   * `session/set_config_option`, so they are cached per session as they arrive. The
+   * `model` option (category `model`) is what decides whether a turn may carry
+   * inline images: a session created before the image-capable model was pinned keeps
+   * the old model and rejects them with "does not declare image input".
+   */
+  getSessionConfigOptions(sessionId) {
+    const cached = this.sessionConfigOptionsBySession.get(normalizeText(sessionId));
+    return Array.isArray(cached) ? cached : [];
+  }
+
+  rememberSessionConfigOptions(sessionId, configOptions) {
+    const normalizedSessionId = normalizeText(sessionId);
+    if (!normalizedSessionId || !Array.isArray(configOptions)) {
+      return;
+    }
+    this.sessionConfigOptionsBySession.set(normalizedSessionId, configOptions);
+  }
+
+  /** Apply one advertised standard option; returns the resulting option state. */
+  async setSessionConfigOption(sessionId, configId, value) {
+    const normalizedSessionId = normalizeText(sessionId);
+    const normalizedConfigId = normalizeText(configId);
+    if (!normalizedSessionId || !normalizedConfigId) {
+      throw new DshProtocolError("session/set_config_option requires a sessionId and configId");
+    }
+    await this.initialize();
+    const result = await this.request("session/set_config_option", {
+      sessionId: normalizedSessionId,
+      configId: normalizedConfigId,
+      value,
+    }, { timeoutMs: this.requestTimeoutMs });
+    this.rememberSessionConfigOptions(normalizedSessionId, result?.configOptions);
+    return Array.isArray(result?.configOptions) ? result.configOptions : [];
   }
 
   /** Re-attach to a persisted session, restoring its log without replaying it. */
@@ -118,11 +175,13 @@ class AcpRpcClient extends DshRpcClient {
       throw new DshProtocolError("session/resume requires a cwd");
     }
     await this.initialize();
-    return this.request("session/resume", {
+    const result = await this.request("session/resume", {
       sessionId: normalizedSessionId,
       cwd,
       mcpServers,
     }, { timeoutMs: this.requestTimeoutMs });
+    this.rememberSessionConfigOptions(normalizedSessionId, result?.configOptions);
+    return result;
   }
 
   async listSessions({ cwd = "", cursor = "" } = {}) {

@@ -42,14 +42,41 @@ const query = process.argv[2] || 'pdf';
   const info = box.result && box.result.result ? box.result.result.value : null;
   if (!info) { console.log(JSON.stringify({ ok: false, reason: 'no search input' })); ws.close(); return; }
   const t = JSON.parse(info);
+  // click into the field, verify it really has focus, then type slowly
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: t.cx, y: t.cy, button: 'none', buttons: 0 });
   await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: t.cx, y: t.cy, button: 'left', buttons: 1, clickCount: 1 });
   await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: t.cx, y: t.cy, button: 'left', buttons: 0, clickCount: 1 });
+  await new Promise((r) => setTimeout(r, 400));
+  const focused = await send('Runtime.evaluate', {
+    expression: `(() => { const i = document.querySelector('input.ant-input'); return i ? JSON.stringify({ hasFocus: document.hasFocus(), active: document.activeElement === i }) : null; })()`,
+    returnByValue: true,
+  });
+  const focusState = focused.result && focused.result.result ? focused.result.result.value : null;
+  console.log('# field focus: ' + focusState);
+  // clear the field first (select-all + delete), then type one event per char.
+  // NOTE: sending both keyDown(text) and char duplicates every character
+  // (observed "pdf" -> "pdfppddff"), so only keyDown(text) is used.
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 });
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 });
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 });
+  await new Promise((r) => setTimeout(r, 300));
   for (const ch of query) {
-    await send('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, key: ch, unmodifiedText: ch });
-    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
-    await new Promise((r) => setTimeout(r, 60));
+    const vk = ch.toUpperCase().charCodeAt(0);
+    await send('Input.dispatchKeyEvent', { type: 'keyDown', text: ch, unmodifiedText: ch, key: ch, windowsVirtualKeyCode: vk });
+    await send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch, windowsVirtualKeyCode: vk });
+    await new Promise((r) => setTimeout(r, 150));
   }
+  await new Promise((r) => setTimeout(r, 600));
+  // commit the query: this component needs Enter (typing alone does not filter)
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
   await new Promise((r) => setTimeout(r, 2500));
+  const typed = await send('Runtime.evaluate', {
+    expression: `(() => { const i = document.querySelector('input.ant-input'); return i ? i.value : '(none)'; })()`,
+    returnByValue: true,
+  });
+  console.log('# field value now: ' + (typed.result && typed.result.result ? typed.result.result.value : '?'));
 
   const res = await send('Runtime.evaluate', {
     expression: `(() => {

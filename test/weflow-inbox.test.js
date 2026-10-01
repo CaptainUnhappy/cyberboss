@@ -210,6 +210,101 @@ test("WeFlow uses exported direct image, audio, video, and file paths", () => {
   }
 });
 
+test("WeFlow downloads media over HTTP when the exported local path is unreadable", async () => {
+  const stateDir = createTempDir();
+  const cursorFile = path.join(stateDir, "weflow-inbox-cursor.json");
+  const imageBytes = Buffer.from("image-bytes-from-the-reader");
+  const unreadablePath = path.join(createTempDir(), "cwinprobe-profile", "photo.jpg");
+  const image = detail({
+    localId: 402,
+    serverId: "current-image-402",
+    localType: 3,
+    isSend: 0,
+    content: "[图片]",
+    parsedContent: "[图片]",
+    mediaType: "image",
+    mediaFileName: "a1b2c3.jpg",
+    mediaLocalPath: unreadablePath,
+    mediaUrl: "http://127.0.0.1:5051/api/v1/media/wxid_main/images/a1b2c3.jpg",
+  });
+  const delivered = [];
+  const requestedUrls = [];
+  const source = new WeFlowInboxSource({
+    config: {
+      weflowInboxChat: "wxid_main",
+      weflowInboxCursorFile: cursorFile,
+      weflowBaseUrl: "http://127.0.0.1:5051",
+      stateDir,
+    },
+    fetchImpl: async (url) => {
+      requestedUrls.push(String(url));
+      if (String(url).includes("/api/v1/media/")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => String(imageBytes.length) },
+          async arrayBuffer() {
+            return imageBytes.buffer.slice(imageBytes.byteOffset, imageBytes.byteOffset + imageBytes.length);
+          },
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { messages: [image] };
+        },
+      };
+    },
+    onMessage: async (message) => {
+      delivered.push(message);
+      return true;
+    },
+    logger: { warn() {}, error() {}, log() {} },
+  });
+
+  const result = await source.handleSseEvent({
+    event: "message.new",
+    data: {
+      sessionId: "wxid_main",
+      rawid: image.serverId,
+      localId: image.localId,
+      timestamp: image.createTime,
+      isSend: 0,
+      content: image.content,
+    },
+  });
+
+  assert.equal(result.status, "ok");
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].attachments.length, 1);
+  const cachedPath = delivered[0].attachments[0].path;
+  assert.notEqual(cachedPath, unreadablePath);
+  assert.match(cachedPath, /weflow-media-cache/);
+  assert.equal(fs.readFileSync(cachedPath, "utf8"), imageBytes.toString("utf8"));
+  assert.deepEqual(requestedUrls.filter((url) => url.includes("/api/v1/media/")), [image.mediaUrl]);
+
+  // A second observation must reuse the cached copy instead of downloading again.
+  const secondSource = new WeFlowInboxSource({
+    config: {
+      weflowInboxChat: "wxid_main",
+      weflowInboxCursorFile: cursorFile,
+      weflowBaseUrl: "http://127.0.0.1:5051",
+      stateDir,
+    },
+    fetchImpl: async (url) => {
+      if (String(url).includes("/api/v1/media/")) {
+        throw new Error("cached media must not be downloaded twice");
+      }
+      return { ok: true, status: 200, async json() { return { messages: [image] }; } };
+    },
+    onMessage: async () => true,
+    logger: { warn() {}, error() {}, log() {} },
+  });
+  await secondSource.materializeMediaLocally([image]);
+  assert.equal(fs.readFileSync(image.mediaLocalPath, "utf8"), imageBytes.toString("utf8"));
+});
+
 test("WeFlow resolves quoted image media to the quoted context and prefers non-thumbnail candidates", () => {
   const dir = createTempDir();
   const thumbnail = createMediaFile(dir, "quoted_t.jpg", "tiny");
@@ -1498,6 +1593,64 @@ test("WeFlow keeps an explanation pending until its paired image media is usable
   persisted = JSON.parse(fs.readFileSync(cursorFile, "utf8"));
   assert.deepEqual(persisted.pendingEvents, []);
   assert.deepEqual(persisted.seenIds, ["message.new:media-prompt", "message.new:media-image"]);
+});
+
+test("WeFlow delivers an appmsg file immediately with an intake failure instead of waiting out a dead end", async () => {
+  const dir = createTempDir();
+  const cursorFile = path.join(dir, "cursor.json");
+  const createTime = 1_800_000_600;
+  const appmsg = [
+    "<msg><appmsg><title>看板_渠道投放复盘.html</title><type>6</type>",
+    "<appattach><fileext>html</fileext><totallen>184320</totallen>",
+    "<attachid>@cdn_305f020100044b3049</attachid></appmsg></msg>",
+  ].join("");
+  // What the live reader returns for such a row: the appmsg body, and no media
+  // locator under any query flag (probed 2026-09-30).
+  const fileRow = detail({
+    talker: "wxid_main",
+    serverId: "inbound-file-1",
+    localId: 402,
+    localType: 25769803825,
+    createTime,
+    isSend: 0,
+    senderUsername: "wxid_main",
+    content: "[文件]",
+    parsedContent: "[文件]",
+    rawContent: appmsg,
+  });
+  const delivered = [];
+  const source = new WeFlowInboxSource({
+    config: { weflowInboxChat: "wxid_main", weflowInboxCursorFile: cursorFile },
+    fetchImpl: async () => ({ ok: true, async json() { return { messages: [fileRow] }; } }),
+    onMessage: async (message) => {
+      delivered.push(message);
+      return true;
+    },
+    logger: { warn() {}, error() {}, log() {} },
+  });
+
+  const result = await source.handleSseEvent({
+    event: "message.new",
+    data: {
+      sessionId: "wxid_main",
+      rawid: fileRow.serverId,
+      localId: fileRow.localId,
+      timestamp: createTime,
+      isSend: 0,
+      content: "[文件]",
+    },
+  });
+
+  assert.equal(result.status, "ok");
+  assert.equal(delivered.length, 1, "the event must be delivered, not parked until its export deadline");
+  assert.equal(delivered[0].kind, "file");
+  assert.equal(delivered[0].attachmentFailures.length, 1);
+  assert.equal(delivered[0].attachmentFailures[0].sourceFileName, "看板_渠道投放复盘.html");
+  assert.match(delivered[0].attachmentFailures[0].reason, /不提供文件导出/u);
+  assert.match(delivered[0].text, /附件接收失败/u);
+  assert.match(delivered[0].text, /看板_渠道投放复盘\.html/u);
+  assert.match(delivered[0].text, /180\.0 KB/u, "the size from the appmsg body belongs in the note");
+  assert.equal(source.pendingEvents.size, 0);
 });
 
 test("WeFlow keeps a direct image pending while its REST detail is temporarily missing", async () => {

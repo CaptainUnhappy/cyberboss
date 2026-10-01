@@ -157,3 +157,7 @@ Status: implemented
 - 收益：失败回复不再依赖"用户下次开口" —— 启动时 `rehydrate()`、入队后 30 秒起指数退避自动重试，尝试次数与下次时间落盘、按 `id` 覆盖去重（绝不重复发送）；重试走 `channelAdapter.sendText`，因此保留账本条目与回声归因，不会被误判成同号人工消息。实测启动日志 `deferred retry re-armed senders=1`，30 秒后 `count=8 requeued=8`，队列簿记从空变为 `attempt=1`。
 - 代价：队列条目多背 8 个字段（路由 + 簿记），文件变大；单条最多重试 8 次（30s/1m/2m/5m 封顶），通道长期不可用会留下 `exhausted` 条目等人处理；重试用的是**当时捕获的 context token**，token 失效时稳定失败（实测官方通道 `sendMessage ret=-2`）—— 差别是失败被计次、可见，而不是静默躺平。
 - 已知风险：`listSenders()` 会读整份队列，队列极大时启动略慢（当前 8 条，无影响）；绕过 `channelAdapter.sendText` 的第三方发送路径不受本机制保护。
+
+## 后续改动（2026-09-30）
+
+补发批次给用户看的开头文案（`DEFERRED_REPLY_NOTICE`）已换成渠道中立的一句"上轮有一条回复当时没能发出去，现在补上。"，不再解释 `context_token`、也不再建议 `/chunk`；同时个人号路由上"下一次入站"这条快路径也改成把这批内容独立成条发出，不再拼在新回复前面。起因是用户把小号通道上收到的原文引用回来要求"不需要做限制"。取舍见 [小号通道取消发送限制：分片预算、context_token 通知、遗留内容拼接](../feature/2026-09-30-weixin-xiaohao-no-send-limits.md)。上面的重试调度、账本语义与队列形态都没有变。

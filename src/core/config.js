@@ -87,7 +87,11 @@ function readConfig() {
     weflowCanaryInboxCursorFile: path.join(stateDir, "weflow-canary-inbox-cursor.json"),
     weflowCanaryMessageLimit: readIntEnv("CYBERBOSS_WEFLOW_CANARY_MESSAGE_LIMIT") || 200,
     weflowMessageLedgerFile: path.join(stateDir, "weflow-message-ledger.json"),
-    generatedImageOutboundDir: path.join(stateDir, "generated-images-outbound"),
+    // The UIA bridge reads outbound images as a different Windows account, so the
+    // directory has to be shared and both sides must agree on it. Deployments set
+    // this together with the bridge's CYBERBOSS_WEFLOW_UIA_IMAGE_ROOT.
+    generatedImageOutboundDir: readTextEnv("CYBERBOSS_GENERATED_IMAGE_OUTBOUND_DIR")
+      || path.join(stateDir, "generated-images-outbound"),
     weflowReconnectDelayMs: readIntEnv("CYBERBOSS_WEFLOW_RECONNECT_DELAY_MS") || 1_000,
     weflowOutgoingPollIntervalMs: readIntEnv("CYBERBOSS_WEFLOW_OUTGOING_POLL_INTERVAL_MS") || 2_000,
     weflowOutgoingReplayWindowMs: readIntEnv("CYBERBOSS_WEFLOW_OUTGOING_REPLAY_WINDOW_MS") || 10 * 60_000,

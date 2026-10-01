@@ -1,0 +1,22 @@
+# Pin the ACP profile to the image-capable flash model.
+#
+# The profile composes `@deepseek-ai/dsh-acp` with `model: deepseek-v4-flash`, whose
+# catalog entry carries no image input modality. `supportsAcpImagePrompts()` then
+# advertises `agentCapabilities.promptCapabilities.image: false`, and every inbound
+# image is refused with:
+#
+#   Invalid params: inline image prompts were not advertised by this connection
+#
+# The catalog already contains the image-capable flash model under the same
+# provider: id `deepseek-flash`, display name "DeepSeek-V41-Flash",
+# `inputModalities: [text, image]`. Measured 2026-09-30 against the live endpoint:
+# that id reads an image correctly, while `deepseek-v4-pro` answers "我无法查看图片内容".
+#
+# `--patch` merges by id and an id that does not exist is a silent no-op, so
+# test/dsh-acp-model-patch.test.js asserts the composed config rather than trusting
+# this text.
+- id: acp
+  name: '@deepseek-ai/dsh-acp'
+  config:
+    provider: deepseek-official
+    model: deepseek-flash

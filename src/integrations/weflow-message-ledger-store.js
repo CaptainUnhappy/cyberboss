@@ -9,6 +9,13 @@ const DEFAULT_MAX_ENTRIES = 4_000;
 const LEDGER_VERSION = 3;
 const VALID_EXPECTED_DIRECTIONS = new Set(["incoming", "outgoing"]);
 const MATCHABLE_STATUSES = new Set(["sending", "failed_uncertain"]);
+// The inbox re-derives a row's kind from the row's own text, so a plain reply
+// that happens to contain a URL comes back as `link` while the outbound planner
+// always records `text`. Both are text for echo attribution: the content hash
+// (or the stable local id) already proves the row is ours. Without this the
+// bot re-reads its own reply as same-account manual input and answers it with a
+// stray 处理中 (measured 2026-09-30: two replies containing a URL were acked).
+const TEXTUAL_CONTENT_KINDS = new Set(["text", "link"]);
 const VALID_STATUSES = new Set([
   "planned",
   "sending",
@@ -303,7 +310,7 @@ class WeFlowMessageLedgerStore {
       .filter((entry) => {
         if (entry.talker !== talker
           || entry.contentHash !== contentHash
-          || entry.contentKind !== fallbackContentKind
+          || !contentKindsCompatible(entry.contentKind, fallbackContentKind)
           || !entryMatchesDirection(entry, observedDirection)
           || !MATCHABLE_STATUSES.has(entry.status)) {
           return false;
@@ -570,7 +577,7 @@ function normalizeImageDigest(value) {
 }
 
 function entryMatchesObservedContent(entry, { contentHash = "", observedContentKind = "" } = {}) {
-  if (observedContentKind && entry.contentKind !== observedContentKind) {
+  if (observedContentKind && !contentKindsCompatible(entry.contentKind, observedContentKind)) {
     return false;
   }
   if (entry.contentKind === "image") {
@@ -579,6 +586,25 @@ function entryMatchesObservedContent(entry, { contentHash = "", observedContentK
     return !observedContentKind || observedContentKind === "image";
   }
   return !contentHash || entry.contentHash === contentHash;
+}
+
+/**
+ * Whether one stored content kind may describe the same message as the kind the
+ * inbox derived for an observed row.
+ *
+ * `text` and `link` are interchangeable here: the inbox labels any row whose text
+ * contains a URL as `link` (bare links, link cards, and ordinary replies that
+ * merely quote an address), while every outbound text send is planned as `text`.
+ * Identity is still proven by the content hash or the stable local id, never by
+ * this kind.
+ */
+function contentKindsCompatible(storedKind, observedKind) {
+  const stored = normalizeContentKind(storedKind);
+  const observed = normalizeContentKind(observedKind);
+  if (stored === observed) {
+    return true;
+  }
+  return TEXTUAL_CONTENT_KINDS.has(stored) && TEXTUAL_CONTENT_KINDS.has(observed);
 }
 
 function normalizeWeFlowMessageContent(value) {

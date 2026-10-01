@@ -50,6 +50,15 @@ $env:CYBERBOSS_WEFLOW_ALLOWED_TALKERS = Get-EnvValue 'CYBERBOSS_WEFLOW_ALLOWED_T
 $env:CYBERBOSS_WEFLOW_DEFAULT_SEND_SOURCE = 'azzy'
 $env:CYBERBOSS_WEFLOW_SEND_VERIFY_SECONDS = Get-EnvValue 'CYBERBOSS_WEFLOW_SEND_VERIFY_SECONDS'
 $env:CYBERBOSS_STATE_DIR = 'C:\ProgramData\cwin-probe\state4'
+# Outbound images: the bot writes them as ITS OWN account, so the bridge's managed
+# image root has to be a directory both accounts can read. Keep this in step with
+# the bot's CYBERBOSS_GENERATED_IMAGE_OUTBOUND_DIR in .env (measured 2026-09-30:
+# bot 79388 -> bridge cwinprobe was "outside the managed image root" + WinError 5).
+$imageRoot = Get-EnvValue 'CYBERBOSS_GENERATED_IMAGE_OUTBOUND_DIR'
+if (-not $imageRoot) { $imageRoot = 'C:\ProgramData\cwin-probe\outbound-images' }
+New-Item -ItemType Directory -Force -Path $imageRoot | Out-Null
+$env:CYBERBOSS_WEFLOW_UIA_IMAGE_ROOT = $imageRoot
+"image root = $imageRoot"
 "token loaded = $([bool]$env:CYBERBOSS_WEFLOW_TOKEN)  allowedTalkers = $([bool]$env:CYBERBOSS_WEFLOW_ALLOWED_TALKERS)"
 
 Remove-Item $log, $err -Force -ErrorAction SilentlyContinue

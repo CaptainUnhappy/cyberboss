@@ -101,10 +101,17 @@ const WEFLOW_UIA_INBOUND_ACK_TEXT = "处理中";
 const REMINDER_INBOUND_ACK_TEXT = "已记录";
 // Consecutive messages from one chat each claimed their own acknowledgement, so a
 // burst answered every message with "处理中". The first ack is what tells the user the
-// bot is working; repeats inside this window are noise (operator request 2026-09-29).
+// bot is working; the rest of one collected burst is the same logical message and must
+// not answer twice (operator request 2026-09-29: 第一时间回，但同一条连续消息只回一条).
+// The burst is exactly the collection window that decides the dispatched batch
+// (pendingInboundQuietWindowMs), so the ack always covers what the turn really gets.
 // Suppression runs before the claim so no message is left half-handled.
-const WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS = 5_000; // 0 = 每条消息都立刻回执（2026-09-29 要求）
+const WEFLOW_UIA_INBOUND_ACK_QUIET_WINDOW_FALLBACK_MS = 15_000;
 const SILENT_DELIVERY_POLICY = "silent";
+// An inbound attachment the source could not obtain at all (see
+// resolveUnexportableMediaReason in the WeFlow inbox). The operator gets a direct
+// notice instead of a turn that depends on the model explaining the failure.
+const UNREADABLE_INTAKE_FAILURE_CODE = "media_export_unavailable";
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
@@ -147,6 +154,7 @@ class CyberbossApp {
     const projectTooling = createProjectTooling(config, {
       channelAdapter: this.channelAdapter,
       timelineIntegration: this.timelineIntegration,
+      weflowMessageLedger: this.weflowMessageLedger,
     });
     this.projectServices = projectTooling.services;
     this.projectToolHost = projectTooling.toolHost;
@@ -1101,6 +1109,36 @@ class CyberbossApp {
     }
     const sharedContent = isSharedInboxContentMessage(enrichedMessage);
     const explicitPrompt = isExplicitInboxPromptMessage(enrichedMessage);
+    // An attachment the source could never obtain (an appmsg file the reader cannot
+    // export) is reported to the operator here, at the point the failure is first
+    // known, instead of hoping the model explains it or threading it through the
+    // prepare pipeline: measured 2026-09-30, the model answered a bare
+    // "[附件接收失败]" note with a silent action, leaving only a 处理中 in the chat.
+    const unreadableIntake = (Array.isArray(enrichedMessage.attachmentFailures)
+      ? enrichedMessage.attachmentFailures
+      : []
+    ).filter((failure) => normalizeText(failure?.code) === UNREADABLE_INTAKE_FAILURE_CODE);
+    if (unreadableIntake.length) {
+      // The route matters: without `provider` and the WeFlow chat fields this goes to
+      // the official WeChat bot API, which answers "sendMessage ret=-2 ... prepare
+      // failed" (measured 2026-09-30) while the chat it must reach is the WeFlow one.
+      const noticePayload = applyWeFlowInboundReplyRoute({
+        userId: target.userId,
+        text: [
+          "⚠️ 附件读取失败",
+          ...unreadableIntake.map((failure) => `- ${failure.sourceFileName || failure.kind || "附件"}: ${failure.reason}`),
+          "可以改用截图，或把内容直接贴成文字发我。",
+        ].join("\n"),
+        contextToken: target.contextToken,
+        provider: "weflow-uia",
+        messageKind: "intake_failure_notice",
+        preserveBlock: true,
+      }, { provider: "weflow-uia", chatId: `weflow:${chatUsername}` });
+      await this.channelAdapter.sendText(noticePayload).catch((error) => {
+        console.warn(`[cyberboss] intake failure notice could not be sent: ${formatErrorMessage(error)}`);
+      });
+      return true;
+    }
     // The reply must return to the chat this message came from. The UIA bridge
     // resolves the displayed name from the talker, so the chat's own wxid is the
     // route; it rides chatId ("weflow:<talker>"), which every prepared-message hop
@@ -1120,7 +1158,15 @@ class CyberbossApp {
       quotedContexts: Array.isArray(enrichedMessage.quotedContexts) ? enrichedMessage.quotedContexts : [],
       attachments: [],
       persistedAttachments: persisted.saved,
-      persistedAttachmentFailures: [...persisted.failed, ...voice.failures],
+      // `persisted.failed` only covers attachments that arrived and could not be
+      // stored; the inbox also reports media it could never obtain (an appmsg file
+      // the reader cannot export). Dropping those here is what left the operator
+      // with a 处理中 and no explanation (measured 2026-09-30).
+      persistedAttachmentFailures: [
+        ...persisted.failed,
+        ...voice.failures,
+        ...(Array.isArray(enrichedMessage.attachmentFailures) ? enrichedMessage.attachmentFailures : []),
+      ],
       contentKind: normalizeSharedContentKind(enrichedMessage.kind),
       contentTitle: normalizeCommandArgument(enrichedMessage.title),
       contentText: normalizeCommandArgument(enrichedMessage.text),
@@ -2481,16 +2527,34 @@ class CyberbossApp {
     if (!shouldAcknowledgeInbound(prepared)) {
       return false;
     }
-    const ackSuppressionKey = normalizeText(buffered?.scopeKey) || normalizeText(prepared?.senderId);
-    if (ackSuppressionKey) {
-      if (!(this.inboundAckSentAtMs instanceof Map)) {
-        this.inboundAckSentAtMs = new Map();
+    const ackScopeKey = normalizeText(buffered?.scopeKey) || normalizeText(prepared?.senderId);
+    const ackActivityAtMs = resolveInboundAckActivityAtMs({
+      buffered,
+      prepared,
+      nowMs: Date.now(),
+    });
+    if (ackScopeKey) {
+      if (!(this.inboundAckActivityAtMs instanceof Map)) {
+        this.inboundAckActivityAtMs = new Map();
       }
-      const ackSentAtMs = Number(this.inboundAckSentAtMs.get(ackSuppressionKey) || 0);
-      if (ackSentAtMs && Date.now() - ackSentAtMs < WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPPRESS_MS) {
+      const quietWindowMs = resolvePendingInboundQuietWindowMs(this);
+      const ackedActivityAtMs = Number(this.inboundAckActivityAtMs.get(ackScopeKey) || 0);
+      // One collected burst = one acknowledgement. The window is anchored on the
+      // activity time of the message that already answered, so a follow-up inside it
+      // is the same logical message (it is also the same dispatched batch). A scope
+      // that was closed and opened again by a fresh message has a strictly newer
+      // activity, so a new burst always answers immediately.
+      const continuesAckedBurst = quietWindowMs > 0
+        && ackedActivityAtMs > 0
+        && ackActivityAtMs > 0
+        && ackActivityAtMs <= ackedActivityAtMs + quietWindowMs;
+      if (continuesAckedBurst) {
         return false;
       }
-      this.inboundAckSentAtMs.set(ackSuppressionKey, Date.now());
+      this.inboundAckActivityAtMs.set(
+        ackScopeKey,
+        Math.max(ackedActivityAtMs, ackActivityAtMs || Date.now())
+      );
     }
     const scopeKey = normalizeText(buffered?.scopeKey);
     const pendingId = normalizeText(buffered?.message?.pendingId)
@@ -2656,7 +2720,10 @@ class CyberbossApp {
           for (const message of Array.isArray(activeDraft.messages) ? activeDraft.messages : []) {
             if (!message?.acknowledgementStatus && shouldAcknowledgeInbound(message)) {
               await this.acknowledgeBufferedInboundOnce({
-                buffered: { added: false, scopeKey, message },
+                // The burst is acknowledged from its collected activity, not from the
+                // individual message: a restart that lost the in-process burst anchor
+                // must still answer a whole collected scope once, not once per message.
+                buffered: { added: false, scopeKey, message, draft: activeDraft },
                 prepared: message,
               });
             }
@@ -2876,6 +2943,31 @@ class CyberbossApp {
         attachments: [],
         attachmentFailures: [],
       };
+    }
+
+    // Guard for any other source that hands over an unreadable intake: the WeFlow
+    // arrival path already reported it and returned before reaching this method, so
+    // this is a safety net for the same contract, not a second notice.
+    const unreadableIntake = [
+      ...(Array.isArray(normalized?.attachmentFailures) ? normalized.attachmentFailures : []),
+      ...(Array.isArray(normalized?.persistedAttachmentFailures) ? normalized.persistedAttachmentFailures : []),
+    ].filter((failure) => normalizeText(failure?.code) === UNREADABLE_INTAKE_FAILURE_CODE);
+    if (unreadableIntake.length) {
+      await this.channelAdapter.sendText(applyWeFlowInboundReplyRoute({
+        userId: normalized.senderId,
+        text: [
+          "⚠️ 附件读取失败",
+          ...unreadableIntake.map((failure) => `- ${failure.sourceFileName || failure.kind || "附件"}: ${failure.reason}`),
+          "可以改用截图，或把内容直接贴成文字发我。",
+        ].join("\n"),
+        contextToken: normalized.contextToken,
+        provider: "weflow-uia",
+        messageKind: "intake_failure_notice",
+        preserveBlock: true,
+      }, { provider: "weflow-uia", chatId: normalizeText(normalized.chatId) })).catch((error) => {
+        console.warn(`[cyberboss] intake failure notice could not be sent: ${formatErrorMessage(error)}`);
+      });
+      return null;
     }
 
     if (Array.isArray(normalized?.persistedAttachments)
@@ -3224,8 +3316,13 @@ class CyberbossApp {
       senderId: normalized.senderId,
     });
     const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
+    // The conversation key is what a WeChat window's thread is actually stored
+    // under, so it must be passed through: without it `startFreshThreadDraft` falls
+    // back to clearing the workspace slot, the conversation binding survives, and
+    // the next turn resumes the old session — leaving a stale tool list in place.
+    const conversationKey = resolveConversationKeyForSource(normalized);
     if (typeof this.runtimeAdapter.startFreshThreadDraft === "function") {
-      await this.runtimeAdapter.startFreshThreadDraft({ bindingKey, workspaceRoot });
+      await this.runtimeAdapter.startFreshThreadDraft({ bindingKey, workspaceRoot, conversationKey });
     }
     this.runtimeAdapter.getSessionStore().clearThreadIdForWorkspace(bindingKey, workspaceRoot);
     await this.channelAdapter.sendText({
@@ -4123,18 +4220,33 @@ function isTestSessionRequest(text) {
  * never mixes into a real conversation's context.
  */
 function resolveConversationKeyForPrepared(prepared = {}) {
+  return resolveConversationKeyForSource(prepared);
+}
+
+/**
+ * Conversation scope for either a prepared turn or a raw inbound.
+ *
+ * Both shapes carry the same two fields, and the command path (`/new`, `/bind`)
+ * receives the raw inbound rather than a prepared turn. Resolving the key the same
+ * way in both places matters: `startFreshThreadDraft` stores a WeChat window's
+ * thread under the CONVERSATION map, so clearing only the workspace slot leaves the
+ * conversation binding intact and the next turn resumes the very session the
+ * operator just tried to leave. That is exactly what happened on 2026-09-30 — a
+ * `/new` reported success and the runtime logged `resumed session ...` afterwards.
+ */
+function resolveConversationKeyForSource(source = {}) {
   // Derived from the message content, not from a parallel field: the inbound
   // travels through several strict field lists (pending queue, prepared clone)
   // that silently drop anything not on their list, while the text itself always
   // survives. A `[test]` marker therefore cannot be lost on the way.
-  if (preparedRequestsTestSession(prepared)) {
+  if (preparedRequestsTestSession(source)) {
     return TEST_SESSION_KEY;
   }
-  const scope = normalizeText(prepared.sessionScope);
+  const scope = normalizeText(source.sessionScope);
   if (scope) {
     return scope;
   }
-  return normalizeText(prepared.chatId);
+  return normalizeText(source.chatId);
 }
 
 function preparedRequestsTestSession(prepared = {}) {
@@ -4691,7 +4803,33 @@ function resolveInboundActivityTime(activity) {
 
 function resolvePendingInboundQuietWindowMs(app) {
   const configured = Number(app?.config?.pendingInboundQuietWindowMs);
-  return Number.isSafeInteger(configured) && configured >= 0 ? configured : 5_000;
+  return Number.isSafeInteger(configured) && configured >= 0
+    ? configured
+    : WEFLOW_UIA_INBOUND_ACK_QUIET_WINDOW_FALLBACK_MS;
+}
+
+/**
+ * Activity time of the message asking for an acknowledgement, on the same clock the
+ * collection window uses.
+ *
+ * The draft already carries `max(previous activity, this message)`, which keeps a
+ * follow-up that is older than the head of the burst (out-of-order source timestamps)
+ * inside the same window. `prepared.receivedAt` is the fallback for callers without a
+ * store-backed draft, and "now" is the last resort so a missing timestamp can never
+ * turn into "suppress everything".
+ */
+function resolveInboundAckActivityAtMs({ buffered, prepared, nowMs }) {
+  const draftActivityAtMs = Date.parse(normalizeText(buffered?.draft?.lastActivityAt));
+  if (Number.isFinite(draftActivityAtMs) && draftActivityAtMs > 0) {
+    return draftActivityAtMs;
+  }
+  const messageActivityAtMs = Date.parse(
+    normalizeText(buffered?.message?.receivedAt) || normalizeText(prepared?.receivedAt)
+  );
+  if (Number.isFinite(messageActivityAtMs) && messageActivityAtMs > 0) {
+    return Math.min(nowMs, messageActivityAtMs);
+  }
+  return nowMs;
 }
 
 function normalizeIsoTime(value) {
@@ -5186,7 +5324,7 @@ function parseNumericOrderValue(value) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-const DEFERRED_REPLY_NOTICE = "由于微信 context_token 的限制，上轮对话里有一部分内容当时没能送达；这次用户再次发来消息、context_token 刷新后，先把遗留内容补上。如果这种情况反复出现，可发送 /chunk <数字>（例如 /chunk 50）调大最小合并字符数，减少消息分片。";
+const DEFERRED_REPLY_NOTICE = "上轮有一条回复当时没能发出去，现在补上。";
 const DEFERRED_PLAIN_REPLY_HEADER = "===== 上轮对话遗留内容 =====";
 const DEFERRED_SYSTEM_REPLY_HEADER = "===== 期间模型主动联系 =====";
 

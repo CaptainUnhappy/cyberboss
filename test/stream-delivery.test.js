@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 
 const { StreamDelivery } = require("../src/core/stream-delivery");
 
-const DEFERRED_REPLY_NOTICE = "由于微信 context_token 的限制，上轮对话里有一部分内容当时没能送达；这次用户再次发来消息、context_token 刷新后，先把遗留内容补上。如果这种情况反复出现，可发送 /chunk <数字>（例如 /chunk 50）调大最小合并字符数，减少消息分片。";
+const DEFERRED_REPLY_NOTICE = "上轮有一条回复当时没能发出去，现在补上。";
 const DEFERRED_PLAIN_REPLY_HEADER = "===== 上轮对话遗留内容 =====";
 const DEFERRED_SYSTEM_REPLY_HEADER = "===== 期间模型主动联系 =====";
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
@@ -918,6 +918,82 @@ test("plain reply with deferred prefix is sent as soon as the first item is fina
     contextToken: "ctx-8",
     preserveBlock: true,
   });
+});
+
+test("WeFlow UIA leftover goes out on its own and the reply is not glued behind it", async () => {
+  const { sent, streamDelivery, bindingByThreadId } = createHarness();
+  bindingByThreadId.set("thread-9", { bindingKey: "binding-9" });
+  streamDelivery.setReplyTarget("binding-9", {
+    userId: "user-9",
+    contextToken: "ctx-9",
+    provider: "weflow-uia",
+    weflowContact: "contact-9",
+    weflowTalker: "wxid-9",
+  });
+  const leftover = `${DEFERRED_REPLY_NOTICE}\n\n${DEFERRED_PLAIN_REPLY_HEADER}\n旧尾段`;
+  streamDelivery.setDeferredReplyPrefix("binding-9", leftover);
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-9",
+    turnId: "turn-9",
+    itemId: "item-9",
+    text: "这是新一轮自动回复",
+  });
+
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[0], {
+    userId: "user-9",
+    text: leftover,
+    contextToken: "ctx-9",
+    preserveBlock: true,
+    provider: "weflow-uia",
+    weflowContact: "contact-9",
+    weflowTalker: "wxid-9",
+  });
+  assert.deepEqual(sent[1], {
+    userId: "user-9",
+    text: "这是新一轮自动回复",
+    contextToken: "ctx-9",
+    provider: "weflow-uia",
+    weflowContact: "contact-9",
+    weflowTalker: "wxid-9",
+  });
+});
+
+test("a WeFlow UIA leftover that cannot be sent is re-queued instead of glued to the reply", async () => {
+  const deferred = [];
+  const { sent, streamDelivery, bindingByThreadId } = createHarness({
+    async sendText() {
+      const error = new Error("WeChat main window could not be activated");
+      error.deliveryUncertain = false;
+      throw error;
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  bindingByThreadId.set("thread-10", { bindingKey: "binding-10" });
+  streamDelivery.setReplyTarget("binding-10", {
+    userId: "user-10",
+    contextToken: "ctx-10",
+    provider: "weflow-uia",
+  });
+  const leftover = `${DEFERRED_REPLY_NOTICE}\n\n${DEFERRED_PLAIN_REPLY_HEADER}\n旧尾段`;
+  streamDelivery.setDeferredReplyPrefix("binding-10", leftover);
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-10",
+    turnId: "turn-10",
+    itemId: "item-10",
+    text: "这是新一轮自动回复",
+  });
+
+  assert.deepEqual(sent, []);
+  assert.deepEqual(
+    deferred.map((entry) => entry.text),
+    [leftover, "这是新一轮自动回复"]
+  );
+  assert.ok(deferred.every((entry) => entry.provider === "weflow-uia"));
 });
 
 test("reply obligation ignores commentary and verifies exactly one final WeFlow text", async () => {

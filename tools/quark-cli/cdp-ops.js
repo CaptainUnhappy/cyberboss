@@ -468,6 +468,30 @@ async function cmdFocus(needle) {
   return { bringToFront: bring, state };
 }
 
+async function cmdMainFilter(label) {
+  // Switch the "转存的内容" status filter chips. IMPORTANT: never leave it on
+  // 有更新 - the owner of this machine asked explicitly not to use that filter,
+  // and an empty 有更新 view looks like "the save failed" when it did not.
+  const s = await sessionFor(MAIN);
+  const found = await s.eval(`(() => {
+    const want = ${JSON.stringify(label)};
+    const cands = Array.from(document.querySelectorAll('span, div, button, li'));
+    const hit = cands.find((el) => el.children.length === 0 && (el.innerText || '').trim() === want &&
+                                   /checkable|tag|filter|chip/i.test(String(el.className || '') + (el.parentElement ? String(el.parentElement.className || '') : '')));
+    if (!hit) return null;
+    const r = hit.getBoundingClientRect();
+    hit.setAttribute('data-quarkctl-filter', '1');
+    return JSON.stringify({ text: want, cls: String(hit.className || '').slice(0, 40),
+                            rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)] });
+  })()`);
+  if (!found) { s.close(); return { ok: false, reason: 'filter chip not found: ' + label }; }
+  const click = await s.clickSelector('[data-quarkctl-filter="1"]');
+  await new Promise((r) => setTimeout(r, 2500));
+  const after = JSON.parse(await s.eval(MAIN_LIST_JS('')));
+  s.close();
+  return { ok: true, filter: JSON.parse(found), click, breadcrumb: after.breadcrumb, rows: after.tableRows.length, treeItems: after.treeItems.length };
+}
+
 async function main() {
   const cmd = process.argv[2];
   let out;
@@ -489,6 +513,7 @@ async function main() {
     case 'main-click-control': out = await cmdMainClickControl(arg('text'), arg('skip', '')); break;
     case 'main-click-button': out = await cmdMainClickButton(arg('text')); break;
     case 'window-state': out = await cmdWindowState(); break;
+    case 'main-filter': out = await cmdMainFilter(arg('label', '全部')); break;
     case 'bring-front': out = await cmdFocus(arg('page', MAIN)); break;
     default:
       console.error('usage: cdp-ops.js <list-targets|share-info|share-enter|share-select|share-save|main-open-saveas|main-list|main-refresh|main-select|main-select-item|main-click-control|main-click-button> [--name X] [--only] [--filter X] [--text X]');

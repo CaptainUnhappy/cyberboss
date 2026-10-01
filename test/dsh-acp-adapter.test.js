@@ -22,21 +22,49 @@ function makeState() {
  * can assert the adapter's decisions (resume vs create, persona, cancel) without
  * spawning a runtime.
  */
-function makeFakeClient({ resumeFails = false, newSessionIds = ["srv-1", "srv-2", "srv-3"] } = {}) {
+function makeFakeClient({ resumeFails = false, newSessionIds = ["srv-1", "srv-2", "srv-3"], promptImage = false, sessionModel = "" } = {}) {
   const calls = [];
   const listeners = new Set();
   const requestHandlers = new Map();
+  const sessionOptions = new Map();
   let created = 0;
+  const modelOptions = sessionModel
+    ? [{
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: sessionModel,
+      options: [{
+        group: "deepseek-official",
+        name: "DeepSeek",
+        options: [
+          { value: "[\"deepseek-official\",\"deepseek-flash\"]", name: "DeepSeek-V41-Flash" },
+          { value: "[\"deepseek-official\",\"deepseek-v4-flash\"]", name: "DeepSeek-V4-Flash" },
+        ],
+      }],
+    }]
+    : [];
+  const rememberOptions = (sessionId) => {
+    if (modelOptions.length) {
+      sessionOptions.set(sessionId, modelOptions.map((option) => ({ ...option })));
+    }
+  };
   const client = {
     isRunning: () => true,
     initialize: async () => {
       calls.push({ method: "initialize" });
-      return { agentInfo: { name: "deepseek-harness-acp" }, agentCapabilities: {} };
+      return {
+        agentInfo: { name: "deepseek-harness-acp" },
+        agentCapabilities: { promptCapabilities: { image: promptImage } },
+      };
     },
+    promptCapability: (name) => (name === "image" ? promptImage : false),
     newSession: async ({ cwd }) => {
       const id = newSessionIds[created] || `srv-extra-${created}`;
       created += 1;
       calls.push({ method: "session/new", cwd, id });
+      rememberOptions(id);
       return id;
     },
     resumeSession: async (sessionId, { cwd }) => {
@@ -44,7 +72,17 @@ function makeFakeClient({ resumeFails = false, newSessionIds = ["srv-1", "srv-2"
       if (resumeFails) {
         throw new Error("session not found");
       }
+      rememberOptions(sessionId);
       return {};
+    },
+    getSessionConfigOptions: (sessionId) => sessionOptions.get(sessionId) || [],
+    setSessionConfigOption: async (sessionId, configId, value) => {
+      calls.push({ method: "session/set_config_option", sessionId, configId, value });
+      const next = (sessionOptions.get(sessionId) || []).map((option) => (
+        option.id === configId ? { ...option, currentValue: value } : option
+      ));
+      sessionOptions.set(sessionId, next);
+      return next;
     },
     prompt: async (sessionId, blocks) => {
       calls.push({ method: "session/prompt", sessionId, blocks });
@@ -458,5 +496,91 @@ test("describe() reports the ACP surface honestly", () => {
   assert.equal(described.limitations.cancelTurn, "session-cancel");
   assert.equal(adapter.supportsExecutionPolicy(""), true);
   assert.equal(adapter.supportsExecutionPolicy("model_canary_deny_side_effects"), false);
-  assert.deepEqual(adapter.getTurnCapabilities(), { nativeImageInput: true, toolImageRead: false });
+  // No runtime process exists yet, so nothing has been advertised: claiming native
+  // image input here is what made every image turn fail with invalid params.
+  assert.deepEqual(adapter.getTurnCapabilities(), { nativeImageInput: false, toolImageRead: false });
+});
+
+test("a session pinned to another model is aligned to the configured one", async () => {
+  const state = makeState();
+  const fake = makeFakeClient({ sessionModel: "[\"deepseek-official\",\"deepseek-v4-flash\"]" });
+  const adapter = makeAdapter(state, fake, { dshModel: "deepseek-flash", dshProvider: "deepseek-official" });
+  await adapter.sendTurn({
+    bindingKey: bindingKeyOf(adapter),
+    workspaceRoot: state.workspace,
+    text: "hello",
+    metadata: { conversationKey: "weflow:pinned-old-model" },
+  });
+
+  const aligned = fake.calls.filter((call) => call.method === "session/set_config_option");
+  assert.equal(aligned.length, 1, "the session model has to be switched exactly once");
+  assert.equal(aligned[0].configId, "model");
+  assert.equal(aligned[0].value, "[\"deepseek-official\",\"deepseek-flash\"]");
+  assert.ok(
+    fake.calls.findIndex((call) => call.method === "session/set_config_option")
+      < fake.calls.findIndex((call) => call.method === "session/prompt"),
+    "the model must be aligned before the prompt that may carry an image",
+  );
+});
+
+test("an already aligned session is left alone and a missing model option is harmless", async () => {
+  const alignedState = makeState();
+  const aligned = makeFakeClient({ sessionModel: "[\"deepseek-official\",\"deepseek-flash\"]" });
+  const alignedAdapter = makeAdapter(alignedState, aligned, {
+    dshModel: "deepseek-flash",
+    dshProvider: "deepseek-official",
+  });
+  await alignedAdapter.sendTurn({
+    bindingKey: bindingKeyOf(alignedAdapter),
+    workspaceRoot: alignedState.workspace,
+    text: "hello",
+    metadata: { conversationKey: "weflow:already-aligned" },
+  });
+  assert.equal(aligned.calls.filter((call) => call.method === "session/set_config_option").length, 0);
+
+  // An agent that advertises no model option must not break the turn.
+  const bareState = makeState();
+  const bare = makeFakeClient();
+  const bareAdapter = makeAdapter(bareState, bare, {
+    dshModel: "deepseek-flash",
+    dshProvider: "deepseek-official",
+  });
+  const turn = await bareAdapter.sendTurn({
+    bindingKey: bindingKeyOf(bareAdapter),
+    workspaceRoot: bareState.workspace,
+    text: "hello",
+    metadata: { conversationKey: "weflow:no-model-option" },
+  });
+  assert.equal(turn.resumed, false);
+  assert.equal(bare.calls.filter((call) => call.method === "session/set_config_option").length, 0);
+});
+
+test("turn capabilities report the ACP agent's advertised image support", async () => {
+  const state = makeState();
+  const textOnly = makeFakeClient();
+  const textOnlyAdapter = makeAdapter(state, textOnly);
+  await textOnlyAdapter.sendTurn({
+    bindingKey: bindingKeyOf(textOnlyAdapter),
+    workspaceRoot: state.workspace,
+    text: "hello",
+    metadata: { conversationKey: "weflow:text-only" },
+  });
+  assert.deepEqual(textOnlyAdapter.getTurnCapabilities(), {
+    nativeImageInput: false,
+    toolImageRead: false,
+  });
+
+  const visionState = makeState();
+  const vision = makeFakeClient({ promptImage: true });
+  const visionAdapter = makeAdapter(visionState, vision);
+  await visionAdapter.sendTurn({
+    bindingKey: bindingKeyOf(visionAdapter),
+    workspaceRoot: visionState.workspace,
+    text: "hello",
+    metadata: { conversationKey: "weflow:vision" },
+  });
+  assert.deepEqual(visionAdapter.getTurnCapabilities(), {
+    nativeImageInput: true,
+    toolImageRead: false,
+  });
 });
