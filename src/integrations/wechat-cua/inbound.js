@@ -59,17 +59,41 @@ function rowDigest(row) {
 
 /**
  * Read every conversation row currently in the chat list.
+ *
  * Read-only: a single snapshot, no clicks, no keys, no focus change.
+ *
+ * Telling a row apart from a message bubble is not cosmetic - getting it wrong
+ * attributes a message to the wrong peer (measured 2026-10-01: a bubble in the
+ * open conversation was reported as a row for that conversation's peer). The two
+ * are separated structurally, by frame width:
+ *
+ *   conversation row   ~300 x 78 px, label has newlines (peer / preview / time)
+ *   message bubble     ~722 x 68 px, label is a single line
+ *
+ * Width is the reliable half: a preview can itself contain newlines, so "has a
+ * newline" alone is not enough.
  */
 function readRows(session, target) {
   const snap = session.snapshot(target);
-  return elements(snap)
-    .filter((el) => el.role === "ListItem" && /session_item_|^\S+[\s\S]*\n/u.test(el.label || ""))
-    // The conversation list is the second List on screen; bubbles live in the
-    // first. Distinguish by shape: a row has a peer line AND a trailing time or
-    // is one of the known paddings, while a bubble is a single short line.
-    .filter((el) => String(el.label || "").includes("\n"))
-    .map((el) => ({ ...parseRow(el.label), token: el.element_token, index: el.element_index }))
+  const candidates = elements(snap)
+    .filter((el) => el.role === "ListItem")
+    .map((el) => ({ el, label: String(el.label || ""), width: el.frame?.w || 0, height: el.frame?.h || 0 }))
+    .filter((c) => c.label.includes("\n"));
+
+  if (!candidates.length) {
+    return [];
+  }
+  // The chat list is the narrower column; take the modal width of multi-line
+  // rows and keep only those, so a wide bubble with a newline cannot sneak in.
+  const widths = candidates.map((c) => c.width).filter((w) => w > 0);
+  const modal = widths.length
+    ? widths.sort((a, b) => a - b)[Math.floor(widths.length / 2)]
+    : 0;
+  const isRow = (c) => (modal > 0 ? c.width <= modal * 1.2 : true);
+
+  return candidates
+    .filter(isRow)
+    .map((c) => ({ ...parseRow(c.label), token: c.el.element_token, index: c.el.element_index, width: c.width }))
     .filter((row) => row && row.peer);
 }
 
