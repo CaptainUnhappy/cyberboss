@@ -32,6 +32,24 @@ const DRIVER = process.env.CUA_DRIVER
 /** WeChat's desktop client window class is mmui; find it by title instead. */
 const WECHAT_TITLE = /微信|Weixin|WeChat/i;
 
+/**
+ * The two fields every driver call accepts for addressing a window.
+ *
+ * This exists because the client rejects unknown arguments outright
+ * (`invalid_arguments: type_text: unknown argument bounds`), and
+ * `findWeChatWindow` returns a richer object for observability (`bounds`,
+ * `title`, `minimized`). Spreading that object into a call breaks the call, so
+ * every driver-facing argument set is built through here instead.
+ */
+function toTarget(win) {
+  const pid = Number(win?.pid);
+  const windowId = Number(win?.window_id);
+  if (!pid || !windowId) {
+    throw new Error(`toTarget needs {pid, window_id}, got ${JSON.stringify(win)}`);
+  }
+  return { pid, window_id: windowId };
+}
+
 function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
@@ -59,7 +77,7 @@ class CuaSession {
   }
 
   snapshot(target, mode = "ax") {
-    return this.call("get_window_state", { pid: target.pid, window_id: target.window_id, capture_mode: mode });
+    return this.call("get_window_state", { ...toTarget(target), capture_mode: mode });
   }
 }
 
@@ -115,7 +133,7 @@ function findWeChatWindow(session = new CuaSession()) {
  * so this is a read, not a guess.
  */
 function currentConversation(session, target) {
-  const snap = session.snapshot(target);
+  const snap = session.snapshot(toTarget(target));
   const box = elements(snap).find(isEdit);
   return { label: box ? labelOf(box) : "", box, snapshot: snap };
 }
@@ -138,7 +156,7 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800 } = {}
 
   // Rung 1: the accessibility route. Measured to be accepted and ignored by this
   // client, but it is free and it is the documented first attempt, so it stays.
-  const attempt = session.call("click", { ...target, element_token: row.element_token });
+  const attempt = session.call("click", { ...toTarget(target), element_token: row.element_token });
   sleep(settleMs);
   let now = currentConversation(session, target);
   if (wanted.test(now.label)) {
@@ -147,7 +165,7 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800 } = {}
 
   // Rung 2: explicit foreground click. This is the rung that actually switches.
   const fresh = elements(session.snapshot(target)).find((el) => isRow(el) && wanted.test(labelOf(el)));
-  const forced = session.call("click", { ...target, element_token: fresh?.element_token || row.element_token, delivery_mode: "foreground" });
+  const forced = session.call("click", { ...toTarget(target), element_token: fresh?.element_token || row.element_token, delivery_mode: "foreground" });
   sleep(settleMs);
   now = currentConversation(session, target);
   if (!wanted.test(now.label)) {
@@ -173,7 +191,7 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   let conv = currentConversation(session, target);
   if (!conv.box) throw new Error("no message box after opening the conversation");
 
-  const typeArgs = { ...target, element_token: conv.box.element_token, text };
+  const typeArgs = { ...toTarget(target), element_token: conv.box.element_token, text };
   let typed = session.call("type_text", { ...typeArgs, delivery_mode: requireForegroundType ? "foreground" : "background" });
   sleep(600);
   conv = currentConversation(session, target);
@@ -189,11 +207,11 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
     return { ok: false, verify: "text never reached the message box", steps };
   }
 
-  const sent = session.call("press_key", { ...target, element_token: conv.box.element_token, key: "return" });
+  const sent = session.call("press_key", { ...toTarget(target), element_token: conv.box.element_token, key: "return" });
   steps.push({ step: "return", outcome: outcome(sent) });
   sleep(1500);
 
-  const after = session.snapshot(target);
+  const after = session.snapshot(toTarget(target));
   const rows = elements(after).filter(isRow).map(labelOf);
   const probe = text.slice(0, Math.min(16, text.length));
   const seen = rows.find((label) => label.includes(probe));
@@ -207,6 +225,7 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
 
 module.exports = {
   CuaSession,
+  toTarget,
   findWeChatWindow,
   currentConversation,
   ensureConversation,

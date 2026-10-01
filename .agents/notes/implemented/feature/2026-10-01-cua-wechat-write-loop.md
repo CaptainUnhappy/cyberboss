@@ -56,32 +56,54 @@ elapsed: 38 s
 - `element_index` 被 **`element_token`** 取代，且 token **属于某一次快照**；一次 CLI 调用一个进程一个会话，所以"快照→动作"必须在**同一个 `session` 标签内**完成，否则 `stale_element_token`。
 - 元素字段是 **`label`**（0.3.x 是 `name`）。
 - 响应区分**投递**与**生效**：`route` / `effect` / `verified` / `refusal.code` / `escalation`。`✅` 只表示投递成功。本模块的 `outcome()` 保留这个区分，不把"投递"洗成"生效"。
+- **拒绝是精确的，不是模糊的**：多传一个它不认识的参数（例如把 `findWeChatWindow` 返回的对象连 `bounds` 一起 spread 进去）会得到 `invalid_arguments: type_text: unknown argument bounds`，而不是静默失败。所以所有驱动调用都经过 `toTarget()` 白名单。
 
-### 5. UIAccess 助手：不需要，且在这台机器上不可能
+### 5. 闭环（2026-10-01 第二轮补全）
 
-`dispatch:"foreground"` 不需要 UIAccess 就能工作（实测有效）。助手 `cua-driver-uia.exe` 要求 `uiAccess="true"`，Windows 规定它必须住在 `%ProgramFiles%` **且**由受信任根签名：0.3.2 的副本**未签名**（所以永远起不来），0.31.0 的是签名有效的（`CN="Cua AI, Inc."`）。另有一条实测：**注册 `RunLevel=Highest` 的计划任务本身就需要管理员** —— 我先前那些非提权注册从来没真正提权过。
+- **入站源**（`src/integrations/wechat-cua/inbound.js`）：读会话行 → 解析出 `对端 / 预览 / 时间 / 未读数` → 与上一拍比较得出事件。规则明确写死：首拍只建基线不回放、纯重排不算新消息、未读徽标是更强信号、允许名单外的对端一律忽略。
+- **回声账本**（`SentLedger`）：这是**本设计最危险的失败模式**的闸门 —— 出站改变会话行 → 行变化就是入站信号 → 机器人自问自答。账本按对端记住"我刚发过什么"，`runLoop` 默认启用。RDP 时代的部署踩过同一个坑并用账本解决，UIA 读者信息更少，闸门只能更严。
+- **循环**（`src/integrations/wechat-cua/loop.js`）：`runOnce` 是单回合（读 → 决策 → 发 → 验证），`runLoop` 是常驻轮询；两端都可注入，因此能在不碰微信的情况下被测试，也能在真机上跑。
 
 ## Verification
 
-- 离线：`test/wechat-cua-client.test.js` 7/7 —— 覆盖"已打开零成本"、"只在后台级失败后才升级且用最新 token"、"点了没变化不算切换"、"发送以预览行为凭据"、"文字没落地就绝不按回车"、"投递≠生效"、"搜索框不会被误认为消息框"。
-- 真机：`scripts/cua-wechat-live.js` 两条路径都走过 —— 会话已打开（`cost=none`）与未打开（`route=global_input mode=foreground`），两次都 `ok: true` 且有预览行验证。
-- 清理纪律：所有探针默认**发完即清空输入框**、`--dry` 只打字不发送；唯一的真发目标是 `文件传输助手`（自己给自己）。探针文本形如 `CUA-MODULE-ESCALATED-132422`，便于事后辨认与清理。
+- 离线：`test/wechat-cua-client.test.js` 7/7（写侧：已打开零成本、只在后台级失败后升级且用最新 token、点了没变化不算切换、以预览行验证发送、文字没落地绝不按回车、投递≠生效、搜索框不被误认为消息框）；`test/wechat-cua-inbound.test.js` 7/7（读侧：解析、首拍不回放、回声抑制、允许名单、未读徽标、纯重排、账本防自答）。
+- 真机（`scripts/cua-wechat-loop-live.js`）：
+  ```
+  read   : 8 conversation row(s) via Cua
+  baseline: primed with 8 peer(s); events emitted = 0 (must be 0)
+  send   : action=sent verify=preview row: "CUA-LOOP-053403-OUT"
+           open   {"cost":"none","route":"already-open"}
+           type   {"route":"accessibility","mode":"background","effect":"confirmed","landed":true}
+           return {"route":"synthetic_events","mode":"background","escalation":"foreground"}
+  VERDICT: closed loop OK (read -> decide -> send -> verify)
+  ```
+- 真机（`scripts/cua-wechat-reader-live.js`，故意关闭回声抑制以证明读取器真的能感知变化）：
+  ```
+  primed : 8 peer(s), events=0
+  send   : sent verify=preview row: "READER-PROBE-053456"
+  observed: 1 event(s) -> {"peer":"文件传输助手","text":"READER-PROBE-053456","confidence":"preview-changed"}
+  stable  : 0 event(s) on the next poll (must be 0)
+  VERDICT: reader observes row changes exactly once
+  ```
+- 清理纪律：所有探针默认发完即清空输入框、`--dry` 只打字不发送；真发目标固定为 `文件传输助手`（自己给自己）。探针文本形如 `CUA-LOOP-053403-OUT`，便于事后辨认与清理。
 
 ## Consequences
 
 **收益**
 
 - 写侧不再需要：第二个 Windows 账号、常驻 mstsc、保活/重连/远控守卫、文件队列与队列工人、`cwinprobe` 的密码、跨账号进程身份判据。这些是 [RDPWrap 隔离会话部署契约](../../implemented/process/2026-09-18-rdpwrap-isolated-session-deployment.md) 里几乎所有失败模式的来源。
-- 读侧（会话定位、当前会话判定、出站确认）在**最小化甚至屏幕外**的窗口上都可用，且零抢焦点。
+- 读侧（会话定位、当前会话判定、出站确认、入站事件）在**最小化甚至屏幕外**的窗口上都可用，且零抢焦点。
 - 失败信号是结构化的：`refusal.code`、`effect`、`escalation` 让"投递了但没生效"第一次可以被代码区分，而不是靠看日志猜。
+- **闭环可以在没有读库器的情况下闭合**：入站靠会话行预览，出站靠 UIA 写入 + 回车，验证靠预览行。
 
 **代价与边界**
 
 - **每次切换会话有一次前台点击。** 这意味着"机器人发消息时你的桌面会被短暂占用"。缓解手段是已有的空闲门槛（`MIN_CANARY_DESKTOP_IDLE_SECONDS`）与节流，但**这条成本消不掉** —— 除非微信将来暴露可用的后台选中通路。
-- **正文读不到**，所以读侧仍绑在 WeFlow 上；WeFlow 的故障模式（`/health` 200 而 `/messages` 500、WCDB 锚点 `-105`）依旧存在。
+- **入站只有预览，没有正文。** 长消息会被截断，历史与媒体路径都拿不到；回声归因只能靠"文本前缀匹配 + 时间窗"，比账本弱。要正文仍需 WeFlow（当前它在本机报 `-101` 拒绝引导，见下）。
 - **单次操作约 16–38 秒**（大部分是快照与睡眠），比原来的 UIA 桥慢。出站排队/节流策略要按这个量级设计。
 - **依赖个人版 Cua Driver 的接口稳定性**：0.3.2 → 0.31.0 就发生了 `element_index` → `element_token` 这类破坏性变化。模块里所有驱动交互都收敛在 `src/integrations/wechat-cua/client.js`，升级时只改这一处。
-- 未接入机器人本体：闭环目前是**独立可跑的**（脚本 + 模块 + 测试），还没有替换 `weflow-outbound` 那条发送路径。替换前需要决定读侧与写侧的路由（`provider` 字段）怎么共存。
+- **尚未接入机器人本体**：闭环是独立可跑的（模块 + 脚本 + 测试），还没有替换 `weflow-outbound` 的发送路径，也没有把入站源接进 `pending-inbound-store` 那条回合管线。接入前要决定 `provider` 路由（`weflow-uia` 与新通道）如何共存，以及读侧"预览 vs 完整正文"的降级语义。
+- **WeFlow 读侧当前不可用（2026-10-01 实测）**：把它搬到交互会话后，`wcdb.log` 每 ~7 秒报 `[bootstrap] native runtime policy mismatch value=-101`，API `/health` 200 而 `/messages` 500 —— 与笔记里 `-105` 那次同族（锚点状态），重建锚点无效。它在 **5031** 监听而非 `.env` 配的 5051，怀疑这一份是给退役的 Ally 栈配置的实例。这条是"读正文"的唯一途径，仍未解决。
 
 ## Alternatives considered
 
