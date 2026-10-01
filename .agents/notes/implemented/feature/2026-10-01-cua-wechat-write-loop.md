@@ -61,6 +61,27 @@ y=451 w=722 "9月18日 11:03"        ← 时间戳行，读的时候要剔除
 
 结论：**写侧换 Cua（拆掉 RDP）；读侧单会话内已自足，跨会话历史仍需 WeFlow。**
 
+### 3b. 媒体：**文件可发，图片不可发**（2026-10-01 实测）
+
+| 动作 | 结果 |
+|---|---|
+| `clipboard_write({ file_path })` | ✅ `CF_HDROP`，`supported: true`，粘贴落地 |
+| `clipboard_write({ image_path })` | ❌ **被拒绝**：`error_code: clipboard_unavailable`、`supported: false` |
+| `clipboard_write({ text })` | ✅ `CF_UNICODETEXT` |
+| `hotkey ["ctrl","v"]` + `background` | ❌ **修饰键丢失，打进字母 `v`** —— 这不是"较弱的粘贴"，是另一个动作 |
+| `hotkey ["ctrl","v"]` + `foreground` | ✅ SendInput，对象真的进 composer |
+
+真机端到端：文件 → 剪贴板 → 前台 Ctrl+V → composer 出现对象（UIA 值里的 `U+FFFC`）→ 回车 → 会话出现 `文件\ncua-file-probe2.txt\n29B`。
+
+**成本**：粘贴必须前台（`focusCosts: ["paste:foreground"]`），切换到未打开的会话再加一次前台点击。
+
+**两条踩出来的规矩**
+
+1. **粘贴一律前台**：后台路径会把字母 `v` 打进输入框。
+2. **验证按内容，不按条数**：会话列表会滚动 —— 真机上文件明明发出去了（最后一条就是文件气泡），消息条数却从 6 降到 5，用计数判断会得到**假失败**。
+
+**不可用的部分要说清楚**：图片发送在此构建上不是"还没调好"，而是**驱动拒绝把图片放进剪贴板**，所以这条路根本不存在。要发图只能走文件路径（对方收到的是文件，不是图片）。这条一旦上游修复，`sendMedia({ imagePath })` 就会自动开始工作（它已经支持该参数并会如实返回拒绝原因）。
+
 ### 4. 0.31.0 的接口变化（踩过的坑）
 
 - `element_index` 被 **`element_token`** 取代，且 token **属于某一次快照**；一次 CLI 调用一个进程一个会话，所以"快照→动作"必须在**同一个 `session` 标签内**完成，否则 `stale_element_token`。
