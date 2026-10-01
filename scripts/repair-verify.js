@@ -24,11 +24,12 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const os = require("node:os");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 require("dotenv").config({ path: path.join(PROJECT_ROOT, ".env") });
 
-const STATE_DIR = process.env.CYBERBOSS_REPAIR_STATE_DIR || "C:\\ProgramData\\cwin-probe\\repair";
+const STATE_DIR = process.env.CYBERBOSS_REPAIR_STATE_DIR || path.join(os.homedir(), ".cyberboss", "repair");
 const DEFAULT_TIMEOUT_MS = 300_000;
 const POLL_INTERVAL_MS = 3_000;
 

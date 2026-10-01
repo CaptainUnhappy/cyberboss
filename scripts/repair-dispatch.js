@@ -20,6 +20,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const os = require("node:os");
 
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 require("dotenv").config({ path: path.join(PROJECT_ROOT, ".env") });
@@ -27,7 +28,7 @@ require("dotenv").config({ path: path.join(PROJECT_ROOT, ".env") });
 const { AcpRpcClient } = require("../src/adapters/runtime/dsh-acp/rpc-client");
 const { defaultDshBin } = require("../src/adapters/runtime/dsh/rpc-client");
 
-const STATE_DIR = process.env.CYBERBOSS_REPAIR_STATE_DIR || "C:\\ProgramData\\cwin-probe\\repair";
+const STATE_DIR = process.env.CYBERBOSS_REPAIR_STATE_DIR || path.join(os.homedir(), ".cyberboss", "repair");
 const SESSION_FILE = path.join(STATE_DIR, "session.json");
 const LOCK_FILE = path.join(STATE_DIR, "in-progress.json");
 const LOG_FILE = path.join(STATE_DIR, "dispatch.log");
@@ -39,10 +40,10 @@ const PROMPT_TIMEOUT_MS = Number(process.env.CYBERBOSS_REPAIR_PROMPT_TIMEOUT_MS)
 const BOOTSTRAP_TEXT = [
   "你是本项目的固定维修工（repair session），职责是收到故障报告后修复这台机器上的 Cyberboss 服务。",
   "工作方式：",
-  "1. 诊断：先看故障报告里的组件与时间，再读证据（C:\\ProgramData\\cwin-probe\\ 下的日志、tmp\\cwin-lab\\ 的观测文件、账本与义务存储）。",
-  "2. 修复：优先使用 scripts/isolated-session/ 下已入库的配方（weflow-restart.ps1 / bridge-restart.ps1 / rdp-keepalive.py / rdp-autologin.py），并遵守笔记 .agents/notes/implemented/process/2026-09-18-rdpwrap-isolated-session-deployment.md 里的硬约束。",
+  "1. 诊断：先看故障报告里的组件与时间，再读证据（状态目录 %USERPROFILE%\\.cyberboss\\ 下的账本、待处理入站、回复义务、pipeline activity；仓库 tmp\\ 下的运行日志），并用 `node bin/cyberboss.js doctor` 看各渠道就绪情况与原因码。",
+  "2. 修复：个人号通道现在由 Cua 驱动（配方与坑见 docs/wechat-cua-channel.md，探针在 scripts/cua-wechat-*.js）。旧的隔离会话栈（RDPWrap + 第二个账号 + UIA 桥）已退场，scripts/isolated-session/ 与 weflow-uia-bridge.py 都已删除，两篇 RDP 期笔记只作历史记录，不要照着它们动手。写侧常见故障的判据：驱动守护进程没起、微信窗口被最小化、允许名单/会话映射缺失 —— `doctor` 会把它们逐一报出来。",
   "3. 验证：修复后运行 `node scripts/repair-verify.js`；它用 test-session 向大号发一条重启消息并等机器人回复唯一标记，退出码 0 才算通过。",
-  "4. 汇报：把结论写进 C:\\ProgramData\\cwin-probe\\repair\\report-<时间戳>.json（字段 ok / actions / verify.ok / verify.marker / verify.detail），并在本会话里简短说明。",
+  "4. 汇报：把结论写进 %USERPROFILE%\\.cyberboss\\repair\\report-<时间戳>.json（字段 ok / actions / verify.ok / verify.marker / verify.detail），并在本会话里简短说明。",
   "边界：不要改 .env 里的端口与账号身份；不要重启属于用户会话（session 1）的程序；一次只修一个故障，修完就停。",
   "现在先只回复 READY，不要做任何操作。",
 ].join("\n");
