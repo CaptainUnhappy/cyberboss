@@ -16,6 +16,9 @@
 
 防"抢前台"的老办法是让机器人在另一个会话里操作另一个微信实例，代价是一整套环境：RDPWrap、第二个 Windows 账号、文件队列 worker、UIA 桥进程，任何一环坏掉整条通道就静默失效。Cua 直接驱动当前会话的窗口，代价只剩**每次切换会话一次前台点击**（发送本身零成本），换来的是"少四个组件"。
 
+那套环境正在退场（十二个计划任务、RDPWrap 注册、`cwinprobe`、1.16 GB 临时数据），进度与残留见
+`.agents/notes/implemented/process/2026-10-01-retire-rdp-isolated-session-stack.md`：Cua 通道不依赖其中任何一项。
+
 ## 环境变量
 
 ```ini
