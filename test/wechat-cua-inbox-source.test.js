@@ -48,6 +48,7 @@ async function main() {
   await peers_outside_the_allow_list_are_never_delivered();
   await a_throwing_handler_does_not_kill_the_poll();
   await deep_reads_are_rate_limited();
+  await an_empty_allow_list_means_nobody();
   console.log("all cua inbox tests passed");
 }
 
@@ -167,3 +168,28 @@ async function deep_reads_are_rate_limited() {
 
 void synthesizeId;
 main();
+
+/**
+ * The dangerous default: with no peer list configured, `PreviewInboundSource`
+ * treats `null` as "unrestricted". A bot holding a real WeChat account must not
+ * start answering strangers because a variable was left unset.
+ */
+async function an_empty_allow_list_means_nobody() {
+  const delivered = [];
+  const source = new WeChatCuaInboxSource({
+    config: {}, // no allow-list at all
+    session: fakeSession([
+      [row("柳毓琳", "hi")],
+      [row("柳毓琳", "在吗")],
+    ]),
+    target: TARGET,
+    onMessage: (m) => delivered.push(m),
+    logger: { log() {}, warn() {} },
+  });
+  await source.start();
+  source.stop();
+  const n = await source.pollOnce();
+  assert.strictEqual(n, 0, "an unconfigured allow-list must not deliver anything");
+  assert.deepStrictEqual(delivered, [], "nobody may be answered when nobody is allowed");
+  console.log("ok   an empty allow-list means nobody, not everybody");
+}

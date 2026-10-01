@@ -140,7 +140,12 @@ class WeChatCuaInboxSource {
 
     this.source = new PreviewInboundSource(this.resolveTarget(), {
       session: this.session,
-      allowPeers: allow.length ? allow : null,
+      // An EMPTY allow-list must mean "nobody", never "everybody": a bot holding
+      // a real WeChat account must not start answering strangers because a
+      // variable was left unset. `PreviewInboundSource` treats null as
+      // "unrestricted", so an unconfigured peer list is turned into a list that
+      // matches nothing.
+      allowPeers: allow.length ? allow : ["\u0000never-match"],
       deepRead: this.deepRead,
       openConversation,
     });
