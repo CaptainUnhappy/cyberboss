@@ -73,12 +73,28 @@ async function main() {
   log(`boot  account=${app.activeAccountId}`);
 
   // --- inject one inbound event into the app's own handler -------------------
+  // The pending-inbound store REBUILDS every inbound through its own normalizer
+  // (`normalizeMessage`), and drops anything missing a pendingId/messageId,
+  // senderId or provider with "invalid pending inbound message". So the injected
+  // event has to carry the same identifiers a real one would: a messageId (that is
+  // what the pending id falls back to), a provider, and the chatId the outbound
+  // route resolves. Getting this wrong is what made the previous round look like a
+  // routing bug when it was really an incomplete fixture.
+  const messageId = `inject-${Date.now()}`;
   const message = {
-    id: `inject-${Date.now()}`,
+    id: messageId,
+    messageId,
     localId: "",
     talker: TALKER,
     text: TEXT,
     direction: "incoming",
+    provider: "wechat-cua",
+    chatId: `weflow:${TALKER}`,
+    workspaceId: config.workspaceId,
+    accountId: app.activeAccountId,
+    quotedContexts: [],
+    attachments: [],
+    attachmentFailures: [],
     contentKind: "text",
     kind: "text",
     timestamp: Math.floor(Date.now() / 1000),

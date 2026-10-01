@@ -1135,7 +1135,22 @@ class CyberbossApp {
       effectiveMessage = { ...message, origin: "self_manual" };
     }
     this.markPipelineUserInbound?.(message?.receivedAt);
-    const target = this.resolveWeFlowInboxReplyTarget();
+    // Which channel answers an inbound personal-account message.
+    //
+    // `resolveWeFlowInboxReplyTarget()` predates the CUA path and always returns
+    // `provider: "weixin"` (the official iLink channel), because it resolves a
+    // *context token*. On this machine exactly one token exists, so it is picked
+    // "correctly" and the reply is routed to iLink even though the message came
+    // from the desktop client on this very session (measured 2026-10-01: a real
+    // turn ended in the official path's deferred queue, user=o9cq…@im.wechat).
+    //
+    // So when the RDP-free path is enabled, the reply goes back through Cua to the
+    // conversation the message came from - the chat's label is the only address a
+    // UIA writer has, and the snapshot carries it.
+    const cuaTarget = this.config.wechatCuaEnabled && normalizeCommandArgument(snapshot.chatUsername)
+      ? { userId: "", contextToken: "", provider: "wechat-cua" }
+      : null;
+    const target = cuaTarget || this.resolveWeFlowInboxReplyTarget();
     if (!target) {
       return false;
     }
