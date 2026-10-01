@@ -80,6 +80,12 @@ function readConfig() {
     // must be a deliberate operator choice.
     wechatCuaEnabled: readBoolEnv("CYBERBOSS_ENABLE_WECHAT_CUA"),
     wechatCuaChatByTalker: readTextEnv("CYBERBOSS_CUA_CHAT_BY_TALKER"),
+    // The inbound half of the same path. Opt-in for the same reason as the
+    // outbound one, plus: a "message" here is a changed conversation row, and a
+    // deep read costs a foreground click.
+    wechatCuaInboxEnabled: mode === "start" && readBoolEnv("CYBERBOSS_ENABLE_WECHAT_CUA_INBOX"),
+    wechatCuaInboxDeepRead: readBoolEnv("CYBERBOSS_WECHAT_CUA_INBOX_DEEP_READ"),
+    wechatCuaAllowPeers: readTextEnv("CYBERBOSS_WECHAT_CUA_ALLOW_PEERS"),
     weflowBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BASE_URL") || "http://127.0.0.1:5031",
     weflowBridgeBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BRIDGE_BASE_URL") || "http://127.0.0.1:8766",
     weflowBridgeTimeoutMs: readIntEnv("CYBERBOSS_WEFLOW_BRIDGE_TIMEOUT_MS") || 30_000,

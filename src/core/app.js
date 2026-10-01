@@ -173,6 +173,7 @@ class CyberbossApp {
     this.systemMessageDispatcher = null;
     this.wechatCliInboxSource = null;
     this.weflowInboxSource = null;
+    this.wechatCuaInboxSource = null;
     this.weflowCanaryInboxSource = null;
     this.voiceTranscriptionService = new VoiceTranscriptionService({ config });
     this.streamDelivery = new StreamDelivery({
@@ -336,6 +337,7 @@ class CyberbossApp {
       console.warn(`[cyberboss] voice transcription warmup failed: ${formatErrorMessage(error)}`);
     });
     await this.ensureWeFlowCanaryInboxStarted();
+    await this.ensureWeChatCuaInboxStarted();
     if (this.config.startWithRestartNotification) {
       void this.sendRestartNotification().catch((error) => {
         console.warn(`[cyberboss] restart notification failed: ${formatErrorMessage(error)}`);
@@ -479,6 +481,46 @@ class CyberbossApp {
     return this.weflowInboxSource;
   }
 
+  /**
+   * The RDP-free inbound source: poll the WeChat chat list through Cua and feed
+   * observed messages into the SAME handler the WeFlow source uses, so the turn
+   * pipeline, the ledger classification, the canary and the pending-inbound store
+   * are all reused rather than reimplemented.
+   *
+   * Opt-in, and it must be: on this path a "message" is a changed conversation
+   * row, our own sends are separated only by the echo ledger, and a deep read
+   * costs a foreground click.
+   */
+  async ensureWeChatCuaInboxStarted() {
+    if (!this.config.wechatCuaInboxEnabled || this.wechatCuaInboxSource) {
+      return this.wechatCuaInboxSource;
+    }
+    const { WeChatCuaInboxSource, sharedLedger } = (() => {
+      const inboxModule = require("../integrations/wechat-cua/inbox");
+      const outboundModule = require("../integrations/wechat-cua/outbound");
+      return { ...inboxModule, sharedLedger: outboundModule.sharedLedger };
+    })();
+    this.wechatCuaInboxSource = new WeChatCuaInboxSource({
+      config: this.config,
+      // Same ledger the outbound sender writes to: that is what stops the loop
+      // from answering its own replies.
+      ledger: sharedLedger,
+      deepRead: this.config.wechatCuaInboxDeepRead,
+      onMessage: (message, snapshot) => this.handleWeFlowInboxMessage(message, snapshot),
+    });
+    await this.wechatCuaInboxSource.start();
+    return this.wechatCuaInboxSource;
+  }
+
+  async closeWeChatCuaInbox() {
+    const source = this.wechatCuaInboxSource;
+    this.wechatCuaInboxSource = null;
+    if (source) {
+      source.stop();
+    }
+    return source;
+  }
+
   async recoverPendingInboundAtStartup() {
     // A revoke and the message it cancels are persisted in different durable
     // queues. Start the WeFlow source first and give its revoke queue a bounded
@@ -588,6 +630,7 @@ class CyberbossApp {
   async closeWeFlowInbox() {
     const source = this.weflowInboxSource;
     this.weflowInboxSource = null;
+    this.wechatCuaInboxSource = null;
     if (source) {
       await source.stop();
     }
