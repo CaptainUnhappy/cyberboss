@@ -1,75 +1,119 @@
-# start-uia-worker.ps1 - start Cua's UIAccess input helper.
+# start-uia-worker.ps1 - make Cua's UIAccess input helper usable, then start it.
 #
-# Why: on Windows, Cua Driver's `dispatch:"foreground"` escalation needs to swap
-# the foreground window, and Windows refuses that for a process that is not at
-# UIAccess integrity (the foreground-lock). Cua ships `cua-driver-uia.exe` for
-# exactly this, but that binary carries an elevation manifest, so a normal
-# process cannot spawn it - measured 2026-10-01:
+# ## Why the helper is needed
+#
+# On Windows, Cua Driver's `dispatch:"foreground"` escalation has to swap the
+# foreground window. Windows refuses that for a process below UIAccess integrity
+# (the foreground-lock), and Cua Driver itself is not UIAccess. Measured
+# 2026-10-01 against the WeChat desktop client:
 #
 #   Foreground swap to target HWND 0x50d02 was rejected by Windows ...
 #   This daemon is not at UIAccess integrity ... Fix: install / spawn the
 #   cua-driver-uia worker (UIAccess-manifested PE)
-#   -> running cua-driver-uia.exe directly: "The requested operation requires elevation"
 #
-# ## What this costs you (read before running)
+# ## Why "just elevate it" does not work
 #
-# A UIAccess process can send input to, and read the accessibility tree of,
-# other processes - including elevated ones. It is a real privilege boundary,
-# not a formality. Registering this task means every message the bot sends may
-# take the foreground for a moment.
+# `cua-driver-uia.exe` declares `<requestedExecutionLevel level="asInvoker"
+# uiAccess="true">`. A uiAccess binary must live in a secure location
+# (%ProgramFiles% or %SystemRoot%\System32) AND be signed by a certificate
+# chained to a trusted root; anywhere else Windows refuses to launch it with
+# ERROR_ELEVATION_REQUIRED (0x800702E4) -- which is exactly what a
+# RunLevel=Highest scheduled task reported for it.
 #
-# ## How to run it
+# The default install puts it under `%USERPROFILE%\.cua-driver\packages\...`,
+# so this script copies the whole release folder into Program Files (which needs
+# elevation once), then starts the helper from there.
 #
-#   1. Run this file ONCE from an **elevated** PowerShell
-#      (the task registration needs it; the task itself then runs as you):
-#         Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-File','<this file>'
-#   2. The helper is registered as a logon task and started immediately.
+# ## What running it costs you
 #
-# It is reversible:  Unregister-ScheduledTask -TaskName cua-uia-worker -Confirm:$false
+# A UIAccess process can read the accessibility tree of, and send input to, other
+# processes -- including elevated ones. That is a real privilege boundary. Enable
+# it only if you accept that the automation may briefly take the foreground.
+#
+# ## Usage (elevated, once)
+#
+#   Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','<this file>'
+#
+# Undo:
+#   Unregister-ScheduledTask -TaskName cua-uia-worker -Confirm:$false
+#   Remove-Item 'C:\Program Files\Cua' -Recurse -Force
 #
 # ASCII only: PowerShell 5.1 reads BOM-less files as the ANSI code page.
 
-$ErrorActionPreference = 'Continue'
-
-$candidates = @(
-  (Join-Path $env:USERPROFILE '.cua-driver\packages\releases'),
-  (Join-Path $env:LOCALAPPDATA 'Programs\Cua')
+param(
+  # Copy into Program Files and register the autostart task (needs elevation).
+  [switch]$Install = $true,
+  # Only report what is where.
+  [switch]$Status
 )
-$helper = $null
-foreach ($dir in $candidates) {
-  if (-not (Test-Path -LiteralPath $dir)) { continue }
-  $found = Get-ChildItem -LiteralPath $dir -Recurse -Filter 'cua-driver-uia.exe' -ErrorAction SilentlyContinue |
+
+$ErrorActionPreference = 'Continue'
+$taskName = 'cua-uia-worker'
+$targetDir = Join-Path ${env:ProgramFiles} 'Cua'
+$installRoot = Join-Path $env:USERPROFILE '.cua-driver\packages\releases'
+
+function Find-Helper([string]$root) {
+  if (-not (Test-Path -LiteralPath $root)) { return $null }
+  $hit = Get-ChildItem -LiteralPath $root -Recurse -Filter 'cua-driver-uia.exe' -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
-  if ($found) { $helper = $found.FullName; break }
+  if ($hit) { return $hit.FullName }
+  return $null
 }
-if (-not $helper) {
-  Write-Host "cua-driver-uia.exe not found under: $($candidates -join '; ')"
-  Write-Host "Install Cua Driver first: irm https://cua.ai/driver/install.ps1 | iex"
+
+$sourceHelper = Find-Helper $installRoot
+$stagedHelper = Join-Path $targetDir 'cua-driver-uia.exe'
+
+if ($Status) {
+  Write-Host "installed helper : $(if (Test-Path $stagedHelper) { $stagedHelper } else { '(not staged)' })"
+  Write-Host "source helper    : $(if ($sourceHelper) { $sourceHelper } else { '(not found)' })"
+  $proc = Get-Process -Name 'cua-driver-uia' -ErrorAction SilentlyContinue
+  Write-Host "running          : $(if ($proc) { ($proc | ForEach-Object { "pid=$($_.Id) session=$($_.SessionId)" }) -join ', ' } else { 'no' })"
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  Write-Host "autostart task   : $(if ($task) { "state=$($task.State) runLevel=$($task.Principal.RunLevel)" } else { '(none)' })"
+  exit 0
+}
+
+if (-not $sourceHelper -and -not (Test-Path $stagedHelper)) {
+  Write-Host "cua-driver-uia.exe not found (looked in $installRoot and $targetDir)."
+  Write-Host "Install Cua Driver first:  irm https://cua.ai/driver/install.ps1 | iex"
   exit 2
 }
-Write-Host "helper: $helper"
 
-$taskName = 'cua-uia-worker'
-# HighestAvailable is required: without it the task starts unelevated and the
-# helper's own manifest makes it fail the same way it does from a normal shell.
-$action = New-ScheduledTaskAction -Execute $helper
+# --- 1) stage the whole release next to the helper (it needs its siblings) ----
+if ($sourceHelper) {
+  $releaseDir = Split-Path $sourceHelper -Parent
+  Write-Host "staging $releaseDir -> $targetDir"
+  New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+  Copy-Item -Path (Join-Path $releaseDir '*') -Destination $targetDir -Recurse -Force
+} else {
+  Write-Host "already staged: $stagedHelper"
+}
+
+if (-not (Test-Path $stagedHelper)) {
+  Write-Host "staging failed: $stagedHelper is missing"
+  exit 3
+}
+Write-Host "helper staged at $stagedHelper"
+
+# --- 2) autostart task so it comes back after a reboot -----------------------
+# HighestAvailable: the helper cannot start below UIAccess, and the task has to
+# be able to run it without an interactive prompt.
+$action = New-ScheduledTaskAction -Execute $stagedHelper
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 Write-Host "registered task: $taskName (RunLevel=Highest, at logon)"
 
+# --- 3) start it now and report ---------------------------------------------
 Start-ScheduledTask -TaskName $taskName
-Start-Sleep -Seconds 5
+Start-Sleep -Seconds 6
 $proc = Get-Process -Name 'cua-driver-uia' -ErrorAction SilentlyContinue
 if ($proc) {
-  foreach ($p in $proc) { Write-Host ("running: pid={0} session={1}" -f $p.Id, $p.SessionId) }
+  foreach ($p in $proc) { Write-Host ("helper running: pid={0} session={1}" -f $p.Id, $p.SessionId) }
 } else {
-  Write-Host "the helper is not running; check the task's last result:"
-  Write-Host "  (Get-ScheduledTaskInfo -TaskName $taskName | Select-Object LastTaskResult,LastRunTime)"
+  $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+  Write-Host ("helper NOT running; task last result = 0x{0:X8}" -f $info.LastTaskResult)
+  Write-Host "0x800702E4 = ERROR_ELEVATION_REQUIRED (the binary is still outside a secure location, or unsigned)"
 }
-Write-Host ""
-Write-Host "verify with a foreground escalation of your choice, e.g.:"
-Write-Host '  cua-driver call click ''{"pid":<pid>,"window_id":<wid>,"x":10,"y":10,"dispatch":"foreground"}'''
-Write-Host ""
-Write-Host "to undo:  Unregister-ScheduledTask -TaskName $taskName -Confirm:`$false"
