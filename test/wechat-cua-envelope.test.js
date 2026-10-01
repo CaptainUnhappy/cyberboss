@@ -77,11 +77,21 @@ async function main() {
 
   // The decisive check: the production store accepts it.
   const store = tmpStore();
-  assert.doesNotThrow(
-    () => store.enqueue({ bindingKey: "default:acct:wxid_x", workspaceRoot: "C:/tmp/ws", message: envelope }),
-    "the pipeline would REJECT this envelope, and the message would be lost silently",
-  );
+  const queued = store.enqueue({ bindingKey: "default:acct:wxid_x", workspaceRoot: "C:/tmp/ws", message: envelope });
   console.log("ok   the CUA inbox envelope is accepted by the real pending-inbound store");
+
+  // Accepted is not enough: the record must still answer "did the user send this?"
+  // after it has been through the queue, or the direction was computed for nothing.
+  assert.strictEqual(queued.message.direction, envelope.direction, "direction must survive the queue");
+  assert.strictEqual(
+    queued.message.directionVerified, envelope.directionVerified,
+    "so must whether the direction was actually read off the screen"
+  );
+  assert.ok(
+    ["incoming", "outgoing"].includes(queued.message.direction),
+    `the record must say who sent it, got ${JSON.stringify(queued.message.direction)}`
+  );
+  console.log("ok   the queued record still says who sent the message, and how sure we are");
 
   // And the old, incomplete shape is still rejected - so this test would catch a
   // regression rather than pass for the wrong reason.

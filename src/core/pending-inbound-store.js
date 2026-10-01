@@ -754,6 +754,14 @@ function normalizeMessage(raw, { scopeKey = "", nowMs = Date.now() } = {}) {
     sourceMessageIds: normalizeSourceMessageIds(raw.sourceMessageIds),
     contextToken: normalizeText(raw.contextToken),
     provider,
+    // Who sent it, and how sure we are. The reader answers this from the bubble
+    // colour on screen (see src/integrations/wechat-cua/pixels.js), and the answer
+    // has to survive the queue: "did the user send this?" is a question the record
+    // must still be able to answer when the turn is dispatched, otherwise the
+    // direction was computed and thrown away.
+    direction: normalizeText(raw.direction),
+    directionVerified: raw.directionVerified === true,
+    origin: normalizeText(raw.origin),
     // Which session the turn belongs to (`test-session` for `[test]` traffic).
     // The queue rebuilds every inbound through this list, so a field missing here
     // is a field the runtime never sees - regardless of who set it upstream.
