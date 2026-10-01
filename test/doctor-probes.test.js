@@ -20,6 +20,7 @@ const {
   probeChannels,
   probeIlink,
   probeWeFlowUia,
+  probeWeChatCua,
   readDeclaredChannels,
   summarizeChannels,
 } = require("../src/core/doctor-probes");
@@ -227,6 +228,62 @@ async function testChannelsSummaryDrivesExitCode() {
   assert.deepStrictEqual(broken.notReady, ["ilink"]);
 }
 
+/** The Cua channel's four ways of being silently mute, as doctor must report them. */
+async function testCuaDriverDown() {
+  const result = await probeWeChatCua(
+    { wechatCuaEnabled: true, wechatCuaAllowPeers: "柳毓琳", wechatCuaChatByTalker: "柳毓琳=柳毓琳" },
+    { exec: () => { throw Object.assign(new Error("exit 1"), { stderr: "Cua Driver daemon is not running" }); } }
+  );
+  assert.strictEqual(result.enabled, true);
+  assert.strictEqual(result.ready, false);
+  assert.strictEqual(result.reason, "driver-not-running");
+  assert.match(result.detail, /cua-driver serve/, "the operator must be told how to fix it");
+}
+
+async function testCuaMissingMapping() {
+  const result = await probeWeChatCua(
+    { wechatCuaEnabled: true, wechatCuaAllowPeers: "柳毓琳,Azzy", wechatCuaChatByTalker: "柳毓琳=柳毓琳" },
+    { exec: () => "Cua Driver daemon is running", findWindow: () => ({ pid: 1, title: "微信", minimized: false }) }
+  );
+  assert.strictEqual(result.ready, false);
+  assert.strictEqual(result.reason, "missing-chat-mapping");
+  assert.match(result.detail, /"Azzy"/);
+
+  // A minimized window still reads but cannot be written to - a distinct answer.
+  const minimized = await probeWeChatCua(
+    { wechatCuaEnabled: true, wechatCuaAllowPeers: "柳毓琳", wechatCuaChatByTalker: "柳毓琳=柳毓琳" },
+    { exec: () => "Cua Driver daemon is running", findWindow: () => ({ pid: 1, title: "微信", minimized: true }) }
+  );
+  assert.strictEqual(minimized.reason, "window-minimized");
+}
+
+async function testCuaReady() {
+  const result = await probeWeChatCua(
+    {
+      wechatCuaEnabled: true,
+      wechatCuaInboxEnabled: true,
+      wechatCuaAllowPeers: "柳毓琳,Azzy",
+      wechatCuaChatByTalker: "柳毓琳=柳毓琳,Azzy=Azzy",
+    },
+    { exec: () => "Cua Driver daemon is running", findWindow: () => ({ pid: 1, title: "微信", minimized: false }) }
+  );
+  assert.strictEqual(result.ready, true);
+  assert.strictEqual(result.reason, "");
+  assert.match(result.detail, /answers "柳毓琳", "Azzy"/);
+
+  // An empty allow-list is fail-closed and must not look ready.
+  const emptyList = await probeWeChatCua(
+    { wechatCuaEnabled: true },
+    { exec: () => "Cua Driver daemon is running", findWindow: () => ({ pid: 1, title: "微信", minimized: false }) }
+  );
+  assert.strictEqual(emptyList.reason, "allow-list-empty");
+
+  // Not enabled at all is "disabled", which the summary does not count against us.
+  const off = await probeWeChatCua({}, { exec: () => "Cua Driver daemon is running" });
+  assert.strictEqual(off.enabled, false);
+  assert.strictEqual(off.reason, "disabled");
+}
+
 async function main() {
   const cases = [
     ["unpaired ilink reports no-paired-account without network", testIlinkNotPaired],
@@ -238,6 +295,9 @@ async function main() {
     ["fully wired weflow-uia reports ready", testWeFlowReady],
     ["CYBERBOSS_ENABLED_CHANNELS filters probes", testDeclaredChannelsFilter],
     ["summary decides the doctor exit code", testChannelsSummaryDrivesExitCode],
+    ["cua channel: daemon down is not ready, and says how to fix it", testCuaDriverDown],
+    ["cua channel: a peer without a chat mapping is not ready", testCuaMissingMapping],
+    ["cua channel: a wired setup reports ready", testCuaReady],
   ];
   let failures = 0;
   for (const [name, fn] of cases) {

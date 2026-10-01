@@ -84,6 +84,11 @@ function defaultExec(driver, args, input) {
     encoding: "utf8",
     windowsHide: true,
     maxBuffer: 128 * 1024 * 1024,
+    // Capture stderr explicitly. The sync variants otherwise forward a child's
+    // stderr to the parent's, so a driver outage printed three lines of
+    // "daemon is not running" per poll and drowned the one line that mattered
+    // (the recovery message). It is still available as `error.stderr`.
+    stdio: ["pipe", "pipe", "pipe"],
   });
 }
 

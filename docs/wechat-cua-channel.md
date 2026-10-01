@@ -86,6 +86,7 @@ UIA 树不告诉你方向：对方发的和自己发的都是同样宽、同样 
 ## 验收与自检
 
 ```sh
+node bin/cyberboss.js doctor                       # 通道就绪检查（含 wechat-cua）
 node scripts/cua-wechat-selftest.js              # 只读自检：守护进程、窗口、开关、映射
 node scripts/cua-wechat-session-live.js          # 会话死后能否自愈（只读）
 node scripts/cua-wechat-token-live.js            # token 失效规则（只读，用空写测试）
@@ -99,3 +100,14 @@ node scripts/cua-wechat-directions-live.js "柳毓琳" "Azzy"
 ```
 
 `inject-live` 会自己重试到写入成功：它和机器人的轮询在抢同一个快照，这是**跨进程**才有的竞争（机器人自己进程内的读写不可能交错，因为驱动调用是同步的）。
+
+## 守护进程死了会怎样
+
+会"安静地聋掉"——这是实测过的（2026-10-01 驱动自己死了一次）：读不到的会话列表和"本来就没有新消息"在旧代码里长得一模一样，机器人进程活着但永远不回。现在：
+
+- 快照失败**抛错**，不再被当成空列表；
+- 连续 3 次读失败（且失败原因确实是"守护进程不在"）→ 走驱动自己的 `autostart kick` 拉起，必要时退化为分离启动 `serve`；60 秒冷却，不会变成重启风暴；
+- 拉不起来就用 `error` 级别直说 **DEAF** 并给出修复命令；
+- 读成功后计数清零，下一次故障照常上报。
+
+`cyberboss doctor` 会按"真正会坏的顺序"检查这条通道：守护进程 → 微信窗口（最小化单独报）→ 允许名单非空 → 每个对端都有会话映射。

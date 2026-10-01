@@ -76,6 +76,16 @@ function rowDigest(row) {
  */
 function readRows(session, target) {
   const snap = session.snapshot(target);
+  // A failed snapshot must not look like "a chat list with no rows". Measured
+  // 2026-10-01: when the driver daemon died, every poll returned an empty list, so
+  // the bot kept reporting healthy while hearing nothing - the failure mode this
+  // whole reader exists to avoid. Loud beats silent.
+  if (snap?.__failed) {
+    const detail = typeof snap.payload === "string"
+      ? snap.payload.split("\n")[0]
+      : (snap.payload?.refusal?.message || "driver refused the snapshot");
+    throw new Error(`cua snapshot failed: ${detail}`);
+  }
   const candidates = elements(snap)
     .filter((el) => el.role === "ListItem")
     .map((el) => ({ el, label: String(el.label || ""), width: el.frame?.w || 0, height: el.frame?.h || 0 }))

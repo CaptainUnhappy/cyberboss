@@ -175,6 +175,32 @@ session '<label>' to start it again, or use a new session label.
 
 代价说明：方向只有**打开会话**（`deepRead`）才拿得到，行为一次前台点击。聊天列表那一行看不出方向，所以这是"要确定性就得付一次点击"的取舍，写进 `docs/wechat-cua-channel.md`。
 
+### 10. "安静地聋掉"：驱动进程会死，而旧读者把死当成"没有新消息"（2026-10-01 第十二轮）
+
+驱动守护进程今天自己死过一次（`status` 从 running 变成 not running，所有调用回
+`Cua Driver daemon is not running on \\.\pipe\cua-driver`）。真正的麻烦不是它死了，而是**死得看不出来**：
+
+`readRows()` 拿到失败的快照后，`elements(snap)` 返回空数组 → 每一拍都是"会话列表里没有行" →
+没有事件、没有错误、没有日志。机器人进程活着、心跳正常、**听不见任何东西**。
+
+三处修改：
+
+1. **失败必须响亮**：`readRows()` 现在检查 `snap.__failed` 并抛错（`cua snapshot failed: …`），
+   不再让"读不到"和"空列表"长得一样。
+2. **能自愈就自愈**：`src/integrations/wechat-cua/daemon.js` 提供 `driverStatus()` /
+   `ensureDriverRunning()`——先看 `cua-driver status`，必要时走**驱动自己的** `autostart kick`
+   拉起注册项，注册项不可用时才 `serve` 分离启动。这不是机器人自己发明提权：`autostart enable`
+   本来就是给守护进程准备的开机项。
+3. **自愈要克制、要出声**：`WeChatCuaInboxSource` 连续失败到阈值（默认 3 次）才尝试一次，随后
+   60 秒冷却（不会变成重启风暴）；拉起成功时警告里写明"在此之前它听不见"；拉不起来则用
+   `error` 级别直说 **DEAF** 并给出修复命令。读成功后连续失败计数清零，下一次故障照常上报。
+   非驱动故障（比如"看不到微信窗口"）只报告，不去重启驱动——那只会在错误的层面折腾。
+
+另外把这条通道接进了 `doctor`（此前**完全没有**覆盖）：`probeWeChatCua()` 按真正会坏的顺序检查
+——守护进程在不在 → 微信窗口在不在（最小化单独报 `window-minimized`，因为读得了、写必失败）→
+允许名单是不是空的（空=谁都不回）→ 每个允许对端有没有会话映射（缺映射发送会硬失败）。
+实测：生产配置下 `doctor` 输出 `ilink` ready、`wechat-cua` ready、`notReady` 为空。
+
 ## Verification
 
 - 离线：`test/wechat-cua-session.test.js` 6/6（活会话零重放、会话死掉后复活并**恰好重放一次**、重放再失败就放弃、参数错误不赖会话、`start_session` 不自递归、stderr 拒绝在 `outcome()` 里可读）。**反证**：把恢复分支单独删掉（保留注入缝），该套件在第二条就红 —— 说明它真的在测这个缺陷，而不是恰好一起通过。
@@ -195,7 +221,9 @@ session '<label>' to start it again, or use a new session label.
             y=691 "闭环成功，CUA-E2E-153646"      <- 模型回合的回答，由 CUA 写进真实微信
   ```
   日志里**没有** `failed to deliver reply`（修复前每一轮都有）。注入脚本自己也印证了重试逻辑：`type` 与 `return` 两步各被拒一次 `stale_element_token`，重新快照后通过。
-- 离线（本轮新增）：`test/wechat-cua-session.test.js` 7/7（+ 传输层失败重试一次且不算会话死亡）、`test/wechat-cua-client.test.js` 13/13（+ 被拒后从新快照重试、只补按一次回车、空框不补按、别人的草稿不覆盖、自己的残留先清、最小化先恢复）、`test/local-inbox-identity.test.js` 5/5（身份 + 回复通道路由）、`test/stream-delivery.test.js` 33/33（+ 普通回复必须带上来源通道的 provider）。每个新断言都做过**反证**：单独撤掉对应修复，测试立刻红。
+- 离线（本轮新增）：`test/wechat-cua-liveness.test.js` 6/6（失败的快照必须抛错而不是空列表；连续失败到阈值才恢复且受冷却限制；非驱动故障只报告不重启驱动；`status`/`autostart kick`/`serve` 三级路径各有断言）、`test/doctor-probes.test.js` 12/12（+ wechat-cua 的驱动没起、窗口最小化、允许名单为空、缺映射、就绪五种判定）。
+- 真机：`node bin/cyberboss.js doctor` 在生产配置下输出 `ilink` ready、`wechat-cua` ready、`notReady: []`，退出码 0。
+- 离线：`test/wechat-cua-session.test.js` 7/7（+ 传输层失败重试一次且不算会话死亡）、`test/wechat-cua-client.test.js` 13/13（+ 被拒后从新快照重试、只补按一次回车、空框不补按、别人的草稿不覆盖、自己的残留先清、最小化先恢复）、`test/local-inbox-identity.test.js` 5/5（身份 + 回复通道路由）、`test/stream-delivery.test.js` 33/33（+ 普通回复必须带上来源通道的 provider）。每个新断言都做过**反证**：单独撤掉对应修复，测试立刻红。
 - 离线：`test/wechat-cua-client.test.js` 7/7（写侧：已打开零成本、只在后台级失败后升级且用最新 token、点了没变化不算切换、以预览行验证发送、文字没落地绝不按回车、投递≠生效、搜索框不被误认为消息框）；`test/wechat-cua-inbound.test.js` 7/7（读侧：解析、首拍不回放、回声抑制、允许名单、未读徽标、纯重排、账本防自答）。
 - 真机（`scripts/cua-wechat-loop-live.js`）：
   ```

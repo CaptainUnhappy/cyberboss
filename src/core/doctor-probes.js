@@ -26,9 +26,21 @@
 const { getConfig } = require("../adapters/channel/weixin/api");
 const { listWeixinAccounts } = require("../adapters/channel/weixin/account-store");
 const { redactSensitiveText } = require("../adapters/channel/weixin/redact");
+const { driverStatus } = require("../integrations/wechat-cua/daemon");
+const { findWeChatWindow } = require("../integrations/wechat-cua/client");
+const { execFileSync } = require("node:child_process");
+
+/** Injected in tests; the real driver CLI otherwise. */
+function defaultExecDriver(driver, args) {
+  const { DRIVER } = require("../integrations/wechat-cua/daemon");
+  return execFileSync(driver || DRIVER, args, { encoding: "utf8", windowsHide: true, timeout: 30_000 });
+}
+function defaultFindWeChatWindow() {
+  return findWeChatWindow();
+}
 
 const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
-const CHANNEL_IDS = ["ilink", "weflow-uia"];
+const CHANNEL_IDS = ["ilink", "weflow-uia", "wechat-cua"];
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -262,6 +274,79 @@ async function probeWeFlowUia(config, { fetchImpl = globalThis.fetch, timeoutMs 
 // -------------------------------------------------------------------- api
 
 /**
+ * Readiness of the Cua-driven channel, in the order that actually breaks:
+ *
+ *   1. the driver daemon is not running  -> nothing can be read or written;
+ *   2. no WeChat window is visible        -> the client is closed or minimized away;
+ *   3. the allow-list is empty            -> the bot answers nobody (fail-closed);
+ *   4. a peer has no chat mapping         -> sending to it fails hard by design.
+ *
+ * Every one of these was observed live on 2026-10-01, and all four look identical
+ * from the outside: the bot is up, and no reply ever comes. That is exactly the
+ * question `doctor` exists to answer, so the channel that now carries production
+ * traffic has to be covered by it.
+ */
+async function probeWeChatCua(config, {
+  exec = defaultExecDriver,
+  findWindow = defaultFindWeChatWindow,
+  env = process.env,
+} = {}) {
+  const result = { channel: "wechat-cua", enabled: false, ready: false, reason: "", detail: "" };
+  const enabled = Boolean(config.wechatCuaEnabled || config.wechatCuaInboxEnabled);
+  result.enabled = enabled;
+  if (!enabled) {
+    result.reason = "disabled";
+    result.detail = "not enabled in this process: set CYBERBOSS_ENABLE_WECHAT_CUA (and ..._INBOX for the read half)";
+    return result;
+  }
+
+  const status = driverStatus({ exec });
+  if (!status.running) {
+    result.reason = "driver-not-running";
+    result.detail = `${status.raw} - start it with "cua-driver serve" or re-enable its autostart entry`;
+    return result;
+  }
+
+  try {
+    const win = findWindow();
+    result.detail = `driver up, window ${JSON.stringify(win?.title || "")} (pid ${win?.pid})`;
+    if (win?.minimized) {
+      // A minimized window still reads, but every write fails (measured).
+      result.reason = "window-minimized";
+      result.detail += " - the window is minimized, so sends will fail until it is restored";
+      return result;
+    }
+  } catch (error) {
+    result.reason = "no-wechat-window";
+    result.detail = `the driver is up but sees no WeChat window: ${summarizeError(error)}`;
+    return result;
+  }
+
+  const peers = String(config.wechatCuaAllowPeers || "")
+    .split(",").map((item) => item.trim()).filter(Boolean);
+  if (!peers.length) {
+    result.reason = "allow-list-empty";
+    result.detail = "CYBERBOSS_WECHAT_CUA_ALLOW_PEERS is empty, so the bot will answer nobody";
+    return result;
+  }
+  const mapping = String(config.wechatCuaChatByTalker || "");
+  const mapped = new Set(mapping
+    .split(",").map((item) => item.trim()).filter(Boolean)
+    .map((item) => (item.includes("=") ? item.slice(0, item.indexOf("=")).trim() : ""))
+    .filter(Boolean));
+  const unmapped = peers.filter((peer) => !mapped.has(peer));
+  if (unmapped.length) {
+    result.reason = "missing-chat-mapping";
+    result.detail = `no CYBERBOSS_CUA_CHAT_BY_TALKER entry for ${unmapped.map((p) => JSON.stringify(p)).join(", ")} - sends to them refuse rather than guess`;
+    return result;
+  }
+
+  result.ready = true;
+  result.detail += `; answers ${peers.map((peer) => JSON.stringify(peer)).join(", ")}`;
+  return result;
+}
+
+/**
  * Probe every eligible channel. Never throws: a channel that cannot be probed
  * is reported as `ready: false` with a reason, because the whole point is to
  * turn "no reply" into a readable string.
@@ -271,6 +356,7 @@ async function probeChannels(config, options = {}) {
   const probes = [
     { id: "ilink", run: () => probeIlink(config, options) },
     { id: "weflow-uia", run: () => probeWeFlowUia(config, options) },
+    { id: "wechat-cua", run: () => probeWeChatCua(config, options) },
   ];
   const selected = declared.length ? probes.filter((probe) => declared.includes(probe.id)) : probes;
 
@@ -312,6 +398,7 @@ module.exports = {
   probeChannels,
   probeIlink,
   probeWeFlowUia,
+  probeWeChatCua,
   readDeclaredChannels,
   summarizeChannels,
 };

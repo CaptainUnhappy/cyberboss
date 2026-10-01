@@ -26,6 +26,7 @@
 const { CuaSession, findWeChatWindow } = require("./client");
 const { PreviewInboundSource } = require("./inbound");
 const { SentLedger } = require("./loop");
+const { ensureDriverRunning, isDaemonDown } = require("./daemon");
 
 /** Stable-ish id for de-duplication: there is no server id on this path. */
 function synthesizeId(event) {
@@ -48,6 +49,9 @@ class WeChatCuaInboxSource {
    * @param {boolean} [options.deepRead]     open a changed conversation to get every message
    * @param {number} [options.deepReadCooldownMs]
    * @param {SentLedger} [options.ledger]    echo ledger shared with the outbound sender
+   * @param {Function} [options.ensureDriver] how to bring the Cua daemon back (injected)
+   * @param {number} [options.recoverAfterFailures] consecutive failed polls before recovering
+   * @param {number} [options.recoveryCooldownMs]  how often recovery may run
    */
   constructor({
     config = {},
@@ -60,6 +64,11 @@ class WeChatCuaInboxSource {
     conversationOpener = null,
     ledger = null,
     logger = console,
+    ensureDriver = ensureDriverRunning,
+    execDriver = undefined,
+    spawnDriver = undefined,
+    recoverAfterFailures = 3,
+    recoveryCooldownMs = 60_000,
   } = {}) {
     if (typeof onMessage !== "function") {
       throw new Error("WeChatCuaInboxSource needs an onMessage callback");
@@ -74,10 +83,16 @@ class WeChatCuaInboxSource {
     this.deepReadCooldownMs = deepReadCooldownMs;
     this.ledger = ledger;
     this.logger = logger;
+    this.ensureDriver = ensureDriver;
+    this.execDriver = execDriver;
+    this.spawnDriver = spawnDriver;
+    this.recoverAfterFailures = recoverAfterFailures;
+    this.recoveryCooldownMs = recoveryCooldownMs;
     this.timer = null;
     this.running = false;
     this.lastDeepReadAt = 0;
-    this.stats = { polls: 0, delivered: 0, errors: 0, suppressed: 0 };
+    this.lastRecoveryAt = 0;
+    this.stats = { polls: 0, delivered: 0, errors: 0, suppressed: 0, consecutiveErrors: 0, recoveries: 0, lastRecovery: null };
   }
 
   /** Peer names the bot may answer. Empty means "whatever the inbox config says". */
@@ -150,14 +165,21 @@ class WeChatCuaInboxSource {
       openConversation,
     });
     // Prime immediately: the first poll establishes the baseline and must not
-    // replay the whole chat list as new messages.
-    this.source.poll({
-      isOwnEcho: (row, text) => Boolean(this.ledger && this.ledger.matches(row.peer, text || row.preview)),
-    });
+    // replay the whole chat list as new messages. A throw here is not fatal: the
+    // bot still starts, and the recovery below reports why it is deaf.
+    try {
+      this.source.poll({
+        isOwnEcho: (row, text) => Boolean(this.ledger && this.ledger.matches(row.peer, text || row.preview)),
+      });
+    } catch (error) {
+      this.stats.errors += 1;
+      this.logger.warn?.(`[cyberboss] cua inbox could not prime: ${error.message}`);
+      this.recoverFromFailure(error);
+    }
     this.running = true;
     this.timer = setInterval(() => {
       this.pollOnce().catch((error) => {
-        this.stats.errors += 1;
+        // pollOnce already counted the error and ran recovery; this is only the log.
         this.logger.warn?.(`[cyberboss] cua inbox poll failed: ${error.message}`);
       });
     }, this.pollMs);
@@ -176,15 +198,26 @@ class WeChatCuaInboxSource {
       return 0;
     }
     this.stats.polls += 1;
-    const events = this.source.poll({
-      isOwnEcho: (row, text) => {
-        const suppressed = Boolean(this.ledger && this.ledger.matches(row.peer, text || row.preview));
-        if (suppressed) {
-          this.stats.suppressed += 1;
-        }
-        return suppressed;
-      },
-    });
+    let events;
+    try {
+      events = this.source.poll({
+        isOwnEcho: (row, text) => {
+          const suppressed = Boolean(this.ledger && this.ledger.matches(row.peer, text || row.preview));
+          if (suppressed) {
+            this.stats.suppressed += 1;
+          }
+          return suppressed;
+        },
+      });
+    } catch (error) {
+      // Every failure goes through the same recovery path, however the poll was
+      // started (timer or a direct call), and still reaches the caller.
+      this.stats.errors += 1;
+      this.recoverFromFailure(error);
+      throw error;
+    }
+    // Reading worked: whatever was wrong is over, so the liveness counter resets.
+    this.stats.consecutiveErrors = 0;
     let delivered = 0;
     for (const event of events) {
       const messageId = synthesizeId(event);
@@ -248,6 +281,57 @@ class WeChatCuaInboxSource {
     }
     this.running = false;
     return this;
+  }
+
+  /**
+   * React to a failed poll: bring the driver back, and say so out loud.
+   *
+   * The daemon died once during a live session (2026-10-01) and the bot simply went
+   * quiet - every poll returned an empty chat list, no error, no events. A channel
+   * that cannot hear anything must not look healthy: after a few consecutive
+   * failures this tries the driver's own autostart entry, and if it still cannot
+   * read, it says that in the log on a slow cadence instead of every poll.
+   */
+  recoverFromFailure(error) {
+    const detail = String(error?.message || "");
+    this.stats.consecutiveErrors = (this.stats.consecutiveErrors || 0) + 1;
+    if (this.stats.consecutiveErrors < this.recoverAfterFailures) {
+      return this.stats.consecutiveErrors;
+    }
+    const now = Date.now();
+    if (now - (this.lastRecoveryAt || 0) < this.recoveryCooldownMs) {
+      return this.stats.consecutiveErrors;
+    }
+    this.lastRecoveryAt = now;
+    const daemonDown = isDaemonDown(detail);
+    if (!daemonDown) {
+      this.stats.recoveries = (this.stats.recoveries || 0) + 1;
+      this.logger.error?.(
+        `[cyberboss] cua inbox cannot read the chat list (${this.stats.consecutiveErrors} failed polls): ${detail}`
+      );
+      return this.stats.consecutiveErrors;
+    }
+    let outcome = null;
+    try {
+      outcome = this.ensureDriver({ exec: this.execDriver, spawnImpl: this.spawnDriver });
+    } catch (recoveryError) {
+      outcome = { started: false, how: "failed", detail: recoveryError.message };
+    }
+    this.stats.recoveries = (this.stats.recoveries || 0) + 1;
+    this.stats.lastRecovery = outcome;
+    if (outcome?.started) {
+      this.logger.warn?.(
+        `[cyberboss] cua driver was down (${this.stats.consecutiveErrors} failed polls: ${detail}); `
+        + `started it again via ${outcome.how}. The bot could not hear anything until now.`
+      );
+    } else {
+      this.logger.error?.(
+        `[cyberboss] cua inbox is DEAF: ${this.stats.consecutiveErrors} failed polls (${detail}) `
+        + `and the driver could not be started (${outcome?.how}: ${outcome?.detail}). `
+        + 'Run "cua-driver serve" or re-enable its autostart entry.'
+      );
+    }
+    return this.stats.consecutiveErrors;
   }
 
   describe() {
