@@ -39,6 +39,8 @@ const {
   buildMergedInboundPrepared,
   clonePreparedInboundMessage,
   isSharedContentOnlyPreparedMessage,
+  resolveLocalInboxIdentity,
+  resolveReplyProvider,
   shouldBatchImageOnlyInbound,
   takeImageOnlyBatchMessages,
 } = require("./inbound-turn");
@@ -1147,8 +1149,18 @@ class CyberbossApp {
     // So when the RDP-free path is enabled, the reply goes back through Cua to the
     // conversation the message came from - the chat's label is the only address a
     // UIA writer has, and the snapshot carries it.
-    const cuaTarget = this.config.wechatCuaEnabled && normalizeCommandArgument(snapshot.chatUsername)
-      ? { userId: "", contextToken: "", provider: "wechat-cua" }
+    //
+    // The target carries the CHAT'S DISPLAY NAME as its `userId`, not an empty
+    // string. It is tempting to treat `userId` as "the wxid we do not have" and
+    // leave it blank - but it is also the message's `senderId`, and the pending
+    // inbound store requires one, so an empty value turns a real message into
+    // "invalid pending inbound message" while the user is never answered at all
+    // (measured 2026-10-01, the first live inbound on this path). On a UIA-read
+    // path the display name is both the identity and the reply address, which is
+    // what the CUA writer resolves through CYBERBOSS_CUA_CHAT_BY_TALKER.
+    const cuaChatUsername = normalizeCommandArgument(snapshot.chatUsername);
+    const cuaTarget = this.config.wechatCuaEnabled && cuaChatUsername
+      ? { userId: cuaChatUsername, contextToken: "", provider: "wechat-cua" }
       : null;
     const target = cuaTarget || this.resolveWeFlowInboxReplyTarget();
     if (!target) {
@@ -1194,15 +1206,22 @@ class CyberbossApp {
     // drives the desktop client on this session instead of a bridge living in an
     // isolated one. Opt-in, because it costs a foreground click whenever the
     // conversation is not already open.
+    const localProvider = sendSource === "azzy"
+      ? (this.config.wechatCuaEnabled ? "wechat-cua" : "weflow-uia")
+      : "weixin";
+    const identity = resolveLocalInboxIdentity({
+      provider: localProvider,
+      chatUsername,
+      replyUserId: target.userId,
+      messageId: enrichedMessage.id,
+    });
     const normalized = {
-      provider: sendSource === "azzy"
-        ? (this.config.wechatCuaEnabled ? "wechat-cua" : "weflow-uia")
-        : "weixin",
+      provider: identity.provider,
       accountId: this.activeAccountId,
       workspaceId: this.config.workspaceId,
-      senderId: target.userId,
-      chatId: `weflow:${chatUsername}`,
-      messageId: `weflow:${enrichedMessage.id}`,
+      senderId: identity.senderId,
+      chatId: identity.chatId,
+      messageId: identity.messageId,
       sourceMessageIds: normalizeSourceMessageIds(enrichedMessage.sourceMessageIds),
       contextToken: target.contextToken,
       sessionScope: isTestSessionRequest(enrichedMessage.text) ? TEST_SESSION_KEY : "",
@@ -4132,12 +4151,18 @@ class CyberbossApp {
     if (!userId || isModelCanarySenderId(userId)) {
       return null;
     }
-    const contextToken = this.channelAdapter.getKnownContextTokens()[userId] || "";
-    return {
-      userId,
-      contextToken,
-      provider: "weixin",
-    };
+    // The provider is NOT always iLink. Answering every binding with "weixin" sent
+    // a CUA-path turn's reply to the official API with a WeChat display name as the
+    // recipient (`ret=-3 errmsg=invalid arguments`), so the reply was lost even
+    // though the message had been received and processed. See resolveReplyProvider.
+    const provider = resolveReplyProvider({
+      senderId: userId,
+      cuaEnabled: this.config.wechatCuaEnabled,
+    });
+    const contextToken = provider === "weixin"
+      ? (this.channelAdapter.getKnownContextTokens()[userId] || "")
+      : "";
+    return { userId, contextToken, provider };
   }
 }
 

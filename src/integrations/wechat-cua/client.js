@@ -45,6 +45,38 @@ const DRIVER = process.env.CUA_DRIVER
 /** The driver's refusal when a call arrives for a session that is no longer live. */
 const SESSION_ENDED = /session has ended/i;
 
+/**
+ * The driver's refusal when the token came from a snapshot that has been
+ * superseded. Measured 2026-10-01 against 0.31.0 (`scripts/cua-wechat-token-live.js`):
+ *
+ *   - a token never expires with time (8s idle, still accepted);
+ *   - a token dies the moment ANY later snapshot of that window is taken, by the
+ *     same session or by a different one.
+ *
+ * The driver keeps **one current snapshot per window**, and says so in the refusal
+ * (`current_snapshots: [{snapshot_id, window_id}]`). So a token is only good until
+ * the next read of that window - including a read by another process, an operator
+ * script, or the user clicking around. A writer that reuses a token across a
+ * refusal is guaranteed to be refused again; the only cure is to snapshot again.
+ */
+const STALE_TOKEN = /stale_element_token/;
+
+/**
+ * The driver's transport-level refusal, measured repeatedly on 2026-10-01:
+ *
+ *   Cua Driver daemon is not running on \\.\pipe\cua-driver.
+ *   Start it first with: cua-driver serve --socket \\.\pipe\cua-driver
+ *
+ * It is reported *while the daemon is alive and answering other callers* when two
+ * `cua-driver call` processes race for the pipe - so it is not proof of anything,
+ * and it definitely did not execute the request. That makes a bounded retry the
+ * right response rather than a hard failure the caller has to interpret.
+ */
+const DRIVER_UNAVAILABLE = /daemon is not running/i;
+
+/** The window is minimized, so nothing can be written to it until it is restored. */
+const WINDOW_MINIMIZED = /window_minimized|window is minimized/i;
+
 /** One `cua-driver call` process. Returns stdout; throws Node's child error shape. */
 function defaultExec(driver, args, input) {
   return execFileSync(driver, args, {
@@ -55,13 +87,34 @@ function defaultExec(driver, args, input) {
   });
 }
 
-/** Is this failure the "your session is gone" refusal (as opposed to a bad call)? */
-function isSessionEnded(res) {
-  if (!res?.__failed) return false;
-  const text = typeof res.payload === "string"
+/** Text of a failed response, whichever shape it arrived in. */
+function failureText(res) {
+  if (!res?.__failed) return "";
+  return typeof res.payload === "string"
     ? res.payload
     : res.payload?.refusal?.message || res.payload?.message || "";
-  return SESSION_ENDED.test(String(text));
+}
+
+/** Is this failure the "your session is gone" refusal (as opposed to a bad call)? */
+function isSessionEnded(res) {
+  return SESSION_ENDED.test(String(failureText(res)));
+}
+
+/** Is this failure the "that token is from a superseded snapshot" refusal? */
+function isStaleToken(res) {
+  if (!res?.__failed) return false;
+  return res.payload?.refusal?.code === "stale_element_token" || STALE_TOKEN.test(String(failureText(res)));
+}
+
+/** Is this failure the transport complaining, rather than the daemon refusing? */
+function isDriverUnavailable(res) {
+  return Boolean(res?.__failed) && DRIVER_UNAVAILABLE.test(String(failureText(res)));
+}
+
+/** Is this failure "the window is minimized, so there is nothing to write to"? */
+function isWindowMinimized(res) {
+  if (!res?.__failed) return false;
+  return res.payload?.refusal?.code === "window_minimized" || WINDOW_MINIMIZED.test(String(failureText(res)));
 }
 
 /** WeChat's desktop client window class is mmui; find it by title instead. */
@@ -129,9 +182,19 @@ class CuaSession {
    */
   call(tool, args) {
     const res = this.raw(tool, args);
-    if (tool === "start_session" || !isSessionEnded(res)) return res;
-    this.revive();
-    return this.raw(tool, args);
+    if (tool === "start_session") return res;
+    if (isSessionEnded(res)) {
+      this.revive();
+      return this.raw(tool, args);
+    }
+    if (isDriverUnavailable(res)) {
+      // A transport failure means the daemon never saw the request, so repeating it
+      // cannot double-execute anything. Worth one retry: this is what two racing
+      // `cua-driver call` processes get, and it went away on its own every time.
+      sleep(500);
+      return this.raw(tool, args);
+    }
+    return res;
   }
 
   /** Bring this label back to life (or create it). Returns the driver's answer. */
@@ -208,6 +271,21 @@ function currentConversation(session, target) {
 }
 
 /**
+ * Re-find a conversation row in a NEW snapshot and click it.
+ *
+ * Only used after a `stale_element_token` refusal: the driver rejected the call,
+ * so nothing was clicked, and the cure is a token from the current snapshot rather
+ * than a retry with the one that was just refused. Returns null if the row is gone.
+ */
+function reclickRow(session, target, wanted, deliveryMode = "") {
+  const row = elements(session.snapshot(target)).find((el) => isRow(el) && wanted.test(labelOf(el)));
+  if (!row) return null;
+  const args = { ...toTarget(target), element_token: row.element_token };
+  if (deliveryMode) args.delivery_mode = deliveryMode;
+  return session.call("click", args);
+}
+
+/**
  * Open `chatLabel` if it is not already open.
  * Returns { switched, route, cost } where route names the rung that worked.
  */
@@ -225,7 +303,10 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800 } = {}
 
   // Rung 1: the accessibility route. Measured to be accepted and ignored by this
   // client, but it is free and it is the documented first attempt, so it stays.
-  const attempt = session.call("click", { ...toTarget(target), element_token: row.element_token });
+  let attempt = session.call("click", { ...toTarget(target), element_token: row.element_token });
+  if (isStaleToken(attempt)) {
+    attempt = reclickRow(session, target, wanted) || attempt;
+  }
   sleep(settleMs);
   let now = currentConversation(session, target);
   if (wanted.test(now.label)) {
@@ -234,13 +315,83 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800 } = {}
 
   // Rung 2: explicit foreground click. This is the rung that actually switches.
   const fresh = elements(session.snapshot(target)).find((el) => isRow(el) && wanted.test(labelOf(el)));
-  const forced = session.call("click", { ...toTarget(target), element_token: fresh?.element_token || row.element_token, delivery_mode: "foreground" });
+  let forced = session.call("click", { ...toTarget(target), element_token: fresh?.element_token || row.element_token, delivery_mode: "foreground" });
+  if (isStaleToken(forced)) {
+    forced = reclickRow(session, target, wanted, "foreground") || forced;
+  }
   sleep(settleMs);
   now = currentConversation(session, target);
   if (!wanted.test(now.label)) {
     throw new Error(`could not open ${JSON.stringify(chatLabel)} (foreground click refused: ${JSON.stringify(outcome(forced))})`);
   }
   return { switched: true, route: "foreground-click", cost: "one focus steal", label: now.label, outcome: outcome(forced) };
+}
+
+/**
+ * Type `text` into the message box identified by `box`.
+ *
+ * The token comes from the caller's most recent snapshot on purpose: a token is
+ * only valid until that window is read again (see STALE_TOKEN above), so every
+ * attempt is built from the freshest read available at that moment.
+ */
+function typeInto(session, target, box, text, mode) {
+  return session.call("type_text", {
+    ...toTarget(target),
+    element_token: box.element_token,
+    text,
+    delivery_mode: mode,
+  });
+}
+
+/**
+ * Bring the window back if Windows has it minimized.
+ *
+ * A minimized window is not writable: the driver refuses foreground delivery with
+ * `window_minimized`, and its snapshots go stale immediately, so the reader still
+ * works while every write fails (measured 2026-10-01 - WeChat sat in the taskbar
+ * and the whole write path stopped, with `stale_element_token` as the only clue).
+ * Restoring costs one foreground activation, and it is only paid after a refusal,
+ * never on the happy path.
+ */
+function bringWindowForward(session, target) {
+  return outcome(session.call("bring_to_front", toTarget(target)));
+}
+
+/** The message box from a fresh snapshot, or null if this view has none. */
+function boxNow(session, target) {
+  return currentConversation(session, target).box || null;
+}
+
+/**
+ * Text this process typed into a conversation's message box but could not confirm
+ * sending (chat label -> text).
+ *
+ * Why this exists: the send ladder can end with our own text still sitting unsent
+ * in the composer - measured 2026-10-01, when a `press_key` refusal on a busy
+ * window left the injected text in the box. The next send then finds a non-empty
+ * box, and the honest choices are "type over it" (mangles the message) or "refuse
+ * forever" (the bot goes mute after one bad press). Neither is acceptable, so the
+ * box is treated as a workspace with an owner:
+ *
+ *   - text WE left behind: cleared, because we know exactly what it is;
+ *   - any other text: never touched - the operator may be typing - and the send
+ *     fails with the text quoted back, so it is visible instead of silent.
+ *
+ * This is process-local on purpose: what another process left behind is *unknown*
+ * text, and unknown text is exactly what must not be destroyed.
+ */
+const leftovers = new Map();
+
+function leftoverFor(chatLabel) {
+  return leftovers.get(chatLabel) || "";
+}
+
+function rememberLeftover(chatLabel, text) {
+  leftovers.set(chatLabel, text);
+}
+
+function forgetLeftover(chatLabel) {
+  leftovers.delete(chatLabel);
 }
 
 /**
@@ -260,24 +411,78 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   let conv = currentConversation(session, target);
   if (!conv.box) throw new Error("no message box after opening the conversation");
 
-  const typeArgs = { ...toTarget(target), element_token: conv.box.element_token, text };
-  let typed = session.call("type_text", { ...typeArgs, delivery_mode: requireForegroundType ? "foreground" : "background" });
+  const draft = String(conv.box.value ?? "");
+  if (draft && draft !== leftoverFor(chatLabel)) {
+    return {
+      ok: false,
+      verify: `the message box already holds unsent text (${JSON.stringify(draft.slice(0, 60))}); refusing to type over it`,
+      steps,
+    };
+  }
+  if (draft) {
+    const cleared = session.call("set_value", { ...toTarget(target), element_token: conv.box.element_token, value: "" });
+    steps.push({ step: "clear-leftover", text: draft.slice(0, 60), outcome: outcome(cleared) });
+    sleep(300);
+    conv = currentConversation(session, target);
+    if (!conv.box) throw new Error("the message box disappeared while clearing our own unsent text");
+  }
+
+  let typed = typeInto(session, target, conv.box, text, requireForegroundType ? "foreground" : "background");
+  let firstAttempt = null;
   sleep(600);
   conv = currentConversation(session, target);
-  const landed = String(conv.box?.value ?? "") === text;
-  if (!landed) {
-    // Background writes are refused by some surfaces; escalate once, explicitly.
-    typed = session.call("type_text", { ...typeArgs, delivery_mode: "foreground" });
-    sleep(600);
-    conv = currentConversation(session, target);
-  }
-  steps.push({ step: "type", landed: String(conv.box?.value ?? "") === text, outcome: outcome(typed) });
   if (String(conv.box?.value ?? "") !== text) {
+    // Two different failures land here and both want the same cure - a NEW token:
+    // the write was refused (typically `stale_element_token`, since anything that
+    // read this window in the meantime invalidated ours), or the surface ignored a
+    // background write. Retrying with the token we already know is dead would just
+    // reproduce the refusal, so the retry is built from a snapshot taken after the
+    // refusal - and if the window is minimized, it is restored first.
+    firstAttempt = outcome(typed);
+    if (firstAttempt.reason === "window_minimized") {
+      bringWindowForward(session, target);
+      sleep(600);
+      conv = currentConversation(session, target);
+    }
+    if (conv.box) {
+      typed = typeInto(session, target, conv.box, text, "foreground");
+      sleep(600);
+      conv = currentConversation(session, target);
+    }
+  }
+  const landed = String(conv.box?.value ?? "") === text;
+  steps.push({ step: "type", landed, outcome: outcome(typed), ...(firstAttempt ? { firstAttempt } : {}) });
+  if (!landed) {
     return { ok: false, verify: "text never reached the message box", steps };
   }
 
-  const sent = session.call("press_key", { ...toTarget(target), element_token: conv.box.element_token, key: "return" });
-  steps.push({ step: "return", outcome: outcome(sent) });
+  let sent = session.call("press_key", { ...toTarget(target), element_token: conv.box.element_token, key: "return" });
+  let pressRetryFrom = null;
+  let skippedRepress = false;
+  const pressRefusal = outcome(sent);
+  if (pressRefusal.failed && (isStaleToken(sent) || isWindowMinimized(sent))) {
+    // The press was refused, so it did not happen. Whether to press again depends
+    // on the box, not on optimism: text still there = nothing was sent, empty box
+    // = the message went out and only our view of it is stale, so pressing again
+    // would send a second copy. Verification below decides, not this branch.
+    pressRetryFrom = pressRefusal;
+    if (isWindowMinimized(sent)) {
+      bringWindowForward(session, target);
+      sleep(600);
+    }
+    conv = currentConversation(session, target);
+    if (conv.box && String(conv.box.value ?? "") === text) {
+      sent = session.call("press_key", { ...toTarget(target), element_token: conv.box.element_token, key: "return" });
+    } else {
+      skippedRepress = true;
+    }
+  }
+  steps.push({
+    step: "return",
+    outcome: outcome(sent),
+    ...(pressRetryFrom ? { firstAttempt: pressRetryFrom } : {}),
+    ...(skippedRepress ? { skippedRepress } : {}),
+  });
   sleep(1500);
 
   const after = session.snapshot(toTarget(target));
@@ -285,8 +490,16 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   const probe = text.slice(0, Math.min(16, text.length));
   const seen = rows.find((label) => label.includes(probe));
   const boxEmpty = !String(elements(after).find(isEdit)?.value ?? "");
+  const ok = Boolean(seen) && boxEmpty;
+  // Remember our own unsent text so the next attempt may clear it; forget it once
+  // the message is really out, so a later identical message is not "cleared" preemptively.
+  if (ok) {
+    forgetLeftover(chatLabel);
+  } else if (!boxEmpty) {
+    rememberLeftover(chatLabel, text);
+  }
   return {
-    ok: Boolean(seen) && boxEmpty,
+    ok,
     verify: seen ? `preview row: ${JSON.stringify(seen.slice(0, 60))}` : "the text never appeared in any preview row",
     steps,
   };
@@ -301,6 +514,9 @@ module.exports = {
   sendMessage,
   outcome,
   isSessionEnded,
+  isStaleToken,
+  isDriverUnavailable,
+  isWindowMinimized,
   labelOf,
   elements,
 };

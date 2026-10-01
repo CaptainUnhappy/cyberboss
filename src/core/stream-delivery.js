@@ -1249,9 +1249,23 @@ function normalizePositiveIntegerText(value) {
   }
 }
 
+/**
+ * Providers this delivery path knows how to route to, besides the default.
+ *
+ * A missing `provider` on a payload means "the official iLink channel", so any
+ * other channel has to be named explicitly. Only `weflow-uia` used to be copied:
+ * a `wechat-cua` target therefore reached `channelAdapter.sendText` with no
+ * provider, fell through to the official API, and was addressed with a WeChat
+ * DISPLAY NAME as the recipient - `sendMessage ret=-3 errmsg=invalid arguments`.
+ * The turn had run, the answer existed, and it went nowhere (measured 2026-10-01,
+ * the first complete CUA turn).
+ */
+const REPLY_ROUTE_PROVIDERS = new Set(["weflow-uia", "wechat-cua"]);
+
 function applyWeFlowReplyRoute(payload, target) {
-  if (normalizeText(target?.provider) === "weflow-uia") {
-    payload.provider = "weflow-uia";
+  const provider = normalizeText(target?.provider);
+  if (REPLY_ROUTE_PROVIDERS.has(provider)) {
+    payload.provider = provider;
   }
   for (const key of ["weflowContact", "weflowTalker"]) {
     const value = normalizeText(target?.[key]);

@@ -23,10 +23,14 @@
 
 const assert = require("assert");
 
-const { CuaSession, outcome, isSessionEnded } = require("../src/integrations/wechat-cua/client");
+const { CuaSession, outcome, isSessionEnded, isDriverUnavailable } = require("../src/integrations/wechat-cua/client");
 
 const ENDED = (tool, label) =>
   `session has ended; tool call '${tool}' was rejected. Call start_session with session '${label}' to start it again, or use a new session label.`;
+
+/** The transport complaint, measured while the daemon was alive and serving others. */
+const DRIVER_DOWN = "Cua Driver daemon is not running on \\\\.\\pipe\\cua-driver.\n"
+  + "Start it first with: cua-driver serve --socket \\\\.\\pipe\\cua-driver\n";
 
 /** Node's child-process failure shape, as measured from the real driver. */
 function childError({ stdout = "", stderr = "", status = 1 }) {
@@ -64,6 +68,35 @@ test_a_session_that_ends_again_is_not_retried_forever();
 test_other_refusals_are_not_mistaken_for_a_dead_session();
 test_start_session_itself_never_recurses();
 test_the_refusal_is_legible_in_the_outcome();
+test_a_transport_failure_is_retried_once_and_not_blamed_on_the_session();
+
+function test_a_transport_failure_is_retried_once_and_not_blamed_on_the_session() {
+  // Seen repeatedly on 2026-10-01 while two `cua-driver call` processes raced for
+  // the pipe: the daemon was alive and answering the other caller the whole time.
+  // The request never reached it, so one retry is free - and it is NOT a dead
+  // session, so it must not consume a revival.
+  const { exec, seen } = scriptedExec([
+    { tool: "list_windows", fail: { stderr: DRIVER_DOWN, status: 1 } },
+    { tool: "list_windows", reply: windows(["微信"]) },
+  ]);
+  const session = new CuaSession("inbox", { exec });
+  const res = session.call("list_windows", { on_screen_only: false });
+  assert.strictEqual(isDriverUnavailable({ __failed: true, payload: DRIVER_DOWN }), true);
+  assert.strictEqual(res.windows.length, 1, "the retry must return the real answer");
+  assert.strictEqual(session.revivals, 0, "a transport failure is not a dead session");
+  assert.deepStrictEqual(seen.map((s) => s.args[1]), ["list_windows", "list_windows"]);
+
+  // And it is bounded: a driver that stays unreachable is reported, not hammered.
+  const stuck = scriptedExec([
+    { tool: "list_windows", fail: { stderr: DRIVER_DOWN } },
+    { tool: "list_windows", fail: { stderr: DRIVER_DOWN } },
+  ]);
+  const stuckSession = new CuaSession("inbox", { exec: stuck.exec });
+  const failed = stuckSession.call("list_windows", {});
+  assert.strictEqual(failed.__failed, true);
+  assert.deepStrictEqual(stuck.seen.map((s) => s.args[1]), ["list_windows", "list_windows"], "exactly one retry");
+  console.log("ok   a transport failure is retried exactly once and does not count as a dead session");
+}
 
 function test_a_live_session_is_not_touched() {
   const { exec, seen } = scriptedExec([{ tool: "list_windows", reply: windows(["微信"]) }]);

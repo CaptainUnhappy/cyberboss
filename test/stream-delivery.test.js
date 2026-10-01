@@ -1098,3 +1098,49 @@ test("media-only WeFlow reply verifies the obligation with a stable delivery key
   assert.equal(lifecycle[1][1].localId, "61");
   assert.equal(lifecycle[2][1].hadFinalReply, true);
 });
+
+test("an ordinary reply keeps the provider of the channel it arrived on", async () => {
+  // Measured 2026-10-01 on the first complete CUA turn: the reply payload carried
+  // no provider, so it fell through to the official iLink API and was addressed
+  // with a WeChat display name - `sendMessage ret=-3 errmsg=invalid arguments`.
+  // The turn had run and produced an answer; the answer went nowhere.
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-cua", {
+    userId: "文件传输助手",
+    contextToken: "",
+    provider: "wechat-cua",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-cua",
+    turnId: "turn-cua",
+    itemId: "item-cua",
+    text: "answer from the model",
+  });
+
+  assert.equal(sent.length, 1, "the reply must be delivered exactly once");
+  assert.equal(sent[0].provider, "wechat-cua", "an answer must go back over the channel its message arrived on");
+  assert.equal(sent[0].userId, "文件传输助手");
+});
+
+test("an official-channel reply is left on the official channel", async () => {
+  // The other half of the same rule: `weixin` is the default when no provider is
+  // set, so it must stay unnamed rather than being copied around.
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-im", {
+    userId: "o9cq803f7eEyaiOaPX094zYZyws0@im.wechat",
+    contextToken: "ctx-im",
+    provider: "weixin",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-im",
+    turnId: "turn-im",
+    itemId: "item-im",
+    text: "official answer",
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].provider, undefined, "the official channel stays the implicit default");
+  assert.equal(sent[0].contextToken, "ctx-im");
+});

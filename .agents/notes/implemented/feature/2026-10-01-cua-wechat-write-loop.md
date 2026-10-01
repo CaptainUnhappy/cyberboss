@@ -137,6 +137,17 @@ session '<label>' to start it again, or use a new session label.
 
 为了让这段逻辑能离线验证，`CuaSession` 多了 `exec` 注入缝（默认仍是 `execFileSync`），测试可以复现"退出码 1 + stdout 空 + stderr 带这句话"的真实契约。
 
+### 8. 第一次完整真机回合：四处"静默丢失"（2026-10-01 第十轮）
+
+跑通一次真实入站 → 模型回合 → CUA 回复，暴露出四个**互相独立**的缺陷。它们都是"看起来在跑、其实没送到"的类型，只有真机回合能抓出来：
+
+1. **入站信封的 senderId 曾是空串**。CUA 回复目标写成 `{userId: ""}` 是把它当"没有 wxid"的占位符，可同一个字段也是消息的 `senderId`，而 `PendingInboundStore` 要求它非空 —— 真消息被判 `invalid pending inbound message`，只留一行 warn，用户永远收不到回答。现在身份由 `resolveLocalInboxIdentity()` 统一决定：UIA 路径用**会话显示名**，官方通道用 replyUserId，**空值直接抛错**（在还能看见原因的地方失败）。
+2. **回复被路由回官方 iLink**。`applyWeFlowReplyRoute()` 只把 `weflow-uia` 抄进 payload，其它 provider 一律丢弃 → `wechat-cua` 的回复带着微信显示名打到 iLink API：`sendMessage ret=-3 errmsg=invalid arguments`。回合跑完、答案存在、就是没送到。现在路由白名单是 `{weflow-uia, wechat-cua}`；`resolveReplyTargetForBinding()` 也不再对所有 binding 硬编码 `weixin`，而是按 id 形状选通道（`@im.wechat` → 官方，其余 → 本地桌面路径）。
+3. **token 的失效规则不是"超时"**。实测（`scripts/cua-wechat-token-live.js`）：token **不会随时间过期**（空闲 8 秒仍然可用），但**任何后续快照都会让它失效 —— 自己的会话、别的会话、别的进程都一样**。驱动每个窗口只保留**一个当前快照**。于是发送阶梯必须"被拒 → 重新快照 → 用新 token 重试"，拿旧 token 重试等于必然再被拒一次。按回车那一步有额外闸门：**只有文本还在输入框里才补按**，框空了就交给回读判定 —— 盲按会发第二条。
+4. **窗口最小化会让写侧整体失效**（读侧照常）。表现极具误导性：拒绝码是 `stale_element_token`，真正的原因藏在 `window_minimized`。现在被拒时若判定为最小化，先 `bring_to_front` 一次再重试（只在失败路径付一次前台激活）。另外 `daemon is not running on \\.\pipe\cua-driver` 会在守护进程**活着并服务其它调用者**时出现（两个 `cua-driver call` 抢管道），它是传输层失败、请求根本没到，所以重试一次是安全的。
+
+顺带补上的安全策略：**输入框里不是我们写的字就不碰**（人工可能在打字），只清理**本进程自己**留下的未发出文本，并把新消息留在框里的事实写进 step 记录，避免"一次按回车被拒 = 机器人从此哑掉"。
+
 ## Verification
 
 - 离线：`test/wechat-cua-session.test.js` 6/6（活会话零重放、会话死掉后复活并**恰好重放一次**、重放再失败就放弃、参数错误不赖会话、`start_session` 不自递归、stderr 拒绝在 `outcome()` 里可读）。**反证**：把恢复分支单独删掉（保留注入缝），该套件在第二条就红 —— 说明它真的在测这个缺陷，而不是恰好一起通过。
@@ -149,6 +160,15 @@ session '<label>' to start it again, or use a new session label.
   5. WeChat visible after recovery: pid 12920, window 25628362
   PASS: an ended driver session is detected, revived once, and the refused call is repeated
   ```
+- **真机完整回合（2026-10-01 15:29 / 15:37，本项目的验收标准）**：机器人带 `CYBERBOSS_ENABLE_WECHAT_CUA` + `..._INBOX` 跑在 worktree，允许名单只有 `文件传输助手`；用 `scripts/cua-wechat-inject-live.js` 往真实会话里注入一条**机器人没有账本记录的**行变化（在 UI 层等价于"从别处来了条新消息"），然后看它自己走完：
+  ```
+  inject : PASS: "CUA-E2E-153646 请用一句话回复：闭环成功，并附上你看到的这条消息的编号。" is now visible as an unexplained row change
+  bot    : [cyberboss] dsh-acp resumed session 3e46ce89-... for window weflow:文件传输助手
+  readback: y=600 "CUA-E2E-153646 请用一句话回复：闭环成功，并附上你看到的这条消息的编号。"
+            y=691 "闭环成功，CUA-E2E-153646"      <- 模型回合的回答，由 CUA 写进真实微信
+  ```
+  日志里**没有** `failed to deliver reply`（修复前每一轮都有）。注入脚本自己也印证了重试逻辑：`type` 与 `return` 两步各被拒一次 `stale_element_token`，重新快照后通过。
+- 离线（本轮新增）：`test/wechat-cua-session.test.js` 7/7（+ 传输层失败重试一次且不算会话死亡）、`test/wechat-cua-client.test.js` 13/13（+ 被拒后从新快照重试、只补按一次回车、空框不补按、别人的草稿不覆盖、自己的残留先清、最小化先恢复）、`test/local-inbox-identity.test.js` 5/5（身份 + 回复通道路由）、`test/stream-delivery.test.js` 33/33（+ 普通回复必须带上来源通道的 provider）。每个新断言都做过**反证**：单独撤掉对应修复，测试立刻红。
 - 离线：`test/wechat-cua-client.test.js` 7/7（写侧：已打开零成本、只在后台级失败后升级且用最新 token、点了没变化不算切换、以预览行验证发送、文字没落地绝不按回车、投递≠生效、搜索框不被误认为消息框）；`test/wechat-cua-inbound.test.js` 7/7（读侧：解析、首拍不回放、回声抑制、允许名单、未读徽标、纯重排、账本防自答）。
 - 真机（`scripts/cua-wechat-loop-live.js`）：
   ```

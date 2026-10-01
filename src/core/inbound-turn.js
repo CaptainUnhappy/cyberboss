@@ -536,6 +536,79 @@ function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+/**
+ * Which channel answers a thread, given who that thread is with.
+ *
+ * A binding only remembers a sender id. The outbound side then has to choose a
+ * driver from it, and choosing wrong is not a cosmetic bug: measured 2026-10-01,
+ * the generic resolver answered every binding with `provider: "weixin"` (the
+ * official iLink API), so a turn whose message had arrived from this machine's own
+ * WeChat client tried to send its reply to the iLink API with a WeChat DISPLAY NAME
+ * as the recipient - `sendMessage ret=-3 errmsg=invalid arguments`. The user's
+ * message was processed and the reply went nowhere.
+ *
+ * The two id shapes are what actually distinguish the channels here:
+ *   - the official iLink API addresses people by `<id>@im.wechat`;
+ *   - a UIA reader has no wxid at all and addresses a chat by its display name.
+ * So the suffix decides, and the local desktop path picks its driver by whether CUA
+ * is enabled.
+ */
+function resolveReplyProvider({ senderId = "", cuaEnabled = false } = {}) {
+  const sender = normalizeText(senderId);
+  if (!sender) {
+    return "";
+  }
+  if (isOfficialImUserId(sender)) {
+    return "weixin";
+  }
+  return cuaEnabled ? "wechat-cua" : "weflow-uia";
+}
+
+/** Official iLink user ids always end in this suffix. */
+function isOfficialImUserId(senderId) {
+  return /@im\.wechat$/iu.test(normalizeText(senderId));
+}
+
+/**
+ * The identity a locally-read WeChat message travels under.
+ *
+ * Two sources feed this: the official iLink channel (a real wxid, addressed by
+ * `replyUserId`) and the desktop readers that drive this machine's own WeChat
+ * client (`weflow-uia`, `wechat-cua`). A UIA reader has no wxid - WeChat's
+ * conversation rows are labelled with the peer's DISPLAY NAME - so for those the
+ * display name IS the identity it can offer.
+ *
+ * This is a seam because getting it wrong is silent and expensive. Measured
+ * 2026-10-01: the CUA reply target was built with an empty `userId`, which flowed
+ * into `senderId`, and `PendingInboundStore.normalizeMessage` drops any message
+ * without a senderId - so a real inbound message was answered with
+ * "invalid pending inbound message" and the user got no reply. Emptiness is
+ * therefore an error HERE, where the reason is still visible, instead of a
+ * boolean three layers down.
+ */
+function resolveLocalInboxIdentity({ provider = "", chatUsername = "", replyUserId = "", messageId = "" } = {}) {
+  const chat = normalizeText(chatUsername);
+  const normalizedProvider = normalizeText(provider);
+  if (!normalizedProvider) {
+    throw new Error("local inbox message needs a provider");
+  }
+  const senderId = normalizedProvider === "wechat-cua" || normalizedProvider === "weflow-uia"
+    ? chat
+    : normalizeText(replyUserId);
+  if (!senderId) {
+    throw new Error(
+      `local inbox message has no sender identity (provider=${normalizedProvider}, `
+      + `chat=${JSON.stringify(chat)}, replyUserId=${JSON.stringify(normalizeText(replyUserId))})`
+    );
+  }
+  return {
+    provider: normalizedProvider,
+    senderId,
+    chatId: `weflow:${chat}`,
+    messageId: `weflow:${normalizeText(messageId)}`,
+  };
+}
+
 function normalizeSourceMessageIds(value) {
   const seen = new Set();
   const normalized = [];
@@ -581,6 +654,8 @@ module.exports = {
   isPlainTextPreparedMessage,
   isSharedContentOnlyPreparedMessage,
   normalizeQuotedContexts,
+  resolveLocalInboxIdentity,
+  resolveReplyProvider,
   shouldBatchImageOnlyInbound,
   takeImageOnlyBatchMessages,
 };
