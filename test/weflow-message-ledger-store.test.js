@@ -227,6 +227,62 @@ test("an observed local id can complete an uncertain ledger row and is exact the
   assert.equal(recycledId.origin, "self_manual");
 });
 
+test("an echoed reply is still ours when the inbox re-derives URL text as a link", (t) => {
+  const { clock, createStore } = fixture(t);
+  const store = createStore();
+  const replyText = "视频给你传到公网了：https://files.catbox.moe/3jh46f.mp4";
+  const planned = store.planOutbound({
+    talkerId: "chat-link",
+    text: replyText,
+    messageKind: "final_reply",
+  });
+  assert.equal(planned.contentKind, "text");
+  store.markSending(planned);
+  clock.value += 11_000;
+  // The UIA send was observed in the chat but never verified in the ledger.
+  store.markFailed(planned, { uncertain: true });
+
+  // `normalizeWeFlowMessage` labels any row whose text contains a URL as `link`,
+  // so this is exactly what the inbox hands to the classifier.
+  const byHash = store.classifyObservedOutgoing({
+    talker: "chat-link",
+    text: replyText,
+    contentKind: "link",
+    direction: "outgoing",
+    observedAt: clock.value,
+  });
+  assert.equal(byHash.origin, "cyberboss");
+  assert.equal(byHash.matchedBy, "content_hash_fifo");
+
+  const verified = store.planOutbound({
+    talkerId: "chat-link",
+    text: "第二个链接：https://gofile.io/d/zzBCbnlM",
+    messageKind: "final_reply",
+  });
+  store.markSending(verified);
+  store.markVerified(verified, { localId: 907 });
+  const byLocalId = store.classifyObservedOutgoing({
+    talker: "chat-link",
+    localId: 907,
+    text: "第二个链接：https://gofile.io/d/zzBCbnlM",
+    contentKind: "link",
+    direction: "outgoing",
+    observedAt: clock.value,
+  });
+  assert.equal(byLocalId.origin, "cyberboss");
+  assert.equal(byLocalId.matchedBy, "local_id");
+
+  // The relaxation must not make an unrelated same-account link look like ours.
+  const manual = store.classifyObservedOutgoing({
+    talker: "chat-link",
+    text: "手动发的另一个链接：https://example.com/other",
+    contentKind: "link",
+    direction: "outgoing",
+    observedAt: clock.value,
+  });
+  assert.equal(manual.origin, "self_manual");
+});
+
 test("uncertain delivery matches the original send timestamp after verification times out", (t) => {
   const { clock, createStore } = fixture(t);
   const store = createStore();

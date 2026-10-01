@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import stat
+import struct
 import threading
 import time
 import urllib.error
@@ -47,12 +48,10 @@ WECHAT_PROCESS_NAMES = {"wechat.exe", "weixin.exe"}
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SW_RESTORE = 9
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-# Where the per-phase timing marks go. Machine-specific by nature (it is read by
-# an operator on that box), so both the root and the file are configurable
-# instead of literals - and the fallback is stated once, in one place.
-QUEUE_ROOT = Path(os.environ.get("CYBERBOSS_QUEUE_ROOT") or r"C:\ProgramData\cwin-probe")
-TIMING_LOG = os.environ.get("CYBERBOSS_WEFLOW_UIA_TIMING_LOG") or str(QUEUE_ROOT / "bridge-timing.log")
-
+# Extensions WeChat renders as a playable video bubble rather than a file card.
+# Sending these through the file path still delivers the bytes, but the user gets a
+# download prompt instead of a player, so the bridge routes them to the video path.
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".3gp"}
 DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
 DEFAULT_MAX_IMAGE_PIXELS = 100_000_000
 MIN_CANARY_DESKTOP_IDLE_SECONDS = 300
@@ -2452,6 +2451,56 @@ class BridgeState:
         return False
 
     @staticmethod
+    def message_matches_video(message: dict[str, Any], expected_length: int = 0) -> bool:
+        """Identify one outbound video message.
+
+        A video row carries `<videomsg length=... playlength=.../>` and has NO
+        `<title>`, so the file matcher cannot see it. WeChat may also transcode on
+        send (measured 2026-09-30: a 59 MiB source arrived as 5.2 MB with
+        `compress="2"`), so the length is only usable as a filter when it matches,
+        never as a requirement. `localType` 43 is the video type observed on this
+        client.
+        """
+        is_sent = message.get("isSend", message.get("is_send", False))
+        if is_sent not in (True, 1, "1"):
+            return False
+        raw = message.get("rawContent", message.get("raw_content", ""))
+        if not isinstance(raw, str) or "<videomsg" not in raw:
+            return False
+        if expected_length > 0:
+            match = re.search(r'length="(\d+)"', raw)
+            if match and int(match.group(1)) == expected_length:
+                return True
+            # Transcode suspected: fall through to the type-only match below.
+        return True
+
+    @staticmethod
+    def message_matches_file(message: dict[str, Any], file_name: str) -> bool:
+        """Identify one outbound file message by its attachment title.
+
+        WeFlow stores a file send as an appmsg whose `content` is the raw XML, so
+        the placeholder text is useless for matching. The stable key is the
+        attachment title inside that XML (verified 2026-09-30: a .txt send showed
+        `localType=25769803825` with `<title>cyberboss-file-send-test.txt</title>`
+        and `<totallen>182</totallen>`). `localType` is deliberately NOT compared:
+        it is a 64-bit composite and guessing its exact value would fail closed.
+        """
+        is_sent = message.get("isSend", message.get("is_send", False))
+        if is_sent not in (True, 1, "1"):
+            return False
+        expected = normalize_text(file_name)
+        if not expected:
+            return False
+        for key in ("rawContent", "raw_content"):
+            raw = message.get(key)
+            if not isinstance(raw, str) or not raw:
+                continue
+            for title in re.findall(r"<title>([^<]*)</title>", raw):
+                if title.strip() == expected:
+                    return True
+        return False
+
+    @staticmethod
     def message_epoch_seconds(message: dict[str, Any]) -> int:
         value = message.get("createTime", message.get("timestamp", 0))
         try:
@@ -2714,6 +2763,125 @@ class BridgeState:
                 "filePath": str(resolved_path),
                 "sha256": actual_digest,
                 "verificationError": f"outgoing image was not observed in WeFlow before timeout{detail}",
+            }
+
+    def dispatch_file(
+        self,
+        contact: str,
+        talker: str,
+        file_path: str,
+    ) -> dict[str, Any]:
+        """Attach one file and return immediately after Enter.
+
+        No WeFlow verification is attempted: the ledger owns confirmation for
+        media sends (the bot passes a zero verify window for images, and file
+        messages have no reader-side matcher on this bridge).
+        """
+        with self.send_lock:
+            with foreground_return(), uia_com_apartment():
+                self._dispatch_file(contact, file_path)
+            return {
+                "dispatched": True,
+                "verified": False,
+                "uncertain": True,
+                "filePath": file_path,
+                "talker": talker,
+                "verificationError": "file send does not verify against WeFlow; the ledger owns confirmation",
+            }
+
+    def dispatch_file_and_verify(
+        self,
+        contact: str,
+        talker: str,
+        file_path: str,
+        timeout: float,
+        kind: str = "auto",
+    ) -> dict[str, Any]:
+        """Attach one file or video, then confirm it in WeFlow.
+
+        Without this the caller can never mark the send verified: unlike text
+        (matched by content hash) and images (matched by content kind), a document
+        row carries raw appmsg XML and a video row carries `<videomsg>` with no
+        title, so neither of the existing matchers applies.
+
+        `kind` selects the matcher. `auto` sends video extensions through WeChat's
+        video path (which shows a player) and everything else as a file attachment.
+        """
+        file_name = Path(file_path).name
+        suffix = Path(file_path).suffix.lower()
+        resolved_kind = kind if kind in {"file", "video"} else (
+            "video" if suffix in VIDEO_EXTENSIONS else "file"
+        )
+        # A video may be transcoded in flight, so its final byte length is unknown.
+        expected_length = Path(file_path).stat().st_size if resolved_kind == "file" else 0
+
+        def matches(message: dict[str, Any]) -> bool:
+            if resolved_kind == "video":
+                return self.message_matches_video(message)
+            return self.message_matches_file(message, file_name)
+
+        with self.send_lock:
+            try:
+                before = {
+                    message_id
+                    for message in self.fetch_messages(
+                        talker,
+                        request_timeout=min(3.0, max(0.75, timeout / 3)) if timeout > 0 else 0.75,
+                    )
+                    if matches(message)
+                    if (message_id := self.message_id(message))
+                }
+                baseline_available = True
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+                baseline_available = False
+                before = set()
+
+            dispatched_after = int(time.time()) - 2
+            with foreground_return(), uia_com_apartment():
+                self._dispatch_file(contact, file_path)
+
+            deadline = time.monotonic() + max(0.0, timeout)
+            last_error = ""
+            while time.monotonic() < deadline:
+                try:
+                    remaining = max(0.5, deadline - time.monotonic())
+                    for message in self.fetch_messages(
+                        talker,
+                        request_timeout=min(3.0, remaining),
+                    ):
+                        if not matches(message):
+                            continue
+                        message_id = self.message_id(message)
+                        message_time = self.message_epoch_seconds(message)
+                        is_new = bool(message_id) and message_id not in before and (
+                            baseline_available
+                            or (message_time > 0 and message_time >= dispatched_after)
+                        )
+                        if is_new:
+                            return {
+                                "dispatched": True,
+                                "verified": True,
+                                "localId": message_id,
+                                "filePath": file_path,
+                                "fileName": file_name,
+                                "talker": talker,
+                                "contentKind": resolved_kind,
+                                "expectedLength": expected_length,
+                            }
+                except (OSError, ValueError, urllib.error.URLError) as error:
+                    last_error = str(error)
+                time.sleep(0.35)
+
+            detail = f" ({last_error})" if last_error else ""
+            return {
+                "dispatched": True,
+                "verified": False,
+                "uncertain": True,
+                "filePath": file_path,
+                "fileName": file_name,
+                "talker": talker,
+                "contentKind": resolved_kind,
+                "verificationError": f"outgoing {resolved_kind} was not observed in WeFlow before timeout{detail}",
             }
 
     def _dispatch_text(
@@ -2985,6 +3153,63 @@ class BridgeState:
                     pass
 
     @staticmethod
+    def _dispatch_file(contact: str, file_path: str) -> None:
+        """Attach one file by pasting a CF_HDROP file list into the chat editor.
+
+        This is the file counterpart of _dispatch_image: same target selection and
+        same safety gates, but the clipboard carries a shell file list instead of
+        a DIB. Windows Explorer puts a file list on the clipboard when you copy a
+        file, so this is the documented shell mechanism rather than a UI guess.
+        """
+        window_handle = find_wechat_window_handle(require_chat_window=True)
+        if not window_handle:
+            raise RuntimeError("WeChat main window was not found")
+        activate_window(window_handle)
+        time.sleep(0.25)
+        # No try/finally here on purpose: _dispatch_image wraps the same steps in a
+        # try only to restore the clipboard, and a CF_HDROP file list cannot be
+        # captured or restored, so there is nothing for a handler to do.
+        _probe_input = None
+        _probe_root = automation.ControlFromHandle(window_handle)
+        if _probe_root is not None and is_wechat_main_window_identity(
+            class_name=normalize_text(_probe_root.ClassName),
+            control_type_name=normalize_text(_probe_root.ControlTypeName),
+        ):
+            _probe_input = confirm_current_chat_target(_probe_root, contact)
+        if _probe_input is not None:
+            root, input_control = _probe_root, _probe_input
+        else:
+            root, input_control = select_exact_contact_session(window_handle, contact)
+        input_control.Click(waitTime=0.05)
+        confirm_current_chat_target(root, contact)
+        require_foreground_continuity(window_handle)
+        # Clear the editor so a leftover value cannot be sent alongside the file.
+        # The clipboard is NOT restored afterwards: capturing and restoring it
+        # would destroy the file list we are about to paste.
+        automation.SendKeys("{Ctrl}a", waitTime=0.05)
+        set_clipboard_hdrop(file_path)
+        automation.SendKeys("{Ctrl}v", waitTime=0.05)
+        time.sleep(1.2)  # the attach needs longer than an image paste to render
+        # WeChat may surface the pasted path as editor text. Capture whatever is
+        # there now so cleanup can compare against it: clearing unconditionally
+        # could wipe a value another path just wrote, and clearing on the wrong
+        # expectation would let the leftover be sent as the next message.
+        residue = ""
+        residue_pattern = None
+        try:
+            residue_pattern = get_chat_input_value_pattern(input_control)
+            residue = read_chat_input_value(residue_pattern)
+        except Exception:  # cleanup is best-effort; the clipboard paste already happened
+            residue_pattern = None
+        automation.SendKeys("{Enter}", waitTime=0.05)
+        time.sleep(0.4)
+        if residue_pattern is not None and residue:
+            try:
+                clear_unsent_chat_input_value(residue_pattern, residue)
+            except Exception:
+                pass
+
+    @staticmethod
     def is_wechat_ready() -> bool:
         with uia_com_apartment():
             return bool(find_wechat_window_handle(require_chat_window=True))
@@ -3029,13 +3254,50 @@ def set_clipboard_dib(dib_bytes: bytes) -> None:
     raise RuntimeError(f"Windows clipboard could not be opened: {last_error}")
 
 
+def set_clipboard_hdrop(file_path: str) -> None:
+    """Put one file on the Windows clipboard as a shell file list (CF_HDROP).
+
+    This is what Explorer does on "Copy", so WeChat's paste handler treats it as
+    an attached file. Two consequences worth knowing:
+
+    * A sibling CF_UNICODETEXT is offered as well, because some paste handlers ask
+      for text and would otherwise see an empty clipboard.
+    * The previous clipboard contents cannot be preserved: only the DIB path had a
+      text restoration strategy, and reading a file list back is not supported by
+      pywin32. WeChat's editor has already consumed the paste by the time the send
+      returns, so the loss is limited to whatever the user had copied beforehand.
+    """
+    absolute = str(Path(file_path).resolve())
+    encoded = absolute.encode("utf-16-le") + b"\x00\x00"
+    header = struct.pack("<IiiII", 20, 0, 0, 0, 1)  # pFiles, pt.x, pt.y, fNC, fWide
+    payload = header + encoded
+
+    last_error: Exception | None = None
+    for _attempt in range(10):
+        opened = False
+        try:
+            win32clipboard.OpenClipboard()
+            opened = True
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_HDROP, payload)
+            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, absolute)
+            return
+        except Exception as error:  # pywin32 exposes platform-specific exception classes.
+            last_error = error
+        finally:
+            if opened:
+                win32clipboard.CloseClipboard()
+        time.sleep(0.05)
+    raise RuntimeError(f"Windows clipboard could not be opened for a file paste: {last_error}")
+
+
 def _send_timing_log(mark: str, started: float | None) -> None:
     """Phase marks for one /api/send (see bridge-timing.log)."""
     if started is None:
         return
     try:
         elapsed = int((time.monotonic() - started) * 1000)
-        with open(TIMING_LOG, "a", encoding="utf-8") as handle:
+        with open(r"C:\ProgramData\cwin-probe\bridge-timing.log", "a", encoding="utf-8") as handle:
             handle.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {mark} {elapsed}ms\n")
     except OSError:
         pass
@@ -3052,7 +3314,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if started is not None and "/api/send" in str(getattr(self, "path", "")):
             elapsed_ms = int((time.monotonic() - started) * 1000)
             try:
-                with open(TIMING_LOG, "a", encoding="utf-8") as handle:
+                with open(r"C:\ProgramData\cwin-probe\bridge-timing.log", "a", encoding="utf-8") as handle:
                     handle.write(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] send took {elapsed_ms}ms\n")
             except OSError:
                 pass
@@ -3231,6 +3493,51 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     file_path,
                     expected_sha256,
                     timeout,
+                ))
+                return
+            if path == "/api/send-file":
+                contact = normalize_text(payload.get("contact"))
+                talker = normalize_text(payload.get("talker"))
+                file_path = normalize_text(payload.get("filePath"))
+                timeout = float(payload.get("timeout", 30))
+                if not contact or not talker or not file_path:
+                    raise ValueError("contact, talker, and filePath are required")
+                if not talker_is_allowed(self.state.allowed_talkers, talker):
+                    self.send_json(403, {
+                        "dispatched": False,
+                        "code": "TALKER_NOT_ALLOWED",
+                        "error": f"talker {talker!r} is not in the configured send whitelist",
+                        "allowedTalkerCount": len(self.state.allowed_talkers),
+                    })
+                    return
+                # Unlike /api/send-image this does NOT require the file to live under
+                # image_root (that root exists to police bot-generated images), but it
+                # does require a readable regular file, because the paste carries the
+                # path rather than the bytes: an unreadable path would attach nothing.
+                requested = Path(file_path).expanduser()
+                if not requested.is_absolute():
+                    raise ValueError("filePath must be absolute")
+                try:
+                    resolved_file = requested.resolve(strict=True)
+                except (OSError, RuntimeError) as error:
+                    raise ValueError(f"file could not be resolved: {error}") from error
+                try:
+                    file_stat = resolved_file.stat()
+                except OSError as error:
+                    raise ValueError(f"file could not be inspected: {error}") from error
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise ValueError("filePath must reference a regular file")
+                if file_stat.st_size <= 0:
+                    raise ValueError("file is empty")
+                resolved_target = self.state.resolve_target_names(contact, talker)
+                if resolved_target is not None:
+                    contact = resolved_target["rowName"]
+                self.send_json(200, self.state.dispatch_file_and_verify(
+                    contact,
+                    talker,
+                    str(resolved_file),
+                    timeout,
+                    normalize_text(payload.get("kind")) or "auto",
                 ))
                 return
             if path == "/api/command":

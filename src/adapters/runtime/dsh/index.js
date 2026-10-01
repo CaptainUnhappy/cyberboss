@@ -235,6 +235,17 @@ function resolveAttachmentLimitsPatchPath(dirname = __dirname) {
 }
 
 /**
+ * Applied by the ACP adapter: the profile ships `model: deepseek-v4-flash`, whose
+ * catalog entry has no image modality, so the agent advertises
+ * `promptCapabilities.image: false` and every image prompt is rejected as invalid
+ * params. Pinning the image-capable flash model (`deepseek-flash`,
+ * "DeepSeek-V41-Flash") is what makes image turns possible at all.
+ */
+function resolveAcpModelPatchPath(dirname = __dirname) {
+  return path.resolve(dirname, "acp-model.patch.yml");
+}
+
+/**
  * Build the DSH `contentBlocks` for one turn.
  *
  * Accepts both shapes the app can hand over - an `absolutePath` reference (what
@@ -894,4 +905,5 @@ module.exports = {
   materializeApprovalPatch,
   APPROVAL_PLUGIN_PLACEHOLDER,
   resolveAttachmentLimitsPatchPath,
+  resolveAcpModelPatchPath,
 };

@@ -232,6 +232,31 @@ const PROJECT_TOOLS = [
     },
   },
   {
+    name: "cyberboss_channel_send_file_any",
+    description: "Send any local file (video, document, archive) to the current WeChat chat as a real attachment. This drives the personal-account bridge, so it works even when the official bot channel cannot reply. Files outside the shared outbound directory are copied there first.",
+    shortHint: "Send any local file to the current WeChat user.",
+    topics: ["channel"],
+    inputSchema: {
+      type: "object",
+      required: ["filePath"],
+      properties: {
+        filePath: { type: "string", description: "Absolute path of an existing local file." },
+        timeoutMs: { type: "integer", description: "Optional verification window in milliseconds; 0 confirms immediately and defers to the ledger." },
+      },
+      additionalProperties: false,
+    },
+    async handler({ services, args }) {
+      const result = await services.channelFileOutbound.sendToCurrentChat(args);
+      const verified = result.verified === true;
+      return {
+        text: verified
+          ? `File sent and confirmed in WeChat: ${result.fileName}`
+          : `File handed to the WeChat bridge but not confirmed yet: ${result.stagedPath}`,
+        data: result,
+      };
+    },
+  },
+  {
     name: "cyberboss_sticker_tags",
     description: `Load the current sticker tag catalog and tagging rules only when you have decided a sticker is needed or an inbox image should be saved as a sticker. ${STICKER_TAG_GUIDANCE}`,
     shortHint: "Load sticker tags only when needed.",

@@ -74,6 +74,7 @@ Models no longer use local capability CLI commands for diary, reminders, timelin
 Those capabilities are exposed as project-native structured tools:
 
 - `cyberboss_channel_send_file`
+- `cyberboss_channel_send_file_any`
 - `cyberboss_diary_append`
 - `cyberboss_reminder_create`
 - `cyberboss_system_send`
@@ -88,6 +89,7 @@ Notes:
 - Claude Code loads them through workspace-local `.mcp.json` injected by Cyberboss and passed to Claude at startup with `--mcp-config`.
 - Codex loads them through the runtime-side Cyberboss MCP bridge configured at spawn time.
 - The public human terminal surface stays intentionally small: lifecycle commands plus shared bridge scripts.
+- **Two file-send tools, two transports.** `cyberboss_channel_send_file` goes out over the official bot channel (iLink), which needs a `context_token` from an inbound message and therefore can only *reply*. `cyberboss_channel_send_file_any` drives the personal-account UIA bridge, which pastes a real attachment and works at any time. They are not duplicates; pick by whether a reply window is open.
 
 ## Current WeChat Commands
 

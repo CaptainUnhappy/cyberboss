@@ -1,6 +1,7 @@
 const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
 const { SessionStore } = require("../adapters/runtime/codex/session-store");
 const { createTimelineIntegration } = require("../integrations/timeline");
+const { ChannelFileOutboundService } = require("../services/channel-file-outbound-service");
 const { ChannelFileService } = require("../services/channel-file-service");
 const { DiaryService } = require("../services/diary-service");
 const { MemoryService } = require("../services/memory-service");
@@ -23,12 +24,17 @@ function createProjectTooling(config, options = {}) {
     filePath: config.projectToolContextFile,
   });
   const channelFile = new ChannelFileService({ config, channelAdapter, sessionStore });
+  const channelFileOutbound = new ChannelFileOutboundService({
+    config,
+    messageLedger: options.weflowMessageLedger || null,
+  });
   const services = {
     diary: new DiaryService({ config }),
     memory: new MemoryService({ config }),
     reminder: new ReminderService({ config, sessionStore }),
     system: new SystemMessageService({ config, sessionStore }),
     channelFile,
+    channelFileOutbound,
     sticker: new StickerService({ config, channelAdapter, sessionStore, channelFileService: channelFile }),
     timeline: new TimelineService({ config, timelineIntegration, sessionStore }),
     whereabouts: new WhereaboutsService({

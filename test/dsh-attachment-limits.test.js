@@ -5,10 +5,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const { defaultDshBin } = require("../src/adapters/runtime/dsh/rpc-client");
-const {
-  resolveAttachmentLimitsPatchPath,
-  materializeApprovalPatch,
-} = require("../src/adapters/runtime/dsh");
+const { resolveAttachmentLimitsPatchPath, resolveAcpModelPatchPath } = require("../src/adapters/runtime/dsh");
 
 /**
  * DSH's shipped `maxImageDimension` is 8192, and the sdk profile composes
@@ -27,20 +24,10 @@ const {
  * overlay text alone proves nothing: the composed config is asserted too.
  */
 const projectRoot = path.resolve(__dirname, "..");
-const pluginDir = path.join(projectRoot, "dsh-plugins", "cyberboss-approval");
 const overlays = [
   { label: "attachment limits", file: resolveAttachmentLimitsPatchPath() },
-  {
-    label: "approval answerer",
-    // Composed exactly as the adapter composes it: the committed overlay names
-    // the plugin with a placeholder, so handing DSH the raw template would exit
-    // 5 for a reason that has nothing to do with attachment limits.
-    file: materializeApprovalPatch({
-      templatePath: path.join(pluginDir, "main.patch.yml"),
-      stateDir: fs.mkdtempSync(path.join(require("node:os").tmpdir(), "cb-compose-")),
-      pluginEntry: path.join(pluginDir, "src", "index.js"),
-    }),
-  },
+  { label: "acp model pin", file: resolveAcpModelPatchPath() },
+  { label: "approval answerer", file: path.join(projectRoot, "dsh-plugins", "cyberboss-approval", "main.patch.yml") },
 ];
 
 function dumpComposedConfig(patchPaths) {

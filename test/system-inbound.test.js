@@ -152,6 +152,40 @@ test("system messages dispatch to a known platform user without a context token"
   assert.equal(captured.prepared.contextToken, "");
 });
 
+test("an unreadable inbound attachment is reported to the operator instead of opening a turn", async () => {
+  const sent = [];
+  const prepared = await CyberbossApp.prototype.prepareIncomingMessageForRuntime.call({
+    config: { stateDir: fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-intake-failure-")) },
+    channelAdapter: {
+      async sendText(payload) {
+        sent.push(payload);
+      },
+    },
+  }, {
+    provider: "weixin",
+    senderId: "user-1",
+    contextToken: "ctx-1",
+    text: "[附件接收失败] WeFlow 阅读器不提供文件导出，内容取不到（file-fix-test.txt, 140 B）",
+    // The normalized inbound record carries intake failures under this key, which is
+    // why the notice has to read it as well (production path, not just the source's).
+    persistedAttachmentFailures: [{
+      code: "media_export_unavailable",
+      kind: "file",
+      sourceFileName: "file-fix-test.txt",
+      reason: "WeFlow 阅读器不提供文件导出，内容取不到（file-fix-test.txt, 140 B）",
+    }],
+    attachments: [],
+  });
+
+  assert.equal(prepared, null, "no turn is opened for an attachment we cannot read");
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /附件读取失败/u);
+  assert.match(sent[0].text, /file-fix-test\.txt/u);
+  assert.match(sent[0].text, /截图|贴成文字/u);
+  assert.equal(sent[0].userId, "user-1");
+  assert.equal(sent[0].contextToken, "ctx-1");
+});
+
 test("quoted attachments retain their origin and reference through persistence", async () => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-quoted-inbound-test-"));
   const originalFetch = global.fetch;
@@ -1142,6 +1176,7 @@ test("location leave_home trigger and major move both enqueue system action mess
   assert.equal(queued[1].id, "location-move:move-1");
   assert.match(queued[1].text, /location appears to have changed significantly/i);
 });
+
 test("the system queue persists an optional personal-account reply route", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-system-queue-"));
   const filePath = path.join(dir, "system-message-queue.json");

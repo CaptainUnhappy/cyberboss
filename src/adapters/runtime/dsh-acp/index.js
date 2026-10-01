@@ -32,7 +32,7 @@ const {
 } = require("./events");
 const { SessionStore } = require("../codex/session-store");
 const { buildOpeningTurnText, buildInstructionRefreshText } = require("../shared-instructions");
-const { resolveDshBin, isSupportedImageMime, imageMimeForPath } = require("../dsh");
+const { resolveDshBin, isSupportedImageMime, imageMimeForPath, resolveAcpModelPatchPath } = require("../dsh");
 const {
   MODEL_CANARY_EXECUTION_POLICY,
 } = require("../../../integrations/weflow-model-canary");
@@ -49,6 +49,90 @@ function normalizeText(value) {
 function resolveAttachmentLimitsPatchPath() {
   const candidate = path.join(__dirname, "..", "dsh", "attachment-limits.patch.yml");
   return fs.existsSync(candidate) ? candidate : "";
+}
+
+/**
+ * Overlays handed to every ACP runtime this adapter spawns.
+ *
+ * A missing overlay is fatal rather than degraded (cordis resolves an insert name
+ * relative to the profile directory and exits 5), so both paths are checked here
+ * and pinned against the repository by tests.
+ */
+function resolvePatchPaths() {
+  const candidates = [
+    resolveAttachmentLimitsPatchPath(),
+    resolveAcpModelPatchPath(),
+  ];
+  return candidates.filter((candidate) => candidate && fs.existsSync(candidate));
+}
+
+/**
+ * Point one session at the configured provider/model when it still carries another.
+ *
+ * ACP stores the model **per session**, so a session created before the profile was
+ * pinned to the image-capable model keeps the old one and every image turn fails
+ * with `model "deepseek-v4-flash" does not declare image input` — even though the
+ * connection now advertises `promptCapabilities.image: true` (measured 2026-09-30).
+ * The option value is the JSON array `["<provider>","<model>"]` that ACP advertises.
+ *
+ * Best effort by design: an agent that offers no model option, or a value it does
+ * not list, leaves the session as it is rather than failing the turn.
+ */
+async function alignSessionModel(record, sessionId, { model: configuredModel = "", provider: configuredProvider = "" } = {}) {
+  const model = normalizeText(configuredModel);
+  const provider = normalizeText(configuredProvider);
+  if (!model || !provider) {
+    return false;
+  }
+  const client = record?.client;
+  if (typeof client?.getSessionConfigOptions !== "function"
+    || typeof client?.setSessionConfigOption !== "function") {
+    return false;
+  }
+  try {
+    const options = client.getSessionConfigOptions(sessionId);
+    const modelOption = (Array.isArray(options) ? options : []).find(
+      (option) => normalizeText(option?.id) === "model" || normalizeText(option?.category) === "model",
+    );
+    if (!modelOption) {
+      return false;
+    }
+    const wanted = JSON.stringify([provider, model]);
+    if (normalizeText(modelOption.currentValue) === wanted) {
+      return false;
+    }
+    const offered = collectSelectValues(modelOption);
+    if (offered.length && !offered.includes(wanted)) {
+      console.warn(
+        `[cyberboss] dsh-acp session ${sessionId} model option does not offer ${wanted}; leaving it as ${modelOption.currentValue}`,
+      );
+      return false;
+    }
+    await client.setSessionConfigOption(sessionId, normalizeText(modelOption.id) || "model", wanted);
+    console.log(`[cyberboss] dsh-acp session ${sessionId} model aligned to ${provider}/${model}`);
+    return true;
+  } catch (error) {
+    console.warn(
+      `[cyberboss] dsh-acp could not align the session model (${error?.message || error}); the turn continues on the session's own model`,
+    );
+    return false;
+  }
+}
+
+function collectSelectValues(option) {
+  const values = [];
+  for (const entry of Array.isArray(option?.options) ? option.options : []) {
+    if (Array.isArray(entry?.options)) {
+      for (const nested of entry.options) {
+        const value = normalizeText(nested?.value);
+        if (value) values.push(value);
+      }
+      continue;
+    }
+    const value = normalizeText(entry?.value);
+    if (value) values.push(value);
+  }
+  return values;
 }
 
 /**
@@ -73,7 +157,7 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
   });
   const configuredModel = normalizeText(config.dshModel) || normalizeText(config.model);
   const configuredProvider = normalizeText(config.dshProvider) || normalizeText(config.modelProvider);
-  const patchPaths = [resolveAttachmentLimitsPatchPath()].filter(Boolean);
+  const patchPaths = resolvePatchPaths();
 
   const eventListeners = new Set();
   const runtimes = new Map();
@@ -303,7 +387,19 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
       return sessionStore;
     },
     getTurnCapabilities() {
-      return { nativeImageInput: true, toolImageRead: false };
+      // The ACP agent advertises whether the configured provider/model accepts
+      // inline image prompts (`agentCapabilities.promptCapabilities.image`).
+      // Claiming native image input unconditionally made every image turn fail
+      // with "Invalid params: inline image prompts were not advertised by this
+      // connection" (measured 2026-09-30). Report the advertised truth instead, so
+      // a text-only model falls back to the vision-caption route.
+      const record = runtimes.get(normalizeText(config.workspaceRoot) || process.cwd())
+        || [...runtimes.values()][0]
+        || null;
+      return {
+        nativeImageInput: Boolean(record?.client?.promptCapability?.("image")),
+        toolImageRead: false,
+      };
     },
     supportsExecutionPolicy(executionPolicy) {
       const requested = normalizeText(executionPolicy);
@@ -370,6 +466,10 @@ function createDshAcpRuntimeAdapter(config = {}, deps = {}) {
         workspaceRoot,
         conversationKey,
         sessionName,
+      });
+      await alignSessionModel(record, sessionId, {
+        model: configuredModel,
+        provider: configuredProvider,
       });
 
       const turnId = `acp-turn-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;

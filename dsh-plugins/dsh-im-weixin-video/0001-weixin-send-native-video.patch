@@ -1,0 +1,131 @@
+From: cyberboss <cyberboss@localhost>
+Subject: [PATCH] weixin: send videos as native video items
+
+The weixin channel can already receive videos: at the inbound boundary
+`item.type === 5` / `video_item` is classified as `{ kind: 'video' }`.
+It can also already upload any media type, because `sendArtifact` has
+always taken `mediaType` as a parameter.
+
+What was missing is the outbound branch. An mp4 returned with
+`dsh_im_return_file` matched neither the `image/` case nor a `video/`
+case, so it fell through to `sendFile` and arrived in WeChat as an
+opaque file message (media_type 3 / item type 4) with no preview. The
+bytes were delivered; the presentation was not.
+
+This adds the mirror image of the image path:
+
+* `weixin-api.mjs` gains `sendVideo` (media_type 2, item type 5,
+  `video_item.video_size`), reusing the existing `sendArtifact`
+  plumbing untouched.
+* `weixin-bridge.mjs` hands the provider a `sendVideo` closure beside
+  `sendImage` / `sendFile`.
+* `artifact-delivery.mjs` gains the video-first branch: native video
+  when the provider offers it, falling back to the file path when the
+  send fails, so a refused video degrades instead of losing the file.
+
+Channels other than weixin are unaffected. They do not supply
+`sendVideo`, and the branch is gated on that, so their behaviour is
+byte-for-byte what it is today.
+
+The three `typeof ... === 'function'` tests inside
+`sendMaterializedArtifact` are collapsed into one `providerSupports`
+helper; adding a third one pushed the repetition past the point where
+it read better than the helper.
+
+Untested against the live provider: the author has no fixture for
+`media_type: 2`, and the thumbnail question is unresolved (`no_need_thumb:
+true` is sent for every media type today). A reviewer with a weixin bot
+should confirm that a video sent this way renders as a playable bubble
+rather than a second file message.
+diff --git a/src/channels/shared/semantic/artifact-delivery.mjs b/src/channels/shared/semantic/artifact-delivery.mjs
+index 28f23aa..0ebe739 100644
+--- a/src/channels/shared/semantic/artifact-delivery.mjs
++++ b/src/channels/shared/semantic/artifact-delivery.mjs
+@@ -33,12 +33,17 @@ function providerIds(value) {
+   return providerMessageIdsFor(value);
+ }
+ 
++function providerSupports(provider, method) {
++  return typeof provider?.[method] === 'function';
++}
++
+ async function sendMaterializedArtifact(file, {
+   sendFile,
+   sendImage,
++  sendVideo,
+   signal,
+ }) {
+-  if (file.mediaType?.startsWith('image/') && typeof sendImage === 'function') {
++  if (file.mediaType?.startsWith('image/') && providerSupports({ sendImage }, 'sendImage')) {
+     try {
+       return {
+         presentation: 'image',
+@@ -50,8 +55,21 @@ async function sendMaterializedArtifact(file, {
+       }
+     }
+   }
++  if (file.mediaType?.startsWith('video/') && providerSupports({ sendVideo }, 'sendVideo')) {
++    try {
++      return {
++        presentation: 'video',
++        result: await sendVideo(file),
++      };
++    } catch (error) {
++      // A provider that refuses the native video must still deliver the bytes.
++      if (isAbort(error, signal) || error?.code === 'artifact-delivery-uncertain') {
++        throw error;
++      }
++    }
++  }
+   signal?.throwIfAborted();
+-  if (typeof sendFile !== 'function') throw unavailableError();
++  if (!providerSupports({ sendFile }, 'sendFile')) throw unavailableError();
+   return {
+     presentation: 'file',
+     result: await sendFile(file),
+@@ -72,6 +90,7 @@ export async function deliverOutboundArtifacts({
+   signal,
+   sendFile,
+   sendImage,
++  sendVideo,
+   sendFailureNotice,
+   onFailure,
+   logger,
+diff --git a/src/channels/weixin/weixin-api.mjs b/src/channels/weixin/weixin-api.mjs
+index a3d389b..7cdd24d 100644
+--- a/src/channels/weixin/weixin-api.mjs
++++ b/src/channels/weixin/weixin-api.mjs
+@@ -788,6 +788,19 @@ export function createWeixinApi({ fetchImpl = fetch } = {}) {
+       });
+     },
+ 
++    async sendVideo(request) {
++      return sendArtifact(request, {
++        mediaType: 2,
++        createItem: ({ media, ciphertextSize }) => ({
++          type: 5,
++          video_item: {
++            media,
++            video_size: ciphertextSize,
++          },
++        }),
++      });
++    },
++
+     async sendImage(request) {
+       return sendArtifact(request, {
+         mediaType: 1,
+diff --git a/src/channels/weixin/weixin-bridge.mjs b/src/channels/weixin/weixin-bridge.mjs
+index d4ef30a..f240d86 100644
+--- a/src/channels/weixin/weixin-bridge.mjs
++++ b/src/channels/weixin/weixin-bridge.mjs
+@@ -1489,6 +1489,9 @@ export class WeixinHarnessBridge {
+       sendImage: typeof this.#api.sendImage === 'function'
+         ? (file) => sendArtifact('sendImage', file)
+         : undefined,
++      sendVideo: typeof this.#api.sendVideo === 'function'
++        ? (file) => sendArtifact('sendVideo', file)
++        : undefined,
+       sendFile: typeof this.#api.sendFile === 'function'
+         ? (file) => sendArtifact('sendFile', file)
+         : undefined,

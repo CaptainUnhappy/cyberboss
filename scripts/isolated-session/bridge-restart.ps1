@@ -14,13 +14,12 @@
 # host reads BOM-less files as the ANSI code page.
 
 $ErrorActionPreference = 'Continue'
-# Machine bindings: dot-source the shared header instead of hardcoding the
-# checkout path, and take the interpreter from the environment.
-. (Join-Path $PSScriptRoot 'queue-root.ps1')
+$root = 'C:\ProgramData\cwin-probe'
 $log = Join-Path $root 'bridge4.log'
 $err = Join-Path $root 'bridge4.err.log'
-$bridge = Join-Path $repoRoot 'scripts\weflow-uia-bridge.py'
-$python = if ($env:CYBERBOSS_PYTHON) { $env:CYBERBOSS_PYTHON } else { 'python' }
+$envFile = 'D:\Projects\cyberboss\.env'
+$bridge = 'D:\Projects\cyberboss\scripts\weflow-uia-bridge.py'
+$python = 'D:\Tools\miniconda3\python.exe'
 $port = 8776
 
 # The session-4 worker captures only start/exit of a queued script, so keep the
@@ -50,7 +49,16 @@ $env:CYBERBOSS_WEFLOW_BASE_URL = 'http://127.0.0.1:5051'
 $env:CYBERBOSS_WEFLOW_ALLOWED_TALKERS = Get-EnvValue 'CYBERBOSS_WEFLOW_ALLOWED_TALKERS'
 $env:CYBERBOSS_WEFLOW_DEFAULT_SEND_SOURCE = 'azzy'
 $env:CYBERBOSS_WEFLOW_SEND_VERIFY_SECONDS = Get-EnvValue 'CYBERBOSS_WEFLOW_SEND_VERIFY_SECONDS'
-$env:CYBERBOSS_STATE_DIR = if ($env:CYBERBOSS_STATE_DIR) { $env:CYBERBOSS_STATE_DIR } else { Join-Path $root 'state4' }
+$env:CYBERBOSS_STATE_DIR = 'C:\ProgramData\cwin-probe\state4'
+# Outbound images: the bot writes them as ITS OWN account, so the bridge's managed
+# image root has to be a directory both accounts can read. Keep this in step with
+# the bot's CYBERBOSS_GENERATED_IMAGE_OUTBOUND_DIR in .env (measured 2026-09-30:
+# bot 79388 -> bridge cwinprobe was "outside the managed image root" + WinError 5).
+$imageRoot = Get-EnvValue 'CYBERBOSS_GENERATED_IMAGE_OUTBOUND_DIR'
+if (-not $imageRoot) { $imageRoot = 'C:\ProgramData\cwin-probe\outbound-images' }
+New-Item -ItemType Directory -Force -Path $imageRoot | Out-Null
+$env:CYBERBOSS_WEFLOW_UIA_IMAGE_ROOT = $imageRoot
+"image root = $imageRoot"
 "token loaded = $([bool]$env:CYBERBOSS_WEFLOW_TOKEN)  allowedTalkers = $([bool]$env:CYBERBOSS_WEFLOW_ALLOWED_TALKERS)"
 
 Remove-Item $log, $err -Force -ErrorAction SilentlyContinue

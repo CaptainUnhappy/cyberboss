@@ -52,3 +52,9 @@ if (ackSentAtMs && Date.now() - ackSentAtMs < WEFLOW_UIA_INBOUND_ACK_REPEAT_SUPP
 （按 `pendingId` 去重）都立刻回执。实现三处：抑制常量置 0（保留开关便于回退）；`acknowledgeBufferedInboundOnce`
 里改为按消息 id 去重、并让 `claimed` 恒为真——原来 `pendingInboundStore.claimAcknowledgement` 的
 scope 级门（`scope.acknowledgementStatus`）在上一条回合结束前一直关着，这就是"没第一时间收到处理中"的直接原因。
+## 追加（同日，用户的最终口径）
+
+用户在 `9f29a82`（抑制窗 0 → 5 s）之后把口径定死为：**"处理中"要第一时间发，但同一条连续消息只回一条**——
+即按 15 秒采集窗口聚合。本节前半段的"每条消息都立刻回执"因此再次被取代，最终方案见
+[「处理中」回执按 15 秒采集窗口聚合](../bug-fix/2026-09-29-inbound-ack-collection-window.md)。
+这里"scope 级 durable 门在回合结束前一直关着"的观察仍然是事实，也是最终方案不动 store、只在 app 层判窗口的理由。
