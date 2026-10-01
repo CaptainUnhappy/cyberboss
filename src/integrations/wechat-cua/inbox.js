@@ -185,10 +185,23 @@ class WeChatCuaInboxSource {
     });
     let delivered = 0;
     for (const event of events) {
+      const messageId = synthesizeId(event);
+      // The envelope MUST satisfy `PendingInboundStore.normalizeMessage`, which
+      // drops anything without a pendingId/messageId, a senderId and a provider -
+      // and the caller only sees a warning plus `false`. Getting this wrong loses
+      // real messages silently: measured 2026-10-01 by feeding this very shape to
+      // the real store, which answered `invalid pending inbound message`.
       const message = {
-        id: synthesizeId(event),
+        id: messageId,
+        messageId,
+        pendingId: messageId,
         localId: "",
         talker: event.peer,
+        // A UIA reader has no wxid, so the peer's display name is both the sender
+        // identity and the reply address.
+        senderId: event.peer,
+        provider: "wechat-cua",
+        chatId: `weflow:${event.peer}`,
         text: event.text,
         // Direction is not readable on this path (see inbound.js): an observed
         // row is treated as inbound only because our own sends are suppressed by
@@ -199,6 +212,9 @@ class WeChatCuaInboxSource {
         kind: "text",
         timestamp: Math.floor(Date.now() / 1000),
         receivedAt: new Date().toISOString(),
+        quotedContexts: [],
+        attachments: [],
+        attachmentFailures: [],
         source: "cua-preview",
         confidence: event.confidence,
         unread: event.unread,
