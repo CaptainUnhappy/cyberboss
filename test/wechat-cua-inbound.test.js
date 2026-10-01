@@ -14,7 +14,7 @@
 
 const assert = require("assert");
 
-const { PreviewInboundSource, parseRow, rowDigest } = require("../src/integrations/wechat-cua/inbound");
+const { PreviewInboundSource, parseRow, rowDigest, readConversation } = require("../src/integrations/wechat-cua/inbound");
 const { SentLedger } = require("../src/integrations/wechat-cua/loop");
 const { CuaSession } = require("../src/integrations/wechat-cua/client");
 
@@ -43,6 +43,8 @@ function main() {
   unread_badge_marks_a_stronger_signal();
   reorder_alone_is_not_a_new_message();
   the_sent_ledger_stops_the_bot_answering_itself();
+  consecutive_messages_do_not_collapse_into_one_event();
+  read_conversation_orders_by_y_and_drops_timestamps();
   console.log("all inbound tests passed");
 }
 
@@ -161,3 +163,56 @@ function the_sent_ledger_stops_the_bot_answering_itself() {
 }
 
 main();
+/**
+ * The preview only ever shows the last message, so three messages sent quickly
+ * used to arrive as one event with the third and final text. Deep read fixes it
+ * by reading the conversation's message list and emitting what is past the
+ * watermark.
+ */
+function consecutive_messages_do_not_collapse_into_one_event() {
+  // Two views of the same client: the chat list (narrow multi-line rows) and the
+  // open conversation (wide bubbles ordered by y). The source reads the list, and
+  // only for a changed peer does it read the conversation.
+  const rows = [
+    [rowText("柳毓琳", "第一条")],
+    [rowText("柳毓琳", "第三条")],
+  ];
+  const conversation = ["第一条", "第二条", "第三条"];
+  let rowCall = 0;
+  const session = new CuaSession("test");
+  session.snapshot = () => {
+    if (rowCall < rows.length) {
+      const labels = rows[rowCall];
+      rowCall += 1;
+      return { elements: labels.map((label, i) => ({ role: "ListItem", label, element_index: 100 + i, element_token: `tok-${i}` })) };
+    }
+    return { elements: conversation.map((text, i) => ({ role: "ListItem", label: text, frame: { y: 100 + i * 60, w: 722 }, element_token: `b${i}` })) };
+  };
+  const source = new PreviewInboundSource(TARGET, { session, deepRead: true, openConversation: () => true });
+  // Seed the state the reader would already hold: the peer's previous row digest
+  // and the last message it read. The changed row then drives the deep read.
+  source.seen.set("柳毓琳", rowDigest(parseRow(rowText("柳毓琳", "第一条"))));
+  source.watermarks.set("柳毓琳", "第一条");
+  source.poll(); // first poll only primes
+
+  const events = source.poll();
+  assert.deepStrictEqual(events.map((e) => e.text), ["第二条", "第三条"], "each unread message must become its own event");
+  assert.strictEqual(events[0].source, "cua-conversation");
+  assert.strictEqual(events[0].peer, "柳毓琳");
+  console.log("ok   consecutive messages become separate events, not one collapsed preview");
+}
+
+function read_conversation_orders_by_y_and_drops_timestamps() {
+  const session = new CuaSession("test");
+  session.snapshot = () => ({
+    elements: [
+      { role: "ListItem", label: "第三条", frame: { y: 300, w: 722 }, element_token: "c" },
+      { role: "ListItem", label: "9月18日 11:03", frame: { y: 200, w: 722 }, element_token: "t" },
+      { role: "ListItem", label: "第二条", frame: { y: 240, w: 722 }, element_token: "b" },
+      { role: "ListItem", label: "窄行会被排除", frame: { y: 260, w: 120 }, element_token: "n" },
+    ],
+  });
+  const got = readConversation(session, TARGET).map((m) => m.text);
+  assert.deepStrictEqual(got, ["第二条", "第三条"], "conversation reads are ordered by y and drop timestamp-only rows");
+  console.log("ok   readConversation orders by y, drops timestamps and narrow rows");
+}

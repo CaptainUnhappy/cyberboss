@@ -98,6 +98,40 @@ function readRows(session, target) {
 }
 
 /**
+ * The message list of the OPEN conversation, in reading order.
+ *
+ * This corrects an earlier claim of mine ("bubble text is unreadable"): it is
+ * readable. Measured 2026-10-01 on WeChat desktop, the bubbles come back as wide
+ * ListItems whose `label` IS the message text:
+ *
+ *   y=176 w=722 "收到，RDP 重连后链路正常"
+ *   y=245 w=722 "[probe] s4 bridge after fg fix"
+ *   y=451 w=722 "9月18日 11:03"          <- a timestamp, not a message
+ *
+ * Sorting by `y` therefore yields the conversation in order. What is NOT
+ * available is direction: outgoing and incoming bubbles are both full-width
+ * children of the same list, with no alignment or role distinction in the tree.
+ * So the caller must treat "is this mine?" as a separate question (the ledger in
+ * loop.js), never infer it from the element.
+ */
+function readConversation(session, target, { maxItems = 40 } = {}) {
+  const snap = session.snapshot(target);
+  const all = elements(snap);
+  const widths = all.filter((el) => el.frame?.w > 0).map((el) => el.frame.w);
+  if (!widths.length) {
+    return [];
+  }
+  const widest = Math.max(...widths);
+  const timeOnly = /^(\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|昨天|星期[一二三四五六日]|周[一二三四五六日]|.{0,6}\d{1,2}月\d{1,2}日.*)$/u;
+  return all
+    .filter((el) => el.role === "ListItem" && el.frame && el.frame.w > widest * 0.4)
+    .sort((a, b) => a.frame.y - b.frame.y)
+    .map((el) => ({ text: String(el.label || "").trim(), y: el.frame.y, token: el.element_token }))
+    .filter((item) => item.text && !timeOnly.test(item.text))
+    .slice(-maxItems);
+}
+
+/**
  * A preview-level inbound source.
  *
  * State machine, in order of precedence for each poll:
@@ -109,16 +143,31 @@ function readRows(session, target) {
  * the conversation we sent to moves to the top with our text as the preview.
  * Without that rule every reply would be answered by itself - the same trap the
  * RDP-era deployment hit and solved with a ledger.
+ *
+ * `deepRead: true` additionally opens a changed conversation and reads its
+ * message list, so several messages sent in quick succession become several
+ * events instead of one collapsed preview. That costs a foreground click (see
+ * client.js: only a foreground click switches conversations), so it is opt-in.
  */
 class PreviewInboundSource {
-  constructor(target, { session = new CuaSession(), allowPeers = null, pollMs = 2000 } = {}) {
+  constructor(target, {
+    session = new CuaSession(),
+    allowPeers = null,
+    pollMs = 2000,
+    deepRead = false,
+    openConversation = null,
+  } = {}) {
     this.target = target;
     this.session = session;
     this.allowPeers = allowPeers ? new Set(allowPeers) : null;
     this.pollMs = pollMs;
+    this.deepRead = deepRead;
+    // Injected so tests can drive the deep path without a live client.
+    this.openConversation = openConversation;
     this.seen = new Map(); // peer -> digest
+    this.watermarks = new Map(); // peer -> last message text read from the conversation
     this.primed = false;
-    this.stats = { polls: 0, events: 0, skippedOwnEcho: 0, skippedNotAllowed: 0 };
+    this.stats = { polls: 0, events: 0, skippedOwnEcho: 0, skippedNotAllowed: 0, deepReads: 0 };
   }
 
   /** One read, no side effects. Returns the events observed since the last call. */
@@ -153,23 +202,62 @@ class PreviewInboundSource {
         this.stats.skippedOwnEcho += 1;
         continue;
       }
-      events.push({
-        direction: "incoming",
-        peer: row.peer,
-        text: row.preview,
-        time: row.time,
-        unread: row.unread,
-        // What the loop must answer *to*: the row is the only handle a UIA
-        // writer has, and WeChat labels the message box with the peer's name.
-        replyTarget: row.peer,
-        confidence: row.unread > 0 ? "unread-badge" : "preview-changed",
-        source: "cua-preview",
-      });
-      this.stats.events += 1;
+      const text = this.deepRead ? this.expand(row) : [row.preview];
+      for (const piece of text) {
+        events.push({
+          direction: "incoming",
+          peer: row.peer,
+          text: piece,
+          time: row.time,
+          unread: row.unread,
+          // What the loop must answer *to*: the row is the only handle a UIA
+          // writer has, and WeChat labels the message box with the peer's name.
+          replyTarget: row.peer,
+          confidence: row.unread > 0 ? "unread-badge" : "preview-changed",
+          source: this.deepRead ? "cua-conversation" : "cua-preview",
+        });
+        this.stats.events += 1;
+      }
     }
 
     this.primed = true;
     return events;
+  }
+
+  /**
+   * Read a changed conversation's message list and return only the messages after
+   * the last one we already emitted for that peer.
+   *
+   * This is what stops "the user sent three things quickly" from collapsing into
+   * one preview event. It needs the conversation open, which costs one foreground
+   * click - so it only runs for a peer whose row actually changed.
+   */
+  expand(row) {
+    if (typeof this.openConversation !== "function") {
+      return [row.preview];
+    }
+    let opened;
+    try {
+      opened = this.openConversation(this.session, this.target, row.peer);
+    } catch (error) {
+      this.stats.deepReads += 1;
+      return [row.preview];
+    }
+    this.stats.deepReads += 1;
+    const messages = readConversation(this.session, this.target).map((m) => m.text);
+    if (!messages.length) {
+      return [row.preview];
+    }
+    const mark = this.watermarks.get(row.peer);
+    let fresh;
+    if (!mark) {
+      fresh = messages;
+    } else {
+      const index = messages.lastIndexOf(mark);
+      fresh = index >= 0 ? messages.slice(index + 1) : messages.slice(-1);
+    }
+    this.watermarks.set(row.peer, messages[messages.length - 1]);
+    return fresh.length ? fresh : [row.preview];
   }
 
   /** Forget a peer's baseline so its next change counts as new (after a send). */
@@ -180,6 +268,7 @@ class PreviewInboundSource {
 
 module.exports = {
   PreviewInboundSource,
+  readConversation,
   parseRow,
   rowDigest,
   readRows,
