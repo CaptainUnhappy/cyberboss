@@ -989,6 +989,14 @@ class CyberbossApp {
   }
 
   async resolveWeFlowReplySource() {
+    // On the RDP-free path there is no bridge to ask: the CUA driver IS the
+    // outbound. Asking the bridge here made every inbound turn die at
+    // `waiting for a single reply route: fetch failed` once WeFlow and the bridge
+    // were shut down (measured 2026-10-01) - the reply route still depended on
+    // exactly the components this work removed.
+    if (this.config.wechatCuaEnabled) {
+      return "azzy";
+    }
     return resolveWeFlowSendSource(this.config);
   }
 
