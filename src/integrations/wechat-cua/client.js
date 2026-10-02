@@ -86,6 +86,9 @@ const WINDOW_MINIMIZED = /window_minimized|window is minimized/i;
  *   14:25:25.699  20384   (WeChat - the foreground was taken)
  *   14:25:25.850  35688   (given back 151ms later)
  *
+ * Three runs measured 151ms, 313ms and 252ms, so the honest figure is a short
+ * activation in the 150-300ms range, not a fixed number.
+ *
  * So the old label "one focus steal" was wrong in both directions: the foreground
  * IS taken (a two-point before/after check misses it entirely), but it is handed
  * back automatically, so it is not a lasting steal either. The honest number is a
@@ -98,7 +101,7 @@ const WINDOW_MINIMIZED = /window_minimized|window is minimized/i;
  * through UIA plus posting Return to it. `scripts/cua-wechat-bg-switch-live.js`
  * re-runs the search-box measurement.
  */
-const FOREGROUND_ACTIVATION_COST = "foreground-activation ~150ms";
+const FOREGROUND_ACTIVATION_COST = "foreground-activation 150-300ms";
 
 /** One `cua-driver call` process. Returns stdout; throws Node's child error shape. */
 function defaultExec(driver, args, input) {
