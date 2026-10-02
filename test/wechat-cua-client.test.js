@@ -183,6 +183,7 @@ test_current_conversation_reads_the_box_label();
 test_a_refused_write_is_retried_from_a_new_snapshot();
 test_a_refused_return_is_re_pressed_only_while_the_text_is_still_there();
 test_a_refused_return_with_an_empty_box_is_not_pressed_again();
+test_a_press_that_silently_sent_nothing_is_retried_in_the_foreground();
 test_an_unknown_draft_is_never_typed_over();
 test_our_own_unsent_leftover_is_cleared_before_the_next_attempt();
 test_a_minimized_window_is_refused_not_raised();
@@ -238,6 +239,9 @@ function test_our_own_unsent_leftover_is_cleared_before_the_next_attempt() {
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
     { tool: "press_key", reply: staleToken() },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
+    { tool: "press_key", reply: staleToken() },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
+    // The foreground re-press is refused too, so the text really does stay unsent.
     { tool: "press_key", reply: staleToken() },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
     // Attempt 2: the same text is recognised as OURS, cleared, and sent.
@@ -334,6 +338,34 @@ function test_a_refused_return_with_an_empty_box_is_not_pressed_again() {
   assert.strictEqual(result.steps[2].skippedRepress, true, "the step must say that it deliberately did not press again");
   assert.strictEqual(result.ok, true, `expected the send to be confirmed by the preview row, got ${result.verify}`);
   console.log("ok   an empty box after a refused return is never pressed again");
+}
+
+function test_a_press_that_silently_sent_nothing_is_retried_in_the_foreground() {
+  // Measured live on 2026-10-02, twice in a row: the driver answers
+  // `✅ Sent return via SendInput on pid 20384 (delivery_mode:foreground)` for a
+  // mode-less press that does nothing at all - the text stayed in the composer - and
+  // the SAME press with `delivery_mode:"foreground"` sent it immediately. A press
+  // that reports success and changes nothing must not be believed, and the cure is
+  // the delivery mode that actually delivered.
+  const text = "FOREGROUND-REPRESS";
+  const { session, calls } = fakeDriver([
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
+    { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
+    { tool: "press_key", reply: { route: "global_input", effect: "unverifiable", summary: "✅ Sent return" } },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
+    { tool: "press_key", reply: { route: "global_input", delivery: { mode: "foreground" }, effect: "unverifiable" } },
+    { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
+  ]);
+  const result = sendMessage(TARGET, "文件传输助手", text, { session });
+  const presses = calls.filter((c) => c.tool === "press_key");
+  assert.strictEqual(presses.length, 2, "a press that sent nothing must be repeated once");
+  assert.strictEqual(presses[0].args.delivery_mode, undefined, "the first press stays the cheap default");
+  assert.strictEqual(presses[1].args.delivery_mode, "foreground", "the repeat is the mode that was measured to work");
+  assert.ok(result.steps.some((s) => s.step === "return-foreground"), "the repeat must be visible in the steps");
+  assert.strictEqual(result.ok, true, `expected the repress to send, got ${result.verify}`);
+  console.log("ok   a press that silently sent nothing is repeated in the foreground");
 }
 
 function test_the_no_foreground_switch_refuses_instead_of_clicking() {

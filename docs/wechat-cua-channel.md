@@ -119,12 +119,14 @@ UIA 树不告诉你方向：对方发的和自己发的都是同样宽、同样 
 ## 会踩的坑（都是真机量出来的）
 
 1. **token 只活到下一次快照**。驱动每个窗口只保留一个当前快照，任何后续 `get_window_state`（自己的、别的会话的、别的进程的）都会让旧 token 失效；它**不会**随时间过期。所以"快照→动作"必须用最新快照，被拒就重新快照再试，拿旧 token 重试必然再被拒。
-2. **窗口最小化 = 写侧全灭，读侧照常**，而拒绝码可能只显示 `stale_element_token`。客户端现在会在被拒后 `bring_to_front` 再重试一次。
-3. **驱动会话有生命周期**：`session has ended; tool call ... was rejected`（退出码 1，话在 stderr 上）。客户端会自动 `start_session` 复活并重放**被拒**的那一次调用（拒绝 = 没执行，所以重放是安全的）。
-4. **两个 `cua-driver call` 抢管道**时，守护进程活着也会回 `daemon is not running`。这是传输层失败、请求没到，客户端会重试一次。
-5. **输入框是"有主"的工作区**：不是机器人写的字绝不覆盖、不删除（可能有人在打字）；只清理本进程自己留下的未发出文本。
-6. **方向不可读**：UIA 读到的气泡没有"谁发的"信息，入站判断依赖回声账本（`SentLedger`）。这是本设计最薄的一环，写在 `.agents/notes/implemented/feature/2026-10-01-cua-wechat-write-loop.md` 里，没有隐藏。
-7. **身份是显示名不是 wxid**：所以 `CYBERBOSS_CUA_CHAT_BY_TALKER` 必须显式配置，绑定的 `senderId` 也是显示名。
+2. **窗口最小化 = 写侧全灭，读侧照常**，而拒绝码可能只显示 `stale_element_token`。当前策略是**拒绝而不抬窗**（抬窗只能靠 `bring_to_front`，它会一直留在前台，正是用户投诉过的"弹我窗口"），并把这次失败标记成"确定没发出去"，交给延迟补发。
+3. **"发了回车"不等于"发出去了"**。实测（2026-10-02，连续两次）：不带 delivery mode 的 `press_key` 会返回 `✅ Sent return`，而文字**还留在输入框里**；同一时刻改用 `delivery_mode:"foreground"`（SendInput）立刻发出。所以发送的判据是**输入框空没空 + 预览行有没有这段话**，不是按键的返回；框里还有字就再按一次（前台模式），框已空就绝不重按（会发第二条）。
+4. **驱动会话有生命周期**：`session has ended; tool call ... was rejected`（退出码 1，话在 stderr 上）。客户端会自动 `start_session` 复活并重放**被拒**的那一次调用（拒绝 = 没执行，所以重放是安全的）。
+5. **两个 `cua-driver call` 抢管道**时，守护进程活着也会回 `daemon is not running`。这是传输层失败、请求没到，客户端会重试一次。
+6. **输入框是"有主"的工作区**：不是机器人写的字绝不覆盖、不删除（可能有人在打字）；只清理本进程自己留下的未发出文本。
+7. **方向不可读**：UIA 读到的气泡没有"谁发的"信息，入站判断依赖回声账本（`SentLedger`）。这是本设计最薄的一环，写在 `.agents/notes/implemented/feature/2026-10-01-cua-wechat-write-loop.md` 里，没有隐藏。
+8. **身份是显示名不是 wxid**：所以 `CYBERBOSS_CUA_CHAT_BY_TALKER` 必须显式配置，绑定的 `senderId` 也是显示名。
+9. **义务账本里也要认对 provider**：`reply-obligations.json` 的读回归一化曾经把每一行都写成 `weflow-uia`（包括 CUA 行），于是"谁欠一条回复"的账本指向一个不能发信的通道。第六处同族 bug，已修并有回归测试。
 
 ## 验收与自检
 

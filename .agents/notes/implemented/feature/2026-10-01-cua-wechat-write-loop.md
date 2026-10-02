@@ -213,7 +213,34 @@ session '<label>' to start it again, or use a new session label.
 允许名单是不是空的（空=谁都不回）→ 每个允许对端有没有会话映射（缺映射发送会硬失败）。
 实测：生产配置下 `doctor` 输出 `ilink` ready、`wechat-cua` ready、`notReady` 为空。
 
+### 11. 确定性失败 → 延迟 → 补发：闭环有了三件证据，也露出两个哑巴故障（2026-10-02 第十三轮）
+
+需求是"不能抢前台，也不能因此丢回复"。做法是：CUA 确信没发出去（`deliveryUncertain === false`，
+例如"这个会话没打开且不允许切前台"）时**先入延迟队列、再记失败**，等会话回到前台后由重试闸门补发。
+这一轮把三件证据一次性攒齐（脚本：`tmp/exp6-driver.js`，自己动手切换会话并打时间戳，其余时间只旁观）：
+
+| 证据 | 实测 |
+| --- | --- |
+| ① 延迟入账（直接读 `~/.cyberboss/deferred-system-replies.json`） | `senderId: "文件传输助手"`、`provider: "wechat-cua"`、`attemptCount: 0`、`lastError: "\"文件传输助手\" is not the open conversation and foreground switching is disabled (CYBERBOSS_WECHAT_CUA_NO_FOREGROUND_SWITCH); the reply should be deferred rather than stealing the foreground"` |
+| ② 全程零前台 | 50ms 采样 724 次（实测周期 73ms）：`transitions` 只有一条 `pid 0`（采样起点，无前台窗口），**对微信 pid 的转换为 0**；`unattributedWeChatTransitions: []` |
+| ③ 恢复会话后补发 | 日志 `deferred retry delivered sender=文件传输助手 count=1`，且全程无 `invalid arguments`（上一次同类 bug 是把补发打到官方 iLink） |
+
+时间线（同一轮）：ack `11:21:29` → 切走 `11:21:39`（本次点击 1 次成功）→ 延迟入账 `11:21:51` → 采样停
+`11:22:34` → 切回 `11:22:46` → 补发成功 `11:23:25`。
+
+这一轮同时暴露两个**不报错的故障**，都已修：
+
+1. **"按了回车"≠"发出去了"**。不带 delivery mode 的 `press_key` 会被驱动回答
+   `✅ Sent return via SendInput`，而文字还留在输入框里；同一时刻改 `delivery_mode:"foreground"`
+   立刻发出（连续两次实测）。修法：发送的判据只认**输入框是否为空 + 预览行是否有这段话**，
+   框里还有原文就再用前台模式补按一次，框已空则绝不重按（重按=发第二条）。
+2. **义务账本把 CUA 行读成旧桥**。`reply-obligations.json` 的读回归一化里写死了
+   `sourceProvider: "weflow-uia"`，于是 CUA 义务重载后全部改姓"已经不能发信的通道"（当天 13 条
+   CUA 义务无一例外）。这是同一族 provider 硬编码的第六处，修法是保留写入时的 provider。
+
 ## Verification
+
+- 离线（本轮新增，反证都做过）：`test/wechat-cua-client.test.js` 14/14（+ "驱动说发了、框里还在 → 前台补按一次"，且补按模式必须是 `foreground`）、`test/reply-obligation-store.test.js` 14/14（+ CUA 义务重载后仍姓 `wechat-cua`）、`test/stream-delivery.test.js` 38/38（+ CUA 目标按桌面 provider 路由、"确定失败才延迟"与"不确定绝不延迟"的正反两例）。删掉任一处修复，对应断言立刻红。
 
 - 离线：`test/wechat-cua-session.test.js` 6/6（活会话零重放、会话死掉后复活并**恰好重放一次**、重放再失败就放弃、参数错误不赖会话、`start_session` 不自递归、stderr 拒绝在 `outcome()` 里可读）。**反证**：把恢复分支单独删掉（保留注入缝），该套件在第二条就红 —— 说明它真的在测这个缺陷，而不是恰好一起通过。
 - 真机（`scripts/cua-wechat-session-live.js`，只读，不点击）：

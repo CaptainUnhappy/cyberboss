@@ -569,23 +569,50 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   });
   sleep(1500);
 
-  const after = session.snapshot(toTarget(target));
-  const rows = elements(after).filter(isRow).map(labelOf);
-  const probe = text.slice(0, Math.min(16, text.length));
-  const seen = rows.find((label) => label.includes(probe));
-  const boxEmpty = !String(elements(after).find(isEdit)?.value ?? "");
-  const ok = Boolean(seen) && boxEmpty;
+  let after = session.snapshot(toTarget(target));
+  let verdict = sendVerdict(after, text);
+  if (!verdict.ok && verdict.boxHoldsText) {
+    // A press the driver reports as PERFORMED can still fail to reach WeChat: the
+    // default press is delivered without a delivery mode, and measured 2026-10-02
+    // (twice in a row, on a window that was not the foreground window) the text sat
+    // in the composer while the identical press with `delivery_mode:"foreground"`
+    // (SendInput) sent it immediately. The box decides whether re-pressing is safe:
+    // text still in it means nothing was sent, so this cannot double-send.
+    const boxEl = elements(after).find(isEdit);
+    const repressed = session.call("press_key", {
+      ...toTarget(target), element_token: boxEl?.element_token, key: "return", delivery_mode: "foreground",
+    });
+    steps.push({ step: "return-foreground", outcome: outcome(repressed) });
+    sleep(1500);
+    after = session.snapshot(toTarget(target));
+    verdict = sendVerdict(after, text);
+  }
+  const ok = verdict.ok;
   // Remember our own unsent text so the next attempt may clear it; forget it once
   // the message is really out, so a later identical message is not "cleared" preemptively.
   if (ok) {
     forgetLeftover(chatLabel);
-  } else if (!boxEmpty) {
+  } else if (!verdict.boxEmpty) {
     rememberLeftover(chatLabel, text);
   }
   return {
     ok,
-    verify: seen ? `preview row: ${JSON.stringify(seen.slice(0, 60))}` : "the text never appeared in any preview row",
+    verify: verdict.seen ? `preview row: ${JSON.stringify(verdict.seen.slice(0, 60))}` : "the text never appeared in any preview row",
     steps,
+  };
+}
+
+/** What the window says about a send: the row that proves it, and the composer. */
+function sendVerdict(snap, text) {
+  const rows = elements(snap).filter(isRow).map(labelOf);
+  const probe = text.slice(0, Math.min(16, text.length));
+  const seen = rows.find((label) => label.includes(probe));
+  const boxValue = String(elements(snap).find(isEdit)?.value ?? "");
+  return {
+    seen,
+    boxEmpty: !boxValue,
+    boxHoldsText: boxValue === text,
+    ok: Boolean(seen) && !boxValue,
   };
 }
 
