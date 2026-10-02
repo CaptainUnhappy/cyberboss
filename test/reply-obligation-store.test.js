@@ -389,3 +389,27 @@ test("a desktop-provider reply can open an obligation, the official channel stil
   );
   console.log("ok   a CUA reply can open a durable obligation; the official channel still cannot");
 });
+
+test("a CUA obligation keeps its own provider across a reload", () => {
+  const cua = fixture();
+  const created = cua.store.begin({
+    sourceMessageIds: ["cua-reload-1"],
+    provider: "wechat-cua",
+    talker: "文件传输助手",
+    accountId: "acct",
+    senderId: "文件传输助手",
+    bindingKey: "default:acct:文件传输助手",
+    workspaceRoot: "D:/ws",
+  });
+  assert.equal(created.entry.sourceProvider, "wechat-cua");
+
+  // The load path used to hardcode `weflow-uia`, so every CUA obligation came back
+  // from disk labelled as the retired bridge - the same family of bug as the four
+  // provider gates fixed on 2026-10-02, and the one that would route a reply at a
+  // channel that cannot send. Measured before the fix: 13 CUA obligations on disk,
+  // all reading `weflow-uia`.
+  const reopened = new ReplyObligationStore({ filePath: cua.filePath, instanceId: "instance-b" });
+  const entry = reopened.snapshot().obligations.find((item) => item.id === created.entry.id);
+  assert.ok(entry, "the CUA obligation must survive a reload");
+  assert.equal(entry.sourceProvider, "wechat-cua");
+});

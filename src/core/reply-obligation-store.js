@@ -524,11 +524,12 @@ function normalizeState(raw, store) {
 function normalizeEntry(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const sourceMessageIds = normalizeSourceMessageIds(raw.sourceMessageIds);
+  const sourceProvider = normalizeText(raw.sourceProvider);
   const status = normalizeText(raw.status);
   const terminal = raw.terminal === true;
   const terminalOutcome = normalizeText(raw.terminalOutcome);
   if (!/^reply-obligation:[a-f0-9]{64}$/.test(normalizeText(raw.id))
-    || !DESKTOP_PROVIDERS.has(normalizeText(raw.sourceProvider))
+    || !DESKTOP_PROVIDERS.has(sourceProvider)
     || !sourceMessageIds.length
     || !normalizeText(raw.senderId)
     || (!terminal && !OPEN_STATUSES.has(status))
@@ -546,7 +547,11 @@ function normalizeEntry(raw) {
   }
   return {
     id: normalizeText(raw.id),
-    sourceProvider: "weflow-uia",
+    // Keep the provider the entry was written with. This used to hardcode
+    // `weflow-uia`, so every `wechat-cua` obligation came back from a load labelled
+    // as the retired bridge - the sixth instance of the same family of bug (measured
+    // 2026-10-02: 13 CUA obligations on disk all read `weflow-uia`).
+    sourceProvider,
     sourceMessageIds,
     talker: normalizeText(raw.talker),
     accountId: normalizeText(raw.accountId),
