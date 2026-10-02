@@ -127,6 +127,7 @@ UIA 树不告诉你方向：对方发的和自己发的都是同样宽、同样 
 7. **方向不可读**：UIA 读到的气泡没有"谁发的"信息，入站判断依赖回声账本（`SentLedger`）。这是本设计最薄的一环，写在 `.agents/notes/implemented/feature/2026-10-01-cua-wechat-write-loop.md` 里，没有隐藏。
 8. **身份是显示名不是 wxid**：所以 `CYBERBOSS_CUA_CHAT_BY_TALKER` 必须显式配置，绑定的 `senderId` 也是显示名。
 9. **义务账本里也要认对 provider**：`reply-obligations.json` 的读回归一化曾经把每一行都写成 `weflow-uia`（包括 CUA 行），于是"谁欠一条回复"的账本指向一个不能发信的通道。第六处同族 bug，已修并有回归测试。
+10. **补发内容不带官方通道的包装**：`上轮有一条回复当时没能发出去，现在补上。/===== 上轮对话遗留内容 =====` 是为"一条出站必须占用一次回复窗口"的官方通道准备的。这条通道没有窗口、随时能发，遗留内容就是一条普通回复 —— 格式器 `formatDeferredRepliesForRetry`（`src/core/app.js`）按批次来源分流，桌面类 provider 只拼正文。用户实测把这句通知引用回来过（2026-10-02）。
 
 ## 验收与自检
 

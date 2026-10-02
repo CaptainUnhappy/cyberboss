@@ -1559,7 +1559,7 @@ class CyberbossApp {
     if (!this.deferredReplyRetrySchedulerInstance) {
       this.deferredReplyRetrySchedulerInstance = new DeferredReplyRetryScheduler({
         store: this.deferredSystemReplyQueue,
-        format: formatDeferredSystemReplyBatch,
+        format: formatDeferredRepliesForRetry,
         log: (message) => console.warn(`[cyberboss] ${message}`),
         onGiveUp: (entry) => console.warn(`[cyberboss] deferred reply gave up id=${entry.id} error=${entry.lastError}`),
         send: ({ senderId, text, entries }) => this.deliverDeferredReplyBatch({ senderId, text, entries }),
@@ -1590,7 +1590,7 @@ class CyberbossApp {
     // 2026-10-02, the fourth experiment). Deferring worked; the retry went out of the
     // wrong door. This is the same migration miss as the reply route, the inbound ack,
     // the deferral gate and the leftover prefix - the fifth.
-    if (route.provider === "weflow-uia" || route.provider === "wechat-cua") {
+    if (isDesktopProvider(route.provider)) {
       payload.provider = route.provider;
     }
     if (route.weflowContact) {
@@ -1618,7 +1618,7 @@ class CyberbossApp {
       accountId: normalized.accountId,
       senderId: normalized.senderId,
     });
-    this.streamDelivery.setDeferredReplyPrefix(bindingKey, formatDeferredSystemReplyBatch(pendingReplies));
+    this.streamDelivery.setDeferredReplyPrefix(bindingKey, formatDeferredRepliesForRetry(pendingReplies));
     console.warn(
       `[cyberboss] queued deferred reply prefix sender=${normalized.senderId} count=${pendingReplies.length}`
     );
@@ -4772,7 +4772,7 @@ function listPendingWeFlowRevokes(source, config = {}) {
   });
 }
 
-module.exports = { CyberbossApp };
+module.exports = { CyberbossApp, formatDeferredRepliesForRetry };
 
 function parseChannelCommand(text) {
   const normalized = typeof text === "string" ? text.trim() : "";
@@ -5162,7 +5162,7 @@ function shouldAcknowledgeInbound(prepared) {
   // to Cua (provider "wechat-cua") the acknowledgement silently stopped being sent
   // at all: this condition was never updated. Both desktop providers behave the same
   // way (they can send into the conversation the message came from), so both count.
-  const desktopProvider = prepared?.provider === "weflow-uia" || prepared?.provider === "wechat-cua";
+  const desktopProvider = isDesktopProvider(prepared?.provider);
   return prepared?.suppressAcknowledgement !== true
     && (desktopProvider || prepared?.deliveryPolicy === SILENT_DELIVERY_POLICY);
 }
@@ -5457,17 +5457,6 @@ const DEFERRED_REPLY_NOTICE = "上轮有一条回复当时没能发出去，现�
 const DEFERRED_PLAIN_REPLY_HEADER = "===== 上轮对话遗留内容 =====";
 const DEFERRED_SYSTEM_REPLY_HEADER = "===== 期间模型主动联系 =====";
 
-function formatDeferredSystemReplyText(text) {
-  const normalized = String(text || "").trim();
-  if (!normalized) {
-    return DEFERRED_REPLY_NOTICE;
-  }
-  if (normalized.startsWith(DEFERRED_REPLY_NOTICE)) {
-    return normalized;
-  }
-  return `${DEFERRED_REPLY_NOTICE}\n\n${normalized}`;
-}
-
 function formatDeferredSystemReplyBatch(replies) {
   const grouped = groupDeferredReplies(replies);
   if (!grouped.plain.length && !grouped.system.length) {
@@ -5499,6 +5488,35 @@ function groupDeferredReplies(replies) {
     grouped.plain.push(normalizedText);
   }
   return grouped;
+}
+
+/** The channels the bot drives itself on the personal account (no reply window). */
+function isDesktopProvider(provider) {
+  return provider === "weflow-uia" || provider === "wechat-cua";
+}
+
+/**
+ * Format one drained deferred batch for the channel it is going back to.
+ *
+ * The notice and the `===== 上轮对话遗留内容 =====` header are an artifact of the
+ * OFFICIAL channel: there a reply only exists inside a reply window, so a leftover has
+ * to be glued in front of the next answer, and the reader has to be told which part is
+ * old. The desktop channel has no window - the leftover can simply be sent as itself -
+ * so the wrapper must not be used there. It was, and the user saw it verbatim in their
+ * own chat ("小号消息渠道不应该出现「上轮有一条回复当时没能发出去，现在补上」",
+ * operator report 2026-10-02). Same migration family as the provider gates: this
+ * formatter is passed to the scheduler as a plain callback, so nothing about it
+ * announced which channel it was formatting for.
+ */
+function formatDeferredRepliesForRetry(entries) {
+  const replies = Array.isArray(entries) ? entries : [];
+  if (replies.some((entry) => isDesktopProvider(entry?.provider))) {
+    return replies
+      .map((entry) => String(entry?.text || "").trim())
+      .filter(Boolean)
+      .join("\n\n");
+  }
+  return formatDeferredSystemReplyBatch(replies);
 }
 
 function formatWechatLocalTime(receivedAt) {

@@ -29,8 +29,23 @@ Status: implemented
 - **保留拼接，只去掉 `===== 本轮模型回复 =====` 胶水头**：最强理由是 diff 最小、只动 `buildEffectiveReplyText`。否决原因是用户要的是"可以主动多发"，两条内容挤在同一条气泡里的观感并没有变，拆条才是他点头的那件事。
 - **对官方通道也拆条**：最强理由是一条代码路径覆盖两种通道、少一个分支。否决原因是官方通道每条出站都要靠入站消息带来新的 `context_token`，多发一条就多一次"窗口已失效"的失败面 —— 那个前缀拼接机制本来就是为它存在的。
 
-## Consequences
+## 2026-10-02 追加：小号通道不再出现这句通知本身
 
+用户把小号通道上的原文引用回来："理论上『小号消息渠道』不应该出现『上轮有一条回复当时没能发出去，现在补上。』这类未成功发送的内容。" 上一节只解决了"挤在同一条气泡里"，**通知本身还在**：
+
+- 队列重试路径（`DeferredReplyRetryScheduler` → `formatDeferredSystemReplyBatch`）把整批遗留内容包成 `通知 + ===== 上轮对话遗留内容 ===== + 正文`，小号通道上补发时用户直接看到这坨包装。上一次 CUA 迁移时改了 `sendDeferredPrefixAsOwnMessage` 的判定（`isDesktopReplyTarget`），但**格式器是当回调传进去的**，没有任何地方说明它在给哪条通道排版，于是漏了。
+- 入站快路径（`primeDeferredRepliesForSender`）用同一个格式器，只是因为小号入站没有 `contextToken` 而被提前挡住，所以线上看到的一定是重试路径那条。
+
+修法：格式器按批次的来源通道分流 —— `formatDeferredRepliesForRetry`（`src/core/app.js`）：
+
+- 批次里只要有桌面类 provider（`wechat-cua` / `weflow-uia`，统一判定 `isDesktopProvider`）→ **直接拼正文**（多条之间空一行），没有通知、没有小标题。这条通道随时能发，遗留内容就是一条普通回复。
+- 其余（官方 iLink）→ 保持原样：通知 + `===== 上轮对话遗留内容 =====`，因为那边一条出站必须占用一次回复窗口，必须告诉读者哪段是旧的。
+
+同一批里混进历史行（早于 provider 落盘）时按"这条会话是桌面通道"处理，避免旧行把包装带回来。顺手删掉无人调用的 `formatDeferredSystemReplyText`（它只会产出带通知的文本，留着就是给下一条路径留门）。
+
+测试：`test/deferred-reply-format.test.js` 5 例（CUA 单条/多条不带通知、混入无 provider 的历史行仍不带、空白条目格式化为空、官方通道保留通知与标题）。`formatDeferredSystemReplyBatch` 仍只被官方分支调用。
+
+## Consequences
 收益：
 
 - 模型不再为"10 条预算"裁剪答案，用户能看到完整内容（仍按 ≤4000 字/条切成多条气泡）。
@@ -40,8 +55,8 @@ Status: implemented
 代价与边界：
 
 - 小号路由下一次入站可能产生**两条出站**（遗留一条 + 回复若干条），桥的串行发送因此多一拍；这是"可以主动多发"的直接代价。
-- 补发失败时，遗留内容会带着"上轮有一条回复当时没能发出去，现在补上。"重新出现在队列重试里（与拆条前的文案一致，用户仍能分辨这段是旧的）。
-- `isWeFlowUiaReplyTarget` 只认 `provider === "weflow-uia"`：将来若出现第三条不需要回复窗口的通路，必须把它加进这个判定，否则会静默退回拼接形态。
+- 补发失败时，遗留内容会带着"上轮有一条回复当时没能发出去，现在补上。"重新出现在队列重试里（**2026-10-02 已改**，见下节：小号通道上这句通知本身就不该出现）。
+- ~~`isWeFlowUiaReplyTarget` 只认 `provider === "weflow-uia"`~~ → 已由 2026-10-02 的 CUA 迁移改成桌面类 provider 集合（`sendDeferredPrefixAsOwnMessage` 的前置判定是 `isDesktopReplyTarget`），第三条通路出现时改一处即可。
 - 模板只对**新 thread** 生效；已经存在的 thread 需要 `/reread` 才会重读（注入路径与缓存键见 [bot 工具层接入微信任意文件发送](2026-09-30-channel-send-file-any-tool.md)）。
 - 通知文案中立化后，官方 bot 通道（若启用）也不再解释"为什么当时没送到"——换来的是同一句话在两条通道上都成立。
 - **操作者当天确认不改的两项**：回复合并粒度 `minChunkChars` 保持默认 3600（`/chunk` 可调，觉得挤了再调）；发送失败的重试节奏保持 30s/1m/2m/5m、最多 8 次（`src/core/deferred-reply-retry-scheduler.js` 未动，桌面被占用时立刻重试同样发不出去）。
