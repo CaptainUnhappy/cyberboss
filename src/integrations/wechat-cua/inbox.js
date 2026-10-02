@@ -92,6 +92,8 @@ class WeChatCuaInboxSource {
     this.running = false;
     this.lastDeepReadAt = 0;
     this.lastRecoveryAt = 0;
+    // so the low-frequency stats line can report a CHANGE in the free-direction path
+    this.lastLoggedDirectionCount = 0;
     this.stats = { polls: 0, delivered: 0, errors: 0, suppressed: 0, consecutiveErrors: 0, recoveries: 0, lastRecovery: null };
   }
 
@@ -270,6 +272,17 @@ class WeChatCuaInboxSource {
         this.stats.errors += 1;
         this.logger.warn?.(`[cyberboss] cua inbox handler failed: ${error.message}`);
       }
+    }
+    // A low-frequency, information-bearing line: what the reader did, and how much
+    // direction it got WITHOUT opening a conversation (the click-free path). Without
+    // this the free-direction work is invisible from outside the process.
+    if (this.stats.polls % 20 === 0 || this.lastLoggedDirectionCount !== this.stats.directionWithoutClick) {
+      this.lastLoggedDirectionCount = this.stats.directionWithoutClick;
+      this.logger.log?.(
+        `[cyberboss] cua inbox stats polls=${this.stats.polls} events=${this.stats.events} `
+        + `delivered=${this.stats.delivered} directionFree=${this.stats.directionWithoutClick} `
+        + `selfManual=${this.stats.selfManual} suppressed=${this.stats.suppressed} errors=${this.stats.errors}`
+      );
     }
     return delivered;
   }
