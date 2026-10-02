@@ -355,3 +355,39 @@ test("claiming a notification for an unknown obligation is refused", () => {
   assert.equal(store.markFailureNotified(""), false);
 });
 
+
+test("a desktop-provider reply can open an obligation, the official channel still cannot", () => {
+  // The obligation is what makes a certain send failure deferrable at all: without
+  // one there is no deferSystemReply branch, so the reply is dropped (measured on
+  // the live CUA channel 2026-10-02). Both desktop providers must therefore be
+  // accepted...
+  const { filePath } = createStore();
+  const store = new ReplyObligationStore({ filePath });
+  const opened = store.begin({
+    sourceMessageIds: ["cua-1"],
+    provider: "wechat-cua",
+    talker: "文件传输助手",
+    accountId: "acct",
+    senderId: "文件传输助手",
+    bindingKey: "default:acct:文件传输助手",
+    workspaceRoot: "D:/ws",
+  });
+  assert.ok(opened?.entry?.id, "a CUA turn must be able to carry a durable reply promise");
+  assert.strictEqual(opened.entry.provider, "wechat-cua");
+
+  // ...and the official channel must stay rejected, so this does not quietly become
+  // "every provider gets an obligation" (iLink has its own context-token lifecycle).
+  const official = new ReplyObligationStore({ filePath: createStore().filePath });
+  assert.throws(
+    () => official.begin({
+      sourceMessageIds: ["im-1"],
+      provider: "weixin",
+      senderId: "o9cq@im.wechat",
+      bindingKey: "default:acct:o9cq",
+      workspaceRoot: "D:/ws",
+    }),
+    /desktop-provider source message id/,
+    "the official channel must remain out of this mechanism"
+  );
+  console.log("ok   a CUA reply can open a durable obligation; the official channel still cannot");
+});
