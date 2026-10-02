@@ -2104,7 +2104,10 @@ class CyberbossApp {
     }
     if (
       this.replyObligationStore
-      && prepared.provider === "weflow-uia"
+      // Both desktop providers: an inbound turn on either of them deserves a durable
+      // reply obligation. Without one there is no deferSystemReply branch at all, so a
+      // certain send failure drops the reply instead of retrying it (measured 2026-10-02).
+      && (prepared.provider === "weflow-uia" || prepared.provider === "wechat-cua")
       && prepared.deliveryPolicy !== SILENT_DELIVERY_POLICY
       && prepared.deliveryPolicy !== MODEL_CANARY_DELIVERY_POLICY
       && obligationSourceIds.length

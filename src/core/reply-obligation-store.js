@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const DESKTOP_PROVIDERS = new Set(["weflow-uia", "wechat-cua"]);
 const fs = require("fs");
 const path = require("path");
 
@@ -91,8 +92,8 @@ class ReplyObligationStore {
     const normalizedIds = normalizeSourceMessageIds(sourceMessageIds);
     const normalizedProvider = normalizeText(provider);
     const normalizedSenderId = normalizeText(senderId);
-    if (!normalizedIds.length || normalizedProvider !== "weflow-uia" || !normalizedSenderId) {
-      throw new Error("reply obligation requires WeFlow UIA source message ids and a sender");
+    if (!normalizedIds.length || !DESKTOP_PROVIDERS.has(normalizedProvider) || !normalizedSenderId) {
+      throw new Error("reply obligation requires a desktop-provider source message id and a sender");
     }
     const id = buildReplyObligationId({
       sourceMessageIds: normalizedIds,
@@ -527,7 +528,7 @@ function normalizeEntry(raw) {
   const terminal = raw.terminal === true;
   const terminalOutcome = normalizeText(raw.terminalOutcome);
   if (!/^reply-obligation:[a-f0-9]{64}$/.test(normalizeText(raw.id))
-    || normalizeText(raw.sourceProvider) !== "weflow-uia"
+    || !DESKTOP_PROVIDERS.has(normalizeText(raw.sourceProvider))
     || !sourceMessageIds.length
     || !normalizeText(raw.senderId)
     || (!terminal && !OPEN_STATUSES.has(status))
