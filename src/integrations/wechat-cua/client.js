@@ -380,10 +380,17 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800, allow
   // measured). With the switch disabled this rung is refused instead: the caller
   // gets a certain failure, and deferring it is safe because nothing was typed.
   if (!allowForegroundSwitch) {
-    throw new Error(
+    const refusal = new Error(
       `${JSON.stringify(chatLabel)} is not the open conversation and foreground switching is disabled `
       + "(CYBERBOSS_WECHAT_CUA_NO_FOREGROUND_SWITCH); the reply should be deferred rather than stealing the foreground"
     );
+    // Nothing was typed and nothing was sent, so this is a CERTAIN failure - and
+    // that flag is the exact condition the delivery layer checks before deferring
+    // (deferSystemReply requires deliveryUncertain === false). Measured
+    // 2026-10-02: without it the refusal was not deferred and the reply was simply
+    // dropped - the window was not stolen, but the user never got an answer.
+    refusal.deliveryUncertain = false;
+    throw refusal;
   }
   const fresh = elements(session.snapshot(target)).find((el) => isRow(el) && wanted.test(labelOf(el)));
   let forced = session.call("click", { ...toTarget(target), element_token: fresh?.element_token || row.element_token, delivery_mode: "foreground" });

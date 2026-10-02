@@ -107,10 +107,21 @@ async function sendWeChatCuaText(config, {
     claim = await messageLedger.planAndClaim({ talker: resolvedTalker, text: content, messageKind, idempotencyKey });
   }
 
-  const result = sendMessage(win, chat, content, {
-    session: cua,
-    allowForegroundSwitch: !config?.wechatCuaNoForegroundSwitch,
-  });
+  let result;
+  try {
+    result = sendMessage(win, chat, content, {
+      session: cua,
+      allowForegroundSwitch: !config?.wechatCuaNoForegroundSwitch,
+    });
+  } catch (error) {
+    // Anything thrown out of the send ladder before a single keystroke is a certain
+    // failure; the deferral path only retries those, so the flag must survive this
+    // seam even if the error was re-created on the way.
+    if (error && error.deliveryUncertain === undefined) {
+      error.deliveryUncertain = false;
+    }
+    throw error;
+  }
   const focusCosts = result.steps.filter((s) => s.cost && s.cost !== "none").map((s) => `${s.step}:${s.cost}`);
   // A minimized client is the one case where sending makes the window VISIBLY come
   // back: the driver can only un-minimize with bring_to_front, which raises it and

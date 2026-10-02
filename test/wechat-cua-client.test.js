@@ -346,11 +346,18 @@ function test_the_no_foreground_switch_refuses_instead_of_clicking() {
     { tool: "click", reply: { route: "accessibility", effect: "unverifiable" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("Azzy"), searchBox()]) },
   ]);
-  assert.throws(
-    () => sendMessage(TARGET, "文件传输助手", "hello", { session, allowForegroundSwitch: false }),
-    /foreground switching is disabled/,
-    "the policy must refuse instead of switching"
-  );
+  let refusal = null;
+  try {
+    sendMessage(TARGET, "文件传输助手", "hello", { session, allowForegroundSwitch: false });
+  } catch (error) {
+    refusal = error;
+  }
+  assert.ok(refusal, "the policy must refuse instead of switching");
+  assert.match(refusal.message, /foreground switching is disabled/);
+  // The delivery layer defers ONLY certain failures (deferSystemReply checks this
+  // exact flag). Without it the reply is dropped rather than retried - measured on
+  // the live channel 2026-10-02.
+  assert.strictEqual(refusal.deliveryUncertain, false, "a policy refusal must be flagged as a certain failure");
   const foregroundClicks = calls.filter((c) => c.tool === "click" && c.args.delivery_mode === "foreground");
   assert.strictEqual(foregroundClicks.length, 0, "not one foreground click may be issued when the policy forbids it");
   console.log("ok   with the foreground switch disabled, a closed conversation is refused (zero foreground clicks)");
