@@ -189,7 +189,12 @@ class WeChatCuaInboxSource {
       this.timer.unref();
     }
     this.logger.log?.(
-      `[cyberboss] cua inbox enabled pollMs=${this.pollMs} deepRead=${this.deepRead} peers=${JSON.stringify(allow)}`
+      `[cyberboss] cua inbox enabled pollMs=${this.pollMs} deepRead=${this.deepRead} `
+      // The foreground policy belongs in the startup line: without it, "why did the
+      // bot (not) pop my window?" needs a code read, and an experiment can silently
+      // run under the wrong policy (that happened on 2026-10-01).
+      + `foregroundSwitch=${this.config?.wechatCuaNoForegroundSwitch ? "off (replies to closed chats are deferred)" : "on"} `
+      + `peers=${JSON.stringify(allow)}`
     );
     return this;
   }
