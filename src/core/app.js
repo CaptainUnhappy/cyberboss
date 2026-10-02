@@ -1583,8 +1583,15 @@ class CyberbossApp {
       text,
       contextToken: route.contextToken || knownTokens[senderId] || "",
     };
-    if (route.provider === "weflow-uia") {
-      payload.provider = "weflow-uia";
+    // Route the retry back over the channel the reply came from. Only `weflow-uia`
+    // used to be copied here, so a deferred CUA reply was re-sent with no provider at
+    // all, fell through to the official iLink branch and was addressed with a WeChat
+    // DISPLAY NAME: `sendMessage ret=-3 errmsg=invalid arguments` (measured
+    // 2026-10-02, the fourth experiment). Deferring worked; the retry went out of the
+    // wrong door. This is the same migration miss as the reply route, the inbound ack,
+    // the deferral gate and the leftover prefix - the fifth.
+    if (route.provider === "weflow-uia" || route.provider === "wechat-cua") {
+      payload.provider = route.provider;
     }
     if (route.weflowContact) {
       payload.weflowContact = route.weflowContact;
