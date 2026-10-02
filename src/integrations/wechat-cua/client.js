@@ -270,15 +270,42 @@ function outcome(res) {
   };
 }
 
+/**
+ * How much does this window look like the chat client itself?
+ *
+ * "Biggest window wins" was measured wrong on 2026-10-01: WeChat's own "新版本"
+ * promo dialog is 690x564 while the minimized main window collapses to 183x26, so
+ * the promo won - it has no conversation rows and no composer, meaning the bot read
+ * an empty chat list (deaf) and would have typed a reply into an advertisement.
+ *
+ * The client's identity is structural, not geometric: the chat window owns a
+ * conversation list (narrow multi-line ListItems) and a message box (an Edit).
+ * Score those, and only fall back to size when nothing scores.
+ */
+function chatWindowScore(session, win) {
+  let snap;
+  try {
+    snap = session.call("get_window_state", { pid: win.pid, window_id: win.window_id, max_elements: 400 });
+  } catch {
+    return 0;
+  }
+  if (snap?.__failed) return 0;
+  const els = elements(snap);
+  const rows = els.filter((el) => el.role === "ListItem" && (el.frame?.w || 0) > 0 && el.frame.w < 400
+    && String(el.label || "").includes("\n")).length;
+  const composer = els.some((el) => el.role === "Edit" && !/搜索/.test(labelOf(el)));
+  return (rows >= 2 ? 2 : 0) + (composer ? 2 : 0) + (rows >= 2 && composer ? 1 : 0);
+}
+
 /** Locate the WeChat main window through the driver itself. */
 function findWeChatWindow(session = new CuaSession()) {
   const res = session.call("list_windows", { on_screen_only: false });
   const all = res.windows || res._legacy_windows || [];
   const byTitle = all.filter((w) => WECHAT_TITLE.test(w.title || ""));
-  // The client owns several windows (overlay/mini-program hosts). The main one is
-  // the largest, which is stable no matter what the driver calls it.
   const area = (w) => (w.bounds ? w.bounds.width * w.bounds.height : (w.width || 0) * (w.height || 0));
-  const hit = byTitle.sort((a, b) => area(b) - area(a))[0];
+  const scored = byTitle.map((w) => ({ w, score: chatWindowScore(session, w) }));
+  const structural = scored.filter((item) => item.score > 0).sort((a, b) => b.score - a.score)[0];
+  const hit = (structural ? structural.w : null) || byTitle.sort((a, b) => area(b) - area(a))[0];
   if (!hit) {
     throw new Error("no WeChat window visible to the driver (is the client running on this desktop?)");
   }
@@ -288,6 +315,10 @@ function findWeChatWindow(session = new CuaSession()) {
     title: hit.title,
     minimized: hit.minimized,
     bounds: hit.bounds || { x: hit.x, y: hit.y, width: hit.width, height: hit.height },
+    // Which window this is, and whether it looked like the client: the difference
+    // between "the chat window" and "a popup of the same title" is worth logging.
+    matchedBy: structural ? "chat-structure" : "largest-window",
+    candidates: byTitle.length,
   };
 }
 
