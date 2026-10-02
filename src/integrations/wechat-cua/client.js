@@ -38,6 +38,7 @@
 // rather than leave the bot permanently mute.
 
 const { execFileSync } = require("node:child_process");
+const { createMcpTransport } = require("./mcp-transport");
 
 const DRIVER = process.env.CUA_DRIVER
   || "C:\\Users\\79388\\AppData\\Local\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe";
@@ -103,20 +104,21 @@ const WINDOW_MINIMIZED = /window_minimized|window is minimized/i;
  */
 const FOREGROUND_ACTIVATION_COST = "foreground-activation 150-300ms";
 
-/** One `cua-driver call` process. Returns stdout; throws Node's child error shape. */
+/** One tool call. Fast path: the long-lived MCP child; fallback: a CLI process. */
 function defaultExec(driver, args, input) {
-  return execFileSync(driver, args, {
-    input,
-    encoding: "utf8",
-    windowsHide: true,
-    maxBuffer: 128 * 1024 * 1024,
-    // Capture stderr explicitly. The sync variants otherwise forward a child's
-    // stderr to the parent's, so a driver outage printed three lines of
-    // "daemon is not running" per poll and drowned the one line that mattered
-    // (the recovery message). It is still available as `error.stderr`.
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  return MCP_TRANSPORT(driver, args, input);
 }
+
+/**
+ * The transport used by every session in this module.
+ *
+ * `cua-driver call` costs 1.5-2.0s of process spawn per call, and this client makes
+ * 4-6 calls per send and ~5 per conversation switch - which is why the "处理中"
+ * acknowledgement arrived seconds late and why a switch held the foreground that
+ * long. The MCP transport answers the same calls in ~150ms and falls back to the CLI
+ * on any problem (see mcp-transport.js for the measurements).
+ */
+const MCP_TRANSPORT = createMcpTransport();
 
 /** Text of a failed response, whichever shape it arrived in. */
 function failureText(res) {
@@ -239,6 +241,41 @@ class CuaSession {
   snapshot(target, mode = "ax") {
     return this.call("get_window_state", { ...toTarget(target), capture_mode: mode });
   }
+
+  /**
+   * Bring a minimized window back WITHOUT activating it.
+   *
+   * The driver has no tool for this: `bring_to_front` is its only un-minimize, and it
+   * raises the window and leaves it in front. `ShowWindow(hwnd, SW_SHOWNOACTIVATE)`
+   * does the same restore and leaves the foreground alone (measured 2026-10-02: the
+   * foreground pid is unchanged), which is the difference between "the bot works in
+   * the background" and "the bot keeps grabbing my screen". Stubbable for tests.
+   */
+  restoreMinimized(pid) {
+    return defaultRestoreMinimized(pid);
+  }
+}
+
+/** `SW_SHOWNOACTIVATE` = 4: show the window at its previous size, do not activate it. */
+function defaultRestoreMinimized(pid) {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return { ok: false, error: `restoreMinimized needs a pid, got ${JSON.stringify(pid)}` };
+  }
+  const script = [
+    "Add-Type -Namespace W -Name SW -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);'",
+    `[void][W.SW]::ShowWindow((Get-Process -Id ${numericPid}).MainWindowHandle, 4)`,
+  ].join("; ");
+  try {
+    execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      stdio: ["ignore", "ignore", "ignore"],
+      windowsHide: true,
+      timeout: 15_000,
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String((error && error.message) || error) };
+  }
 }
 
 const elements = (snap) => (Array.isArray(snap?.elements) ? snap.elements : []);
@@ -349,13 +386,17 @@ function reclickRow(session, target, wanted, deliveryMode = "") {
 
 /**
  * Open `chatLabel` if it is not already open.
- * Returns { switched, route, cost } where route names the rung that worked.
+ *
+ * Returns { switched, route, cost, label, box, snapshot }: the last two come from the
+ * very snapshot this rung already read, so a caller that needs the composer does not
+ * have to read the window again (one driver call, ~200ms - which is 200ms of the
+ * "处理中" being late, and reading again also invalidates the tokens it just got).
  */
 function ensureConversation(session, target, chatLabel, { settleMs = 1800, allowForegroundSwitch = true } = {}) {
   const wanted = new RegExp(`^\\s*${chatLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i");
   const before = currentConversation(session, target);
   if (wanted.test(before.label)) {
-    return { switched: false, route: "already-open", cost: "none", label: before.label };
+    return { switched: false, route: "already-open", cost: "none", label: before.label, box: before.box, snapshot: before.snapshot };
   }
 
   const row = elements(before.snapshot).find((el) => isRow(el) && wanted.test(labelOf(el)));
@@ -372,7 +413,7 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800, allow
   sleep(settleMs);
   let now = currentConversation(session, target);
   if (wanted.test(now.label)) {
-    return { switched: true, route: "accessibility", cost: "background", label: now.label, outcome: outcome(attempt) };
+    return { switched: true, route: "accessibility", cost: "background", label: now.label, box: now.box, snapshot: now.snapshot, outcome: outcome(attempt) };
   }
 
   // Rung 2: explicit foreground click. This is the rung that actually switches -
@@ -402,7 +443,7 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800, allow
   if (!wanted.test(now.label)) {
     throw new Error(`could not open ${JSON.stringify(chatLabel)} (foreground click refused: ${JSON.stringify(outcome(forced))})`);
   }
-  return { switched: true, route: "foreground-click", cost: FOREGROUND_ACTIVATION_COST, label: now.label, outcome: outcome(forced) };
+  return { switched: true, route: "foreground-click", cost: FOREGROUND_ACTIVATION_COST, label: now.label, box: now.box, snapshot: now.snapshot, outcome: outcome(forced) };
 }
 
 /**
@@ -482,11 +523,19 @@ function forgetLeftover(chatLabel) {
  */
 function sendMessage(target, chatLabel, text, { session = new CuaSession(), settleMs = 1800, requireForegroundType = false, allowForegroundSwitch = true } = {}) {
   const steps = [];
+  // Every step carries its own wall-clock offset: without it, a 7-second send looks
+  // like one opaque number and the only way to find the cost is to guess (which is
+  // how the MCP transport, the fixed settles and the send route were all found).
+  const startedAtMs = Date.now();
+  const pushStep = (entry) => { steps.push({ ...entry, ms: Date.now() - startedAtMs }); };
   const opened = ensureConversation(session, target, chatLabel, { settleMs, allowForegroundSwitch });
   steps.push({ step: "open", ...opened });
 
-  // Fresh snapshot: the message box element belongs to the conversation just opened.
-  let conv = currentConversation(session, target);
+  // The composer comes from the snapshot `ensureConversation` already read: reading the
+  // window again costs a driver call AND invalidates the token we are about to use.
+  let conv = opened.box
+    ? { label: opened.label, box: opened.box, snapshot: opened.snapshot }
+    : currentConversation(session, target);
   if (!conv.box) throw new Error("no message box after opening the conversation");
 
   const draft = String(conv.box.value ?? "");
@@ -507,7 +556,10 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
 
   let typed = typeInto(session, target, conv.box, text, requireForegroundType ? "foreground" : "background");
   let firstAttempt = null;
-  sleep(600);
+  // A settle, not a wait for the text to travel: the UIA write is confirmed
+  // synchronously (`effect: confirmed` + `value_readback`), so every millisecond here
+  // is a millisecond of the 处理中 being late (measured 2026-10-02).
+  sleep(80);
   conv = currentConversation(session, target);
   if (String(conv.box?.value ?? "") !== text) {
     // Two different failures land here and both want the same cure - a NEW token:
@@ -518,72 +570,145 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
     // refusal - and if the window is minimized, it is restored first.
     firstAttempt = outcome(typed);
     if (firstAttempt.reason === "window_minimized") {
-      // POLICY: never raise the window ourselves.
+      // A minimized window has to be restored before it can be typed into, and there
+      // ARE two ways to do it - they differ in exactly the thing the operator cares
+      // about:
       //
-      // Un-minimizing has no background path: the driver can only do it with
-      // bring_to_front, which raises WeChat AND leaves it in front. Measured
-      // 2026-10-01: a conversation switch activates for 150-300ms and returns the
-      // focus, but a restore *stays* - and that is the "the bot popped my window up
-      // while I was working" complaint. A minimized client means the user put it
-      // away, so the honest thing is to fail certainly and let the caller's
-      // deferral path retry the reply later (see stream-delivery.deferSystemReply,
-      // which now defers certain CUA failures too).
-      steps.push({ step: "type", landed: false, outcome: outcome(typed), firstAttempt });
-      return { ok: false, verify: "the WeChat window is minimized; refusing to raise it (the reply will be retried)", steps };
-    }
-    if (conv.box) {
+      //   bring_to_front          raises WeChat AND leaves it in front (the "the bot
+      //                           popped my window up" complaint)
+      //   ShowWindow(SW_SHOWNOACTIVATE)
+      //                           restores the window at its previous size without
+      //                           touching the foreground. Measured 2026-10-02 twice:
+      //                           the foreground pid is identical before and after.
+      //
+      // So the policy is no longer "refuse and defer": the window is restored the
+      // quiet way and the send continues. Refusing used to make the whole channel
+      // mute for as long as the user kept WeChat in the taskbar (measured
+      // 2026-10-02: the operator minimized it and no reply or 处理中 could go out).
+      const restored = session.restoreMinimized(target.pid);
+      pushStep({ step: "unminimize", outcome: { failed: !restored.ok, reason: restored.ok ? "no-activate-restore" : "restore-failed", detail: restored.error || "" } });
+      if (!restored.ok) {
+        pushStep({ step: "type", landed: false, outcome: outcome(typed), firstAttempt });
+        return {
+          ok: false,
+          verify: "the WeChat window is minimized and could not be restored without stealing focus (the reply will be retried)",
+          steps,
+        };
+      }
+      conv = currentConversation(session, target);
+      if (conv.box) {
+        typed = typeInto(session, target, conv.box, text, "foreground");
+        sleep(250);
+        conv = currentConversation(session, target);
+      }
+    } else if (conv.box) {
       typed = typeInto(session, target, conv.box, text, "foreground");
-      sleep(600);
+      sleep(250);
       conv = currentConversation(session, target);
     }
   }
   const landed = String(conv.box?.value ?? "") === text;
-  steps.push({ step: "type", landed, outcome: outcome(typed), ...(firstAttempt ? { firstAttempt } : {}) });
+  pushStep({ step: "type", landed, outcome: outcome(typed), ...(firstAttempt ? { firstAttempt } : {}) });
   if (!landed) {
     return { ok: false, verify: "text never reached the message box", steps };
   }
 
-  let sent = session.call("press_key", { ...toTarget(target), element_token: conv.box.element_token, key: "return" });
+  /**
+   * Deliver the RETURN for a composer that already holds our text.
+   *
+   * Four routes were measured on 2026-10-02 (50ms foreground sampling, another window
+   * parked in front), and they differ in exactly what the operator complained about:
+   *
+   *   press_key (no delivery mode)   PostMessage(WM_KEYDOWN) to the window. WeChat
+   *                                  ignores it: the driver answers "✅ sent", the text
+   *                                  stays in the composer.
+   *   press_key (foreground)         SendInput: it DOES send, and it never gives the
+   *                                  foreground back - WeChat was still in front 10.5s
+   *                                  later, with the user's window behind it.
+   *   click on the composer's 发送    sends, and the driver returns the focus after
+   *                                  ~124ms - but the call itself costs ~1.9s.
+   *   type_text "\n" (foreground)    SendInput of one newline: sends, 146ms per call,
+   *                                  and WeChat held the foreground for 125ms.
+   *
+   * So the newline is primary, the button is the retry route for a client whose Enter
+   * does not send (WeChat can be configured to need Ctrl+Enter, in which case the box
+   * keeps the text and `send-again` walks this ladder with the newline skipped), and
+   * the mode-less press is never used because "reported sent, still in the box" is the
+   * worst of the four.
+   */
+  function deliverReturn(snapshotForButton, { skipNewline = false } = {}) {
+    const box = elements(snapshotForButton).find(isEdit);
+    // The newline is one rung, and a refusal is reported as-is so the caller retries
+    // it from a NEW snapshot (dead tokens kill the button rung too, so falling through
+    // inside this call would only burn the retry).
+    if (!skipNewline && box) {
+      return {
+        via: "foreground-newline",
+        res: session.call("type_text", {
+          ...toTarget(target), element_token: box.element_token, text: "\n", delivery_mode: "foreground",
+        }),
+      };
+    }
+    const button = elements(snapshotForButton).find((el) => labelOf(el) === "发送");
+    if (button) {
+      let res = session.call("click", {
+        ...toTarget(target), element_token: button.element_token, delivery_mode: "foreground",
+      });
+      if (isStaleToken(res)) {
+        const fresh = currentConversation(session, target);
+        const retryButton = elements(fresh.snapshot).find((el) => labelOf(el) === "发送");
+        if (retryButton) {
+          res = session.call("click", {
+            ...toTarget(target), element_token: retryButton.element_token, delivery_mode: "foreground",
+          });
+        }
+      }
+      return { via: "send-button-click", res };
+    }
+    return {
+      via: "foreground-return",
+      res: session.call("press_key", {
+        ...toTarget(target), element_token: box?.element_token, key: "return", delivery_mode: "foreground",
+      }),
+    };
+  }
+
+  let sent = deliverReturn(conv.snapshot);
   let pressRetryFrom = null;
   let skippedRepress = false;
-  const pressRefusal = outcome(sent);
-  if (pressRefusal.failed && (isStaleToken(sent) || isWindowMinimized(sent))) {
-    // The press was refused, so it did not happen. Whether to press again depends
-    // on the box, not on optimism: text still there = nothing was sent, empty box
-    // = the message went out and only our view of it is stale, so pressing again
-    // would send a second copy. Verification below decides, not this branch.
+  const pressRefusal = outcome(sent.res);
+  if (pressRefusal.failed && (isStaleToken(sent.res) || isWindowMinimized(sent.res))) {
+    // The delivery was refused, so the message did not go out. Whether to try again
+    // depends on the box, not on optimism: text still there = nothing was sent, empty
+    // box = it went out and only our view is stale, so sending again would duplicate
+    // it. Verification below decides, not this branch.
     pressRetryFrom = pressRefusal;
-    // (no restore either: the same policy as above)
     conv = currentConversation(session, target);
     if (conv.box && String(conv.box.value ?? "") === text) {
-      sent = session.call("press_key", { ...toTarget(target), element_token: conv.box.element_token, key: "return" });
+      sent = deliverReturn(conv.snapshot);
     } else {
       skippedRepress = true;
     }
   }
-  steps.push({
-    step: "return",
-    outcome: outcome(sent),
+  pushStep({
+    step: "send",
+    via: sent.via,
+    outcome: outcome(sent.res),
     ...(pressRetryFrom ? { firstAttempt: pressRetryFrom } : {}),
     ...(skippedRepress ? { skippedRepress } : {}),
   });
-  sleep(1500);
-
+  // SendInput sends synchronously and the composer is empty the moment it returns;
+  // this settle only covers the chat-list preview repaint.
+  sleep(250);
   let after = session.snapshot(toTarget(target));
   let verdict = sendVerdict(after, text);
   if (!verdict.ok && verdict.boxHoldsText) {
-    // A press the driver reports as PERFORMED can still fail to reach WeChat: the
-    // default press is delivered without a delivery mode, and measured 2026-10-02
-    // (twice in a row, on a window that was not the foreground window) the text sat
-    // in the composer while the identical press with `delivery_mode:"foreground"`
-    // (SendInput) sent it immediately. The box decides whether re-pressing is safe:
-    // text still in it means nothing was sent, so this cannot double-send.
-    const boxEl = elements(after).find(isEdit);
-    const repressed = session.call("press_key", {
-      ...toTarget(target), element_token: boxEl?.element_token, key: "return", delivery_mode: "foreground",
-    });
-    steps.push({ step: "return-foreground", outcome: outcome(repressed) });
-    sleep(1500);
+    // Whatever route ran, the box is the judge: text still in it means nothing was
+    // sent, so trying once more cannot duplicate anything. This is also the path that
+    // saved the old mode-less press, which reported success and sent nothing.
+    const again = deliverReturn(after, { skipNewline: true });
+    pushStep({ step: "send-again", via: again.via, outcome: outcome(again.res) });
+    sleep(400);
     after = session.snapshot(toTarget(target));
     verdict = sendVerdict(after, text);
   }
@@ -608,10 +733,13 @@ function sendVerdict(snap, text) {
   const probe = text.slice(0, Math.min(16, text.length));
   const seen = rows.find((label) => label.includes(probe));
   const boxValue = String(elements(snap).find(isEdit)?.value ?? "");
+  // Trailing newlines are ignored on purpose: when Enter is configured not to send,
+  // the composer holds `text\n` and that is exactly the state the retry exists for.
+  const held = boxValue.replace(/[\r\n]+$/, "");
   return {
     seen,
     boxEmpty: !boxValue,
-    boxHoldsText: boxValue === text,
+    boxHoldsText: held === text,
     ok: Boolean(seen) && !boxValue,
   };
 }

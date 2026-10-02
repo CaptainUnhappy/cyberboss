@@ -238,6 +238,29 @@ session '<label>' to start it again, or use a new session label.
    `sourceProvider: "weflow-uia"`，于是 CUA 义务重载后全部改姓"已经不能发信的通道"（当天 13 条
    CUA 义务无一例外）。这是同一族 provider 硬编码的第六处，修法是保留写入时的 provider。
 
+### 12. 交接后操作者的两条抱怨：焦点不还、处理中太慢（2026-10-02 第十四轮）
+
+原话：「还是没有将原始焦点还原」「"处理中"回复过慢不是第一时间回复的」。两条**共用同一个根因**，都是量出来的：
+
+**根因一：每次驱动调用 1.5–2.0s。** `cua-driver call` 每次都起一个新进程（各 4 次实测：`list_windows` 1495/1587/1593/1607ms，`get_window_state` 1540/2032/1676/1620ms），而一次发送要 4–6 次调用、一次切换要 ~5 次。`cua-driver mcp` 是一条常驻 stdio 连接，同样的调用实测 164/179/150/144ms 与 155/146/141ms —— **差 10 倍**。新增 `mcp-transport.js`（worker 线程持有 mcp 子进程，主线程用 `receiveMessageOnPort` 同步取回，客户端的同步 API 一行没改）+ `mcp-transport-worker.js`（把 MCP 回答映射回 `cua-driver call` 打印的形状，refusal 仍落在 `payload.refusal.code`）。它是**优化不是依赖**：任何异常都退回 CLI 并冷却 120s，`CYBERBOSS_CUA_MCP_TRANSPORT=0` 可关。实测 `findWeChatWindow` 33.7s → 0.67s、`currentConversation` 1.8s → 0.22s。
+
+**根因二：发送走的是"抢了不还"的那条路。** 50ms 采样、把 chrome(12744) 停在最前，四条路都量了：
+
+| 发送方式 | 发出去了吗 | 前台代价 |
+| --- | --- | --- |
+| `press_key return`（无 delivery mode，PostMessage） | **没有**（微信忽略；驱动回答"✅ 已发送"） | 零 |
+| `press_key return delivery_mode=foreground`（SendInput） | 发出去了 | **抢走且不还**：全程 10544ms，采样结束时微信仍在前台 |
+| 点击 UIA 树里的 `Button "发送"`（前台点击） | 发出去了 | 124ms 后归还，但单次调用 ~1.9s |
+| **`type_text "\n"`（前台）** | 发出去了 | **146ms 的单次调用，微信只在前台 125ms** |
+
+于是发送主路径改成"后台写值 + 一次前台换行"，点 `发送` 按钮作为重试梯级（微信可被配置成 Ctrl+Enter 发送，那时换行只是插入换行符：输入框仍留着 `text\n`，`sendVerdict` 因此容忍结尾换行，`send-again` 跳过换行改点按钮），没有按钮时才退回前台回车。**那个"报了成功却没发出去"的模式彻底不用了。**
+
+**顺带修掉的两处：**
+- **最小化不再是死路**：旧策略是"拒绝 + 延迟"（因为当时只知道 `bring_to_front` 能恢复、而它会一直留在前台）。实测 `ShowWindow(SW_SHOWNOACTIVATE)` 恢复窗口后**前台 pid 不变**（两次），于是改成"静默恢复后继续发送"。之前操作者把微信最小化过一次，整个通道哑掉：处理中和回复都发不出去。
+- **"处理中"的两段延迟都砍了**：读会话轮询 3000ms → 1500ms（新增 `CYBERBOSS_WECHAT_CUA_POLL_MS`）；发送阶梯里的固定 sleep 600/1500 → 80/250ms（UIA 写入本来就是同步确认的，这些只是等重绘）；`ensureConversation` 把自己的快照一起返回，发送路径不再多读一次窗口（省一次调用，也避免刚拿到的 token 被自己下一次读作废）。每个 step 现在都带 `ms`，`inbound acknowledged` 日志也带 `latencyMs`/`sendMs` —— 以后不用再猜。
+
+**更正（重要）：§11 里"会话全程零前台、724 次采样"那条证据是无效的。** 采样脚本的 `Add-Type -MemberDefinition '...'` 多了一个 `]`，类型注册失败后每一拍都写 `0`，而"永远 0"看起来和"前台从未动过"一模一样 —— 我据此下了结论。修正后的采样器（去掉那个 `]`）才是本节的数字来源：一次切换 126ms、一次发送 190ms（按钮路径）/125ms（换行路径），**两次都归还焦点**；整段 70 秒窗口里微信累计只在前台 506ms，且每次都由驱动主动归还。这个坑已写进 `docs/wechat-cua-channel.md`。
+
 ## Verification
 
 - 离线（本轮新增，反证都做过）：`test/wechat-cua-client.test.js` 14/14（+ "驱动说发了、框里还在 → 前台补按一次"，且补按模式必须是 `foreground`）、`test/reply-obligation-store.test.js` 14/14（+ CUA 义务重载后仍姓 `wechat-cua`）、`test/stream-delivery.test.js` 38/38（+ CUA 目标按桌面 provider 路由、"确定失败才延迟"与"不确定绝不延迟"的正反两例）。删掉任一处修复，对应断言立刻红。

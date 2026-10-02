@@ -85,6 +85,11 @@ function readConfig() {
     // deep read costs a foreground click.
     wechatCuaInboxEnabled: mode === "start" && readBoolEnv("CYBERBOSS_ENABLE_WECHAT_CUA_INBOX"),
     wechatCuaInboxDeepRead: readBoolEnv("CYBERBOSS_WECHAT_CUA_INBOX_DEEP_READ"),
+    // How often the open conversation is read. This is the FIRST half of the operator's
+    // "处理中 is not the first thing that arrives" complaint: at 3000ms a message could
+    // sit unread for three seconds before the acknowledgement was even attempted. A
+    // poll costs one snapshot (~150ms over the MCP transport), so 1500ms is cheap.
+    wechatCuaInboxPollMs: readIntEnv("CYBERBOSS_WECHAT_CUA_POLL_MS") || 1_500,
     wechatCuaAllowPeers: readTextEnv("CYBERBOSS_WECHAT_CUA_ALLOW_PEERS"),
     // Opt-in: never take the foreground, not even for the 150-300ms activation a
     // conversation switch costs. A reply whose conversation is not already open is

@@ -516,6 +516,7 @@ class CyberbossApp {
       // from answering its own replies.
       ledger: sharedLedger,
       deepRead: this.config.wechatCuaInboxDeepRead,
+      pollMs: this.config.wechatCuaInboxPollMs,
       onMessage: (message, snapshot) => this.handleWeFlowInboxMessage(message, snapshot),
     });
     await this.wechatCuaInboxSource.start();
@@ -2350,9 +2351,17 @@ class CyberbossApp {
       provider: prepared.provider,
       messageKind: isReminderRequest ? "reminder_ack" : "inbound_ack",
     }, prepared);
+    const ackStartedAtMs = Date.now();
+    const ackReceivedAtMs = Date.parse(normalizeText(prepared?.receivedAt)) || 0;
     try {
       await this.channelAdapter.sendText(payload);
-      console.log(`[cyberboss] inbound acknowledged message=${prepared.messageId || "(unknown)"}`);
+      // The split matters: `latencyMs` is the operator's complaint measured from the
+      // moment the message was READ, `sendMs` is how much of it the write path cost.
+      // Without these two numbers "处理中 is late" is unfalsifiable.
+      console.log(
+        `[cyberboss] inbound acknowledged message=${prepared.messageId || "(unknown)"}`
+        + ` latencyMs=${ackReceivedAtMs ? Date.now() - ackReceivedAtMs : "?"} sendMs=${Date.now() - ackStartedAtMs}`
+      );
       if (isInboundTimestampRequest(prepared?.originalText)
           || isInboundTimestampRequest(prepared?.contentText)
           || isInboundTimestampRequest(prepared?.text)) {

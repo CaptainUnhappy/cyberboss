@@ -45,6 +45,8 @@ const snapshot = (elements) => ({ elements, element_count: elements.length });
 const row = (label, token = "tok-row") => ({ role: "ListItem", label, element_token: token });
 const box = (label, value = "", token = "tok-box") => ({ role: "Edit", label, value, element_token: token });
 const searchBox = (value = "") => ({ role: "Edit", label: "搜索", value, element_token: "tok-search" });
+/** The composer's send button, as the real tree exposes it: Button "发送". */
+const sendButton = (token = "tok-send") => ({ role: "Button", label: "发送", actions: ["invoke", "set_value"], element_token: token });
 
 /** A refusal shaped like the driver's real `stale_element_token` answer. */
 const staleToken = () => ({
@@ -102,8 +104,10 @@ function test_refuses_to_claim_success_when_the_row_never_appears() {
   const { session } = fakeDriver([
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("Azzy")]) },
     { tool: "click", reply: { route: "accessibility", effect: "unverifiable" } },
+    // Still the same conversation - this read is what makes rung 1 a failure.
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("Azzy")]) },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("Azzy")]) },
+    // Rung 2 needs a token from a fresh snapshot.
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手", "tok-row-2"), box("Azzy")]) },
     { tool: "click", reply: { route: "global_input", delivery: { mode: "foreground" } } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("Azzy")]) },
   ]);
@@ -118,15 +122,14 @@ function test_refuses_to_claim_success_when_the_row_never_appears() {
 function test_send_reports_success_from_the_preview_row() {
   const text = "CUA-CLOSED-LOOP-OK";
   const { session, calls } = fakeDriver([
-    // open: already on the right conversation
+    // open: already on the right conversation (its snapshot also carries the composer)
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
     // type
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "confirmed", summary: "✅ Wrote 18 char(s)" } },
     // read-back shows the text in the box
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text), searchBox()]) },
     // send
-    { tool: "press_key", reply: { route: "synthetic_events", effect: "unverifiable", summary: "📨 Sent return" } },
+    { tool: "type_text", reply: { route: "synthetic_events", effect: "unverifiable", summary: "📨 Sent return" } },
     // verify
     { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
   ]);
@@ -134,17 +137,17 @@ function test_send_reports_success_from_the_preview_row() {
   assert.strictEqual(result.ok, true, `expected ok, got ${result.verify}`);
   assert.match(result.verify, /preview row/);
   const steps = result.steps.map((s) => s.step);
-  assert.deepStrictEqual(steps, ["open", "type", "return"]);
+  assert.deepStrictEqual(steps, ["open", "type", "send"]);
   assert.strictEqual(result.steps[0].cost, "none");
-  const pressed = calls.find((c) => c.tool === "press_key");
-  assert.strictEqual(pressed.args.key, "return");
+  const newline = calls.find((c) => c.tool === "type_text" && c.args.text === "\n");
+  assert.ok(newline, "the send is the foreground newline call");
+  assert.strictEqual(newline.args.delivery_mode, "foreground");
   console.log("ok   a send is confirmed from the conversation preview row");
 }
 
 function test_send_fails_when_the_text_never_lands() {
   const text = "never-lands";
   const { session, calls } = fakeDriver([
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "unverifiable" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
@@ -154,7 +157,7 @@ function test_send_fails_when_the_text_never_lands() {
   const result = sendMessage(TARGET, "文件传输助手", text, { session });
   assert.strictEqual(result.ok, false);
   assert.match(result.verify, /never reached/);
-  assert.strictEqual(calls.some((c) => c.tool === "press_key"), false, "never press return when the text did not land");
+  assert.strictEqual(calls.some((c) => c.tool === "type_text" && c.args.text === "\n"), false, "never deliver a return when the text did not land");
   console.log("ok   return is not pressed when the text never landed");
 }
 
@@ -183,31 +186,57 @@ test_current_conversation_reads_the_box_label();
 test_a_refused_write_is_retried_from_a_new_snapshot();
 test_a_refused_return_is_re_pressed_only_while_the_text_is_still_there();
 test_a_refused_return_with_an_empty_box_is_not_pressed_again();
-test_a_press_that_silently_sent_nothing_is_retried_in_the_foreground();
+test_a_send_uses_one_foreground_newline();
+test_a_newline_that_did_not_send_falls_back_to_the_send_button();
+test_without_a_send_button_the_retry_still_never_uses_a_mode_less_press();
 test_an_unknown_draft_is_never_typed_over();
 test_our_own_unsent_leftover_is_cleared_before_the_next_attempt();
-test_a_minimized_window_is_refused_not_raised();
+test_a_minimized_window_is_restored_without_activation();
+test_a_minimized_window_that_cannot_be_restored_still_fails_certainly();
 test_the_no_foreground_switch_refuses_instead_of_clicking();
 
-function test_a_minimized_window_is_refused_not_raised() {
-  // Measured 2026-10-01: un-minimizing needs bring_to_front, which raises WeChat and
-  // LEAVES it in front - unlike a conversation switch, whose activation is transient
-  // (150-300ms). Raising the user's window on our own initiative is the thing they
-  // complained about, so the send refuses instead, and the failure is *certain*
-  // (nothing was typed), which lets the caller defer the reply and retry it later.
-  const text = "MINIMIZED-REFUSAL";
+function test_a_minimized_window_is_restored_without_activation() {
+  // Measured 2026-10-02 twice: the driver's only un-minimize is `bring_to_front`,
+  // which raises WeChat AND leaves it in front, while `ShowWindow(SW_SHOWNOACTIVATE)`
+  // restores it at its previous size with the foreground pid unchanged. Refusing
+  // instead (the old policy) made the whole channel mute for as long as the operator
+  // kept WeChat in the taskbar - no 处理中 and no reply could go out at all.
+  const text = "MINIMIZED-RESTORE";
   const { session, calls } = fakeDriver([
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
+    { tool: "type_text", reply: { __failed: true, payload: { refusal: { code: "window_minimized", message: "the window is minimized" } } } },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-2"), searchBox()]) },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-3"), searchBox()]) },
+    { tool: "type_text", reply: { route: "global_input", delivery: { mode: "foreground" } } },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-3"), searchBox()]) },
+    { tool: "type_text", reply: { route: "synthetic_events", effect: "unverifiable" } },
+    { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
+  ]);
+  const restores = [];
+  session.restoreMinimized = (pid) => { restores.push(pid); return { ok: true }; };
+
+  const result = sendMessage(TARGET, "文件传输助手", text, { session });
+  assert.deepStrictEqual(restores, [TARGET.pid], "the minimized window must be restored, by pid");
+  assert.ok(result.steps.some((step) => step.step === "unminimize"), "the restore must be visible in the steps");
+  assert.strictEqual(calls.some((c) => c.tool === "bring_to_front"), false, "the bot must NOT raise the user's window");
+  assert.strictEqual(result.ok, true, `expected the send to go through after the restore, got ${result.verify}`);
+  console.log("ok   a minimized window is restored without activation and the send continues");
+}
+
+function test_a_minimized_window_that_cannot_be_restored_still_fails_certainly() {
+  const text = "MINIMIZED-UNRESTORABLE";
+  const { session, calls } = fakeDriver([
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
     { tool: "type_text", reply: { __failed: true, payload: { refusal: { code: "window_minimized", message: "the window is minimized" } } } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-2"), searchBox()]) },
   ]);
+  session.restoreMinimized = () => ({ ok: false, error: "no such process" });
+
   const result = sendMessage(TARGET, "文件传输助手", text, { session });
-  assert.strictEqual(result.ok, false, "a minimized window must not be reported as sent");
+  assert.strictEqual(result.ok, false, "a window that cannot be restored must not be reported as sent");
   assert.match(result.verify, /minimized/, "and the reason must name the actual condition");
-  assert.strictEqual(calls.some((c) => c.tool === "bring_to_front"), false, "the bot must NOT raise the user's window");
-  assert.strictEqual(calls.some((c) => c.tool === "press_key"), false, "and it must not press return either");
-  console.log("ok   a minimized window is refused (no raise), so the caller can defer instead");
+  assert.strictEqual(calls.some((c) => c.tool === "press_key"), false, "nothing may be typed or sent into a hidden window");
+  console.log("ok   a minimized window that cannot be restored fails certainly (the reply is deferred)");
 }
 
 function test_an_unknown_draft_is_never_typed_over() {
@@ -215,7 +244,7 @@ function test_an_unknown_draft_is_never_typed_over() {
   // workspace with an owner: text we did not put there is never typed over and
   // never deleted - the send fails and quotes the text back instead.
   const { session, calls } = fakeDriver([
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
+    // One snapshot: the composer comes from the read that opened the conversation.
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "手动打字中", "tok-box-1"), searchBox()]) },
   ]);
   const result = sendMessage(TARGET, "文件传输助手", "bot reply", { session });
@@ -234,24 +263,24 @@ function test_our_own_unsent_leftover_is_cleared_before_the_next_attempt() {
   const { session, calls } = fakeDriver([
     // Attempt 1: the write lands, the press is refused twice, the text stays unsent.
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
+    { tool: "type_text", reply: staleToken() },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
+    { tool: "type_text", reply: staleToken() },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
+    // The send-again rung has no 发送 button to click here, so it falls back to a
+    // foreground press - refused as well, so the text really does stay unsent.
     { tool: "press_key", reply: staleToken() },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
-    { tool: "press_key", reply: staleToken() },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
-    // The foreground re-press is refused too, so the text really does stay unsent.
-    { tool: "press_key", reply: staleToken() },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
-    // Attempt 2: the same text is recognised as OURS, cleared, and sent.
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
+    // Attempt 2: the same text is recognised as OURS, cleared, and sent. The opening
+    // read already shows the leftover, because that read now carries the composer.
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-3"), searchBox()]) },
     { tool: "set_value", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-4"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-4"), searchBox()]) },
-    { tool: "press_key", reply: { route: "synthetic_events", effect: "unverifiable" } },
+    { tool: "type_text", reply: { route: "synthetic_events", effect: "unverifiable" } },
     { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
   ]);
 
@@ -279,16 +308,16 @@ function test_a_refused_write_is_retried_from_a_new_snapshot() {
   const text = "RETRY-AFTER-STALE";
   const { session, calls } = fakeDriver([
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
     { tool: "type_text", reply: staleToken() },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-2"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
-    { tool: "press_key", reply: { route: "synthetic_events", effect: "unverifiable" } },
+    { tool: "type_text", reply: { route: "synthetic_events", effect: "unverifiable" } },
     { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
   ]);
   const result = sendMessage(TARGET, "文件传输助手", text, { session });
-  const types = calls.filter((c) => c.tool === "type_text");
+  // The typing calls only: the newline that delivers the return is also a type_text.
+  const types = calls.filter((c) => c.tool === "type_text" && c.args.text !== "\n");
   assert.strictEqual(types.length, 2, "a refused write must be attempted again");
   assert.strictEqual(types[0].args.element_token, "tok-box-1");
   assert.strictEqual(types[1].args.element_token, "tok-box-2", "the retry must use a token from the NEW snapshot");
@@ -302,16 +331,15 @@ function test_a_refused_return_is_re_pressed_only_while_the_text_is_still_there(
   const text = "PRESS-AGAIN";
   const { session, calls } = fakeDriver([
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
-    { tool: "press_key", reply: staleToken() },
+    { tool: "type_text", reply: staleToken() },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-2"), searchBox()]) },
-    { tool: "press_key", reply: { route: "synthetic_events", effect: "unverifiable" } },
+    { tool: "type_text", reply: { route: "synthetic_events", effect: "unverifiable" } },
     { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
   ]);
   const result = sendMessage(TARGET, "文件传输助手", text, { session });
-  const presses = calls.filter((c) => c.tool === "press_key");
+  const presses = calls.filter((c) => c.tool === "type_text" && c.args.text === "\n");
   assert.strictEqual(presses.length, 2, "the refused press did not happen, so it must be repeated");
   assert.strictEqual(presses[1].args.element_token, "tok-box-2", "the repeated press must use a fresh token");
   assert.strictEqual(result.steps[2].firstAttempt.reason, "stale_element_token", "the step must record the refused press");
@@ -326,46 +354,91 @@ function test_a_refused_return_with_an_empty_box_is_not_pressed_again() {
   const text = "PRESS-ONCE";
   const { session, calls } = fakeDriver([
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
-    { tool: "press_key", reply: staleToken() },
+    { tool: "type_text", reply: staleToken() },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-2"), searchBox()]) },
     { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手", "", "tok-box-3"), searchBox()]) },
   ]);
   const result = sendMessage(TARGET, "文件传输助手", text, { session });
-  assert.strictEqual(calls.filter((c) => c.tool === "press_key").length, 1, "an empty box must not be pressed again");
+  assert.strictEqual(calls.filter((c) => c.tool === "type_text" && c.args.text === "\n").length, 1, "an empty box must not be sent into again");
   assert.strictEqual(result.steps[2].skippedRepress, true, "the step must say that it deliberately did not press again");
   assert.strictEqual(result.ok, true, `expected the send to be confirmed by the preview row, got ${result.verify}`);
   console.log("ok   an empty box after a refused return is never pressed again");
 }
 
-function test_a_press_that_silently_sent_nothing_is_retried_in_the_foreground() {
-  // Measured live on 2026-10-02, twice in a row: the driver answers
-  // `✅ Sent return via SendInput on pid 20384 (delivery_mode:foreground)` for a
-  // mode-less press that does nothing at all - the text stayed in the composer - and
-  // the SAME press with `delivery_mode:"foreground"` sent it immediately. A press
-  // that reports success and changes nothing must not be believed, and the cure is
-  // the delivery mode that actually delivered.
-  const text = "FOREGROUND-REPRESS";
+function test_a_send_uses_one_foreground_newline() {
+  // Measured live on 2026-10-02 with a 50ms foreground sampler and another window
+  // parked in front: the four candidate routes are
+  //   press_key (no mode)      -> WeChat ignores it, the text stays in the composer
+  //   press_key (foreground)   -> sends, never gives the focus back (10.5s later WeChat
+  //                               was still in front)
+  //   click on 发送             -> sends, focus back after ~124ms, but the call costs ~1.9s
+  //   type_text "\n" foreground -> sends, 146ms per call, WeChat in front for 125ms
+  // so the newline is primary and the modes that lie or steal are not used.
+  const text = "NEWLINE-SEND";
   const { session, calls } = fakeDriver([
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
     { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
-    { tool: "press_key", reply: { route: "global_input", effect: "unverifiable", summary: "✅ Sent return" } },
+    { tool: "type_text", reply: { route: "global_input", delivery: { mode: "foreground" }, effect: "unverifiable", summary: "✅ Typed 1 char(s) via SendInput" } },
+    { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
+  ]);
+  const result = sendMessage(TARGET, "文件传输助手", text, { session });
+  const newlines = calls.filter((c) => c.tool === "type_text" && c.args.text === "\n");
+  assert.strictEqual(newlines.length, 1, "the send is exactly one newline");
+  assert.strictEqual(newlines[0].args.delivery_mode, "foreground", "only the foreground newline was measured to send AND return the focus");
+  assert.strictEqual(newlines[0].args.element_token, "tok-box-1", "the newline goes to the composer");
+  assert.strictEqual(calls.some((c) => c.tool === "press_key"), false, "the modes that lie or steal must not be used");
+  assert.strictEqual(result.steps.find((s) => s.step === "send").via, "foreground-newline");
+  assert.strictEqual(result.ok, true, `expected the send to be confirmed, got ${result.verify}`);
+  console.log("ok   a send is one foreground newline into the composer");
+}
+
+function test_a_newline_that_did_not_send_falls_back_to_the_send_button() {
+  // WeChat can be configured to need Ctrl+Enter, in which case the newline only adds a
+  // line break: the composer still holds the text, and the retry walks the ladder past
+  // the newline rung and clicks 发送 instead.
+  const text = "NEWLINE-THEN-BUTTON";
+  const { session, calls } = fakeDriver([
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
+    { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox(), sendButton("tok-send-1")]) },
+    { tool: "type_text", reply: { route: "global_input", delivery: { mode: "foreground" } } },
+    // The newline did nothing: the box still holds the text.
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", `${text}\n`, "tok-box-1"), searchBox(), sendButton("tok-send-1")]) },
+    { tool: "click", reply: { route: "global_input", delivery: { mode: "foreground" } } },
+    { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
+  ]);
+  const result = sendMessage(TARGET, "文件传输助手", text, { session });
+  const clicks = calls.filter((c) => c.tool === "click");
+  assert.strictEqual(clicks.length, 1, "the retry must be exactly one click on 发送");
+  assert.strictEqual(clicks[0].args.element_token, "tok-send-1");
+  assert.strictEqual(clicks[0].args.delivery_mode, "foreground");
+  const again = result.steps.find((s) => s.step === "send-again");
+  assert.strictEqual(again.via, "send-button-click");
+  assert.strictEqual(result.ok, true, `expected the retry to send, got ${result.verify}`);
+  console.log("ok   a newline that only added a line break is retried through the 发送 button");
+}
+
+function test_without_a_send_button_the_retry_still_never_uses_a_mode_less_press() {
+  const text = "NO-SEND-BUTTON";
+  const { session, calls } = fakeDriver([
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
+    { tool: "type_text", reply: { route: "accessibility", effect: "confirmed" } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
-    { tool: "press_key", reply: { route: "global_input", delivery: { mode: "foreground" }, effect: "unverifiable" } },
+    { tool: "type_text", reply: { route: "global_input", delivery: { mode: "foreground" } } },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-1"), searchBox()]) },
+    { tool: "press_key", reply: { route: "global_input", delivery: { mode: "foreground" } } },
     { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
   ]);
   const result = sendMessage(TARGET, "文件传输助手", text, { session });
   const presses = calls.filter((c) => c.tool === "press_key");
-  assert.strictEqual(presses.length, 2, "a press that sent nothing must be repeated once");
-  assert.strictEqual(presses[0].args.delivery_mode, undefined, "the first press stays the cheap default");
-  assert.strictEqual(presses[1].args.delivery_mode, "foreground", "the repeat is the mode that was measured to work");
-  assert.ok(result.steps.some((s) => s.step === "return-foreground"), "the repeat must be visible in the steps");
-  assert.strictEqual(result.ok, true, `expected the repress to send, got ${result.verify}`);
-  console.log("ok   a press that silently sent nothing is repeated in the foreground");
+  assert.strictEqual(presses.length, 1);
+  assert.strictEqual(presses[0].args.delivery_mode, "foreground", "the fallback press must be the mode that actually sends");
+  assert.strictEqual(result.steps.find((s) => s.step === "send-again").via, "foreground-return");
+  assert.strictEqual(result.ok, true);
+  console.log("ok   without a 发送 button the retry falls back to a foreground press");
 }
 
 function test_the_no_foreground_switch_refuses_instead_of_clicking() {
