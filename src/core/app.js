@@ -5146,11 +5146,15 @@ function buildReminderSystemTrigger(reminder, config = {}) {
 }
 
 function shouldAcknowledgeInbound(prepared) {
+  // The immediate "处理中" acknowledgement exists so the user knows the message
+  // arrived while the model works. It used to be gated on the WeFlow UIA bridge -
+  // the provider a desktop-driven reply travelled under - so when the channel moved
+  // to Cua (provider "wechat-cua") the acknowledgement silently stopped being sent
+  // at all: this condition was never updated. Both desktop providers behave the same
+  // way (they can send into the conversation the message came from), so both count.
+  const desktopProvider = prepared?.provider === "weflow-uia" || prepared?.provider === "wechat-cua";
   return prepared?.suppressAcknowledgement !== true
-    && (
-      prepared?.provider === "weflow-uia"
-      || prepared?.deliveryPolicy === SILENT_DELIVERY_POLICY
-    );
+    && (desktopProvider || prepared?.deliveryPolicy === SILENT_DELIVERY_POLICY);
 }
 
 function resolvePendingInboundId(message) {
