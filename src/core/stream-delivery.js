@@ -946,9 +946,15 @@ class StreamDelivery {
       return false;
     }
     const target = state?.replyTarget || {};
-    const isCertainWeFlowUiaFailure = target.provider === "weflow-uia"
-      && error?.deliveryUncertain === false;
-    if (!isSystemReplyContextFailure(error) && !isCertainWeFlowUiaFailure) {
+    // "Certainly not dispatched" is what makes deferring safe: the message never
+    // left, so retrying later cannot duplicate it. This used to be gated on the
+    // WeFlow UIA bridge alone, so a CUA send that failed for a known reason (window
+    // minimized, driver down - both report deliveryUncertain === false) was NOT
+    // deferred: the reply was dropped instead of retried. Both desktop providers
+    // behave identically here, so both count.
+    const desktopProvider = target.provider === "weflow-uia" || target.provider === "wechat-cua";
+    const isCertainDesktopSendFailure = desktopProvider && error?.deliveryUncertain === false;
+    if (!isSystemReplyContextFailure(error) && !isCertainDesktopSendFailure) {
       return false;
     }
     if (!target.userId || !text) {
