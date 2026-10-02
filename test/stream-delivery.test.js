@@ -760,6 +760,102 @@ test("uncertain WeFlow UIA failure is not deferred", async () => {
   assert.deepEqual(deferred, []);
 });
 
+test("WeChat CUA reply target is forwarded as the exclusive outbound provider", async () => {
+  const { sent, streamDelivery } = createHarness();
+  streamDelivery.queueReplyTargetForThread("thread-cua-route", {
+    userId: "文件传输助手",
+    contextToken: "",
+    provider: "wechat-cua",
+  });
+
+  await runCompletedTurn(streamDelivery, {
+    threadId: "thread-cua-route",
+    turnId: "turn-cua-route",
+    itemId: "item-cua-route",
+    text: "cua route",
+  });
+
+  assert.deepEqual(sent, [{
+    userId: "文件传输助手",
+    text: "cua route",
+    contextToken: "",
+    provider: "wechat-cua",
+  }]);
+});
+
+test("certain WeChat CUA failure defers the reply and keeps its CUA route", async () => {
+  const attempts = [];
+  const deferred = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText(payload) {
+      attempts.push(payload);
+      const error = new Error(
+        '"文件传输助手" is not the open conversation and foreground switching is disabled '
+        + "(CYBERBOSS_WECHAT_CUA_NO_FOREGROUND_SWITCH); the reply should be deferred rather "
+        + "than stealing the foreground"
+      );
+      error.deliveryUncertain = false;
+      throw error;
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  streamDelivery.queueReplyTargetForThread("thread-cua-certain-failure", {
+    userId: "文件传输助手",
+    contextToken: "",
+    provider: "wechat-cua",
+  });
+
+  await assert.doesNotReject(() => runCompletedTurnWithResultOnly(streamDelivery, {
+    threadId: "thread-cua-certain-failure",
+    turnId: "turn-cua-certain-failure",
+    text: "补发验证",
+  }));
+
+  assert.deepEqual(sent, []);
+  assert.equal(attempts.length, 1);
+  assert.equal(deferred.length, 1);
+  assert.equal(deferred[0].threadId, "thread-cua-certain-failure");
+  assert.equal(deferred[0].userId, "文件传输助手");
+  assert.equal(deferred[0].text, "补发验证");
+  assert.equal(deferred[0].kind, "plain_reply");
+  // Without the provider the retry addresses the official iLink channel instead,
+  // which is the failure mode measured on 2026-10-02 (`sendMessage ret=-3`).
+  assert.equal(deferred[0].provider, "wechat-cua");
+});
+
+test("uncertain WeChat CUA failure is never deferred", async () => {
+  const attempts = [];
+  const deferred = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText(payload) {
+      attempts.push(payload);
+      const error = new Error("cua-driver: session has ended");
+      error.deliveryUncertain = true;
+      throw error;
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  streamDelivery.queueReplyTargetForThread("thread-cua-uncertain-failure", {
+    userId: "文件传输助手",
+    contextToken: "",
+    provider: "wechat-cua",
+  });
+
+  await runCompletedTurnWithResultOnly(streamDelivery, {
+    threadId: "thread-cua-uncertain-failure",
+    turnId: "turn-cua-uncertain-failure",
+    text: "不要重复投递",
+  });
+
+  assert.deepEqual(sent, []);
+  assert.equal(attempts.length, 1);
+  assert.deepEqual(deferred, []);
+});
+
 test("system send_message retries explicitly without context after a stale-token failure", async () => {
   const attempts = [];
   const { sent, streamDelivery } = createHarness({
