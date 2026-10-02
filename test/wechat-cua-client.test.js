@@ -186,6 +186,7 @@ test_a_refused_return_with_an_empty_box_is_not_pressed_again();
 test_an_unknown_draft_is_never_typed_over();
 test_our_own_unsent_leftover_is_cleared_before_the_next_attempt();
 test_a_minimized_window_is_refused_not_raised();
+test_the_no_foreground_switch_refuses_instead_of_clicking();
 
 function test_a_minimized_window_is_refused_not_raised() {
   // Measured 2026-10-01: un-minimizing needs bring_to_front, which raises WeChat and
@@ -333,4 +334,24 @@ function test_a_refused_return_with_an_empty_box_is_not_pressed_again() {
   assert.strictEqual(result.steps[2].skippedRepress, true, "the step must say that it deliberately did not press again");
   assert.strictEqual(result.ok, true, `expected the send to be confirmed by the preview row, got ${result.verify}`);
   console.log("ok   an empty box after a refused return is never pressed again");
+}
+
+function test_the_no_foreground_switch_refuses_instead_of_clicking() {
+  // The only remaining foreground cost is the switch rung. With the opt-in policy
+  // (CYBERBOSS_WECHAT_CUA_NO_FOREGROUND_SWITCH) it must be refused outright: a
+  // background/accessibility click is free and may still be attempted, but nothing
+  // with delivery_mode "foreground" may ever be issued.
+  const { session, calls } = fakeDriver([
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("Azzy"), searchBox()]) },
+    { tool: "click", reply: { route: "accessibility", effect: "unverifiable" } },
+    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("Azzy"), searchBox()]) },
+  ]);
+  assert.throws(
+    () => sendMessage(TARGET, "文件传输助手", "hello", { session, allowForegroundSwitch: false }),
+    /foreground switching is disabled/,
+    "the policy must refuse instead of switching"
+  );
+  const foregroundClicks = calls.filter((c) => c.tool === "click" && c.args.delivery_mode === "foreground");
+  assert.strictEqual(foregroundClicks.length, 0, "not one foreground click may be issued when the policy forbids it");
+  console.log("ok   with the foreground switch disabled, a closed conversation is refused (zero foreground clicks)");
 }
