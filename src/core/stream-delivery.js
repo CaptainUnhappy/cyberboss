@@ -781,6 +781,17 @@ class StreamDelivery {
         deliveryUncertain: !resultWasCertainlyNotDispatched,
       });
     } catch (error) {
+      // Defer BEFORE recording a failure. A send that certainly did not go out (the
+      // driver refused, nothing was typed) can be retried later without any risk of
+      // duplicating it - and deferring is the only path that keeps the reply alive.
+      // Measured 2026-10-02 on the CUA channel: without this call the failure was
+      // merely recorded (obligation branch) or logged (throw branch) and the user
+      // never got an answer, while every individual guard downstream looked correct.
+      const deferred = await this.deferSystemReply(state, payload.text, error, "plain_reply");
+      if (deferred) {
+        await this.invokeReplyLifecycle(this.onReplyDeliveryDeferred, state, { error });
+        return;
+      }
       if (obligationId) {
         await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
           error,
