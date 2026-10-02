@@ -19,7 +19,7 @@
 // and marked read, or because an unsent draft was restored. Those are separated
 // by explicit rules below rather than by hope.
 
-const { CuaSession, findWeChatWindow, elements } = require("./client");
+const { CuaSession, findWeChatWindow, currentConversation, elements } = require("./client");
 const { decodePng, classifyBubbleDirection, greenShare } = require("./pixels");
 
 const ROW_SPLIT = /\n+/;
@@ -200,7 +200,7 @@ class PreviewInboundSource {
     this.seen = new Map(); // peer -> digest
     this.watermarks = new Map(); // peer -> last message text read from the conversation
     this.primed = false;
-    this.stats = { polls: 0, events: 0, skippedOwnEcho: 0, skippedNotAllowed: 0, deepReads: 0, selfManual: 0 };
+    this.stats = { polls: 0, events: 0, skippedOwnEcho: 0, skippedNotAllowed: 0, deepReads: 0, selfManual: 0, directionWithoutClick: 0 };
   }
 
   /** One read, no side effects. Returns the events observed since the last call. */
@@ -235,7 +235,9 @@ class PreviewInboundSource {
         this.stats.skippedOwnEcho += 1;
         continue;
       }
-      const pieces = this.deepRead ? this.expand(row) : [{ text: row.preview, direction: "unknown" }];
+      const pieces = this.deepRead
+        ? this.expand(row)
+        : (this.readOpenConversation(row) || [{ text: row.preview, direction: "unknown" }]);
       for (const piece of pieces) {
         const text = typeof piece === "string" ? piece : piece.text;
         const direction = typeof piece === "string" ? "unknown" : (piece.direction || "unknown");
@@ -323,6 +325,49 @@ class PreviewInboundSource {
     if (!messages.length) {
       return [{ text: row.preview, direction: "unknown" }];
     }
+    return this.freshMessages(row, messages);
+  }
+
+  /**
+   * Direction without paying for it.
+   *
+   * The expensive half of a deep read is OPENING the conversation (one foreground
+   * activation, measured at 150-300ms). But when the changed peer happens to be the
+   * conversation that is already open - which is the common case for a chat the bot
+   * is active in - its bubbles can be read with a background snapshot: no click, no
+   * focus change, and the answer to "did the user send this?" comes for free.
+   *
+   * Returns null when the peer is not the open conversation, so the caller falls
+   * back to the preview/ledger path exactly as before.
+   */
+  readOpenConversation(row) {
+    if (typeof this.session?.snapshot !== "function") {
+      return null;
+    }
+    let current;
+    try {
+      current = currentConversation(this.session, this.target);
+    } catch {
+      return null;
+    }
+    if (!current?.label || current.label !== row.peer) {
+      return null;
+    }
+    let messages;
+    try {
+      messages = readConversation(this.session, this.target);
+    } catch {
+      return null;
+    }
+    if (!messages.length) {
+      return null;
+    }
+    this.stats.directionWithoutClick += 1;
+    return this.freshMessages(row, messages);
+  }
+
+  /** The messages after this peer's watermark, shared by both read paths. */
+  freshMessages(row, messages) {
     const texts = messages.map((m) => m.text);
     const mark = this.watermarks.get(row.peer);
     let fresh;

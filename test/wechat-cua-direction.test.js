@@ -104,6 +104,7 @@ test_an_unreadable_bubble_is_unknown_not_incoming();
 test_read_conversation_labels_each_bubble();
 test_an_outgoing_bubble_is_never_answered_as_the_peer();
 test_the_operators_own_message_is_recorded_not_dropped();
+test_direction_is_free_when_the_peer_is_already_open();
 console.log("all direction tests passed");
 
 function test_png_round_trip() {
@@ -158,6 +159,7 @@ function buildSnapshot({ peer = "柳毓琳", preview = "", bubbles = [] } = {}) 
   const elements = [
     { role: "Group", label: "", element_token: "container", frame: { x: 0, y: 0, w: width, h: height } },
     { role: "ListItem", label: `${peer}\n${preview}\n13:00\n`, element_token: "row-1", frame: { x: 485, y: 300, w: 300, h: 78 } },
+    { role: "Edit", label: peer, value: "", element_token: "box-1", frame: { x: 400, y: 700, w: 700, h: 60 } },
     ...bubbles.map((bubble, index) => ({
       role: "ListItem",
       label: bubble.text,
@@ -247,4 +249,32 @@ function test_the_operators_own_message_is_recorded_not_dropped() {
   assert.strictEqual(events[0].text, "typed by the operator");
   assert.strictEqual(source.stats.selfManual, 1);
   console.log("ok   a same-account message is recorded as the operator's, with its direction");
+}
+
+function test_direction_is_free_when_the_peer_is_already_open() {
+  // Opening a conversation costs a foreground activation (150-300ms, measured). But
+  // when the changed peer IS the open conversation, its bubbles are one background
+  // snapshot away - so the answer to "did the user send this?" costs nothing.
+  const session = new CuaSession("test");
+  let phase = 0;
+  session.snapshot = () => {
+    phase += 1;
+    return phase === 1
+      ? buildSnapshot({ preview: "old", bubbles: [] })
+      : buildSnapshot({ preview: "typed by the user", bubbles: [{ text: "typed by the user", outgoing: false }] });
+  };
+  const source = new PreviewInboundSource(TARGET, {
+    session,
+    deepRead: false,                       // no clicking allowed
+    openConversation: () => { throw new Error("must not open a conversation to read direction"); },
+    allowPeers: ["柳毓琳"],
+  });
+  source.poll({ isOwnEcho: () => false }); // prime
+  const events = source.poll({ isOwnEcho: () => false });
+  assert.strictEqual(events.length, 1, `expected one inbound event: ${JSON.stringify(events)}`);
+  assert.strictEqual(events[0].direction, "incoming");
+  assert.strictEqual(events[0].confidence, "bubble-direction", "the direction must come from the bubbles, not a preview guess");
+  assert.ok(source.stats.directionWithoutClick >= 1, "the direction was read without any click");
+  assert.strictEqual(source.stats.deepReads, 0, "no deep read means no conversation was opened");
+  console.log("ok   the direction of an already-open conversation is read without any click");
 }
