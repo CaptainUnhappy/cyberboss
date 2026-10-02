@@ -86,6 +86,10 @@ function readConfig() {
     wechatCuaInboxEnabled: mode === "start" && readBoolEnv("CYBERBOSS_ENABLE_WECHAT_CUA_INBOX"),
     wechatCuaInboxDeepRead: readBoolEnv("CYBERBOSS_WECHAT_CUA_INBOX_DEEP_READ"),
     wechatCuaAllowPeers: readTextEnv("CYBERBOSS_WECHAT_CUA_ALLOW_PEERS"),
+    // Opt-in: never take the foreground, not even for the 150-300ms activation a
+    // conversation switch costs. A reply whose conversation is not already open is
+    // then deferred instead of being delivered now.
+    wechatCuaNoForegroundSwitch: readBoolEnv("CYBERBOSS_WECHAT_CUA_NO_FOREGROUND_SWITCH"),
     weflowBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BASE_URL") || "http://127.0.0.1:5031",
     weflowBridgeBaseUrl: readTextEnv("CYBERBOSS_WEFLOW_BRIDGE_BASE_URL") || "http://127.0.0.1:8766",
     weflowBridgeTimeoutMs: readIntEnv("CYBERBOSS_WEFLOW_BRIDGE_TIMEOUT_MS") || 30_000,

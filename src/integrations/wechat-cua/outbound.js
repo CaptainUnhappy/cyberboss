@@ -85,6 +85,7 @@ async function sendWeChatCuaText(config, {
   session = null,
   target = null,
   chatLabel = "",
+  noForegroundSwitch = null,
   attempt = 1,
   ledger = sharedLedger,
   resolveLabel = resolveChatLabel,
@@ -106,7 +107,10 @@ async function sendWeChatCuaText(config, {
     claim = await messageLedger.planAndClaim({ talker: resolvedTalker, text: content, messageKind, idempotencyKey });
   }
 
-  const result = sendMessage(win, chat, content, { session: cua });
+  const result = sendMessage(win, chat, content, {
+    session: cua,
+    allowForegroundSwitch: !config?.wechatCuaNoForegroundSwitch,
+  });
   const focusCosts = result.steps.filter((s) => s.cost && s.cost !== "none").map((s) => `${s.step}:${s.cost}`);
   // A minimized client is the one case where sending makes the window VISIBLY come
   // back: the driver can only un-minimize with bring_to_front, which raises it and

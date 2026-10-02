@@ -351,7 +351,7 @@ function reclickRow(session, target, wanted, deliveryMode = "") {
  * Open `chatLabel` if it is not already open.
  * Returns { switched, route, cost } where route names the rung that worked.
  */
-function ensureConversation(session, target, chatLabel, { settleMs = 1800 } = {}) {
+function ensureConversation(session, target, chatLabel, { settleMs = 1800, allowForegroundSwitch = true } = {}) {
   const wanted = new RegExp(`^\\s*${chatLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i");
   const before = currentConversation(session, target);
   if (wanted.test(before.label)) {
@@ -375,7 +375,16 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800 } = {}
     return { switched: true, route: "accessibility", cost: "background", label: now.label, outcome: outcome(attempt) };
   }
 
-  // Rung 2: explicit foreground click. This is the rung that actually switches.
+  // Rung 2: explicit foreground click. This is the rung that actually switches -
+  // and it is the ONLY remaining foreground cost in the whole path (150-300ms,
+  // measured). With the switch disabled this rung is refused instead: the caller
+  // gets a certain failure, and deferring it is safe because nothing was typed.
+  if (!allowForegroundSwitch) {
+    throw new Error(
+      `${JSON.stringify(chatLabel)} is not the open conversation and foreground switching is disabled `
+      + "(CYBERBOSS_WECHAT_CUA_NO_FOREGROUND_SWITCH); the reply should be deferred rather than stealing the foreground"
+    );
+  }
   const fresh = elements(session.snapshot(target)).find((el) => isRow(el) && wanted.test(labelOf(el)));
   let forced = session.call("click", { ...toTarget(target), element_token: fresh?.element_token || row.element_token, delivery_mode: "foreground" });
   if (isStaleToken(forced)) {
@@ -464,9 +473,9 @@ function forgetLeftover(chatLabel) {
  *   show the text. Returns ok:false rather than throwing when the send cannot be
  *   confirmed, because the caller (the bot) has to decide about retrying.
  */
-function sendMessage(target, chatLabel, text, { session = new CuaSession(), settleMs = 1800, requireForegroundType = false } = {}) {
+function sendMessage(target, chatLabel, text, { session = new CuaSession(), settleMs = 1800, requireForegroundType = false, allowForegroundSwitch = true } = {}) {
   const steps = [];
-  const opened = ensureConversation(session, target, chatLabel, { settleMs });
+  const opened = ensureConversation(session, target, chatLabel, { settleMs, allowForegroundSwitch });
   steps.push({ step: "open", ...opened });
 
   // Fresh snapshot: the message box element belongs to the conversation just opened.
