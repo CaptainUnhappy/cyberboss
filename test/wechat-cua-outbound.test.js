@@ -64,6 +64,17 @@ function makeClient({ openChat = CHAT, sendLands = true } = {}) {
       return { route: "global_input", delivery: { mode: "foreground" }, summary: "clicked" };
     }
     if (tool === "type_text") {
+      // A foreground newline IS the return key on this client (measured 2026-10-02:
+      // 146ms per call, WeChat in front for 125ms and the focus handed back), so the
+      // fake has to treat it as the send, not as text.
+      if (String(args.text) === "\n") {
+        if (sendLands) {
+          state.sent = [...state.sent, state.box];
+          state.preview = state.box;
+        }
+        state.box = "";
+        return { route: "global_input", delivery: { mode: "foreground" }, summary: "typed a newline" };
+      }
       state.box = String(args.text);
       return { route: "accessibility", effect: "confirmed", summary: "wrote" };
     }

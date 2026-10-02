@@ -76,6 +76,13 @@ function createMcpTransport({
     state.lastError = String(reason || "");
     state.disabledUntil = now() + cooldownMs;
     state.counts.failures += 1;
+    // Loud on purpose: the fallback keeps working, so without this line a driver
+    // hiccup is invisible until someone reads `stats()` - and a silent degradation to
+    // 1.5s-per-call is exactly the latency this transport exists to remove (measured
+    // 2026-10-02: one transient driver failure cost a 处理中 and a reply).
+    console.warn(
+      `[cyberboss] cua mcp transport degraded (${state.lastError}); using the CLI for ${Math.round(cooldownMs / 1000)}s`
+    );
   }
 
   function ensureChannel() {

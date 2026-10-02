@@ -98,7 +98,22 @@ async function sendWeChatCuaText(config, {
   const chat = chatLabel || resolveLabel(resolvedTalker, { fallback: resolvedTalker === "" ? DEFAULT_TARGET : "" });
 
   const cua = session || new CuaSession(`cyberboss-out-${process.pid}`);
-  const win = target || findWeChatWindow(cua);
+  let win;
+  try {
+    win = target || findWeChatWindow(cua);
+  } catch (error) {
+    // The same rule as the send ladder below: nothing has been typed when the window
+    // cannot even be located, so this is a CERTAIN failure. Measured 2026-10-02: this
+    // call sat OUTSIDE the try, so a transient "no WeChat window" threw untagged, the
+    // acknowledgement was merely logged, and the reply was recorded as
+    // `failed/delivery_uncertain` - the user got neither 处理中 nor an answer, and
+    // nothing retried it. Tagged, the reply is deferred and arrives when the driver is
+    // healthy again.
+    if (error && error.deliveryUncertain === undefined) {
+      error.deliveryUncertain = false;
+    }
+    throw error;
+  }
 
   let claim = null;
   if (messageLedger && typeof messageLedger.planAndClaim === "function") {

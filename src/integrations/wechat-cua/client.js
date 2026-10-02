@@ -336,7 +336,23 @@ function chatWindowScore(session, win) {
 
 /** Locate the WeChat main window through the driver itself. */
 function findWeChatWindow(session = new CuaSession()) {
-  const res = session.call("list_windows", { on_screen_only: false });
+  // A FAILED list is not an empty list. Measured 2026-10-02: one transient failure of
+  // this call surfaced as "no WeChat window visible to the driver (is the client
+  // running on this desktop?)", which sent the whole investigation after a window that
+  // was on screen the entire time. So: retry a failed call once (this is a read - a
+  // repetition can never double-execute anything) and then say what actually happened.
+  let res = session.call("list_windows", { on_screen_only: false });
+  if (res?.__failed) {
+    sleep(400);
+    res = session.call("list_windows", { on_screen_only: false });
+  }
+  if (res?.__failed) {
+    const error = new Error(`driver call list_windows failed: ${JSON.stringify(res.payload).slice(0, 200)}`);
+    // Nothing has been typed at this point, anywhere. Saying so is what lets the caller
+    // defer a reply instead of marking it uncertain and dropping it.
+    error.deliveryUncertain = false;
+    throw error;
+  }
   const all = res.windows || res._legacy_windows || [];
   const byTitle = all.filter((w) => WECHAT_TITLE.test(w.title || ""));
   const area = (w) => (w.bounds ? w.bounds.width * w.bounds.height : (w.width || 0) * (w.height || 0));
@@ -344,7 +360,11 @@ function findWeChatWindow(session = new CuaSession()) {
   const structural = scored.filter((item) => item.score > 0).sort((a, b) => b.score - a.score)[0];
   const hit = (structural ? structural.w : null) || byTitle.sort((a, b) => area(b) - area(a))[0];
   if (!hit) {
-    throw new Error("no WeChat window visible to the driver (is the client running on this desktop?)");
+    const error = new Error(
+      `no WeChat window in the driver's window list (${all.length} window(s) visible, none titled like WeChat)`
+    );
+    error.deliveryUncertain = false;
+    throw error;
   }
   return {
     pid: hit.pid,
