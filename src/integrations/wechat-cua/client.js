@@ -77,6 +77,29 @@ const DRIVER_UNAVAILABLE = /daemon is not running/i;
 /** The window is minimized, so nothing can be written to it until it is restored. */
 const WINDOW_MINIMIZED = /window_minimized|window is minimized/i;
 
+/**
+ * What a conversation switch actually costs, measured rather than assumed.
+ *
+ * 2026-10-01, sampling `GetForegroundWindow` every 50ms around the switch:
+ *
+ *   14:25:16.237  35688   (the user's window)
+ *   14:25:25.699  20384   (WeChat - the foreground was taken)
+ *   14:25:25.850  35688   (given back 151ms later)
+ *
+ * So the old label "one focus steal" was wrong in both directions: the foreground
+ * IS taken (a two-point before/after check misses it entirely), but it is handed
+ * back automatically, so it is not a lasting steal either. The honest number is a
+ * brief activation, and callers can decide whether a ~150ms interruption is worth
+ * answering into a different conversation.
+ *
+ * The two click-free candidates were measured too, and both are dead ends on this
+ * client: a background/accessibility click on a chat row (including a pixel click
+ * carrying a capture_id) never switches, and neither does writing the search box
+ * through UIA plus posting Return to it. `scripts/cua-wechat-bg-switch-live.js`
+ * re-runs the search-box measurement.
+ */
+const FOREGROUND_ACTIVATION_COST = "foreground-activation ~150ms";
+
 /** One `cua-driver call` process. Returns stdout; throws Node's child error shape. */
 function defaultExec(driver, args, input) {
   return execFileSync(driver, args, {
@@ -329,7 +352,7 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800 } = {}
   if (!wanted.test(now.label)) {
     throw new Error(`could not open ${JSON.stringify(chatLabel)} (foreground click refused: ${JSON.stringify(outcome(forced))})`);
   }
-  return { switched: true, route: "foreground-click", cost: "one focus steal", label: now.label, outcome: outcome(forced) };
+  return { switched: true, route: "foreground-click", cost: FOREGROUND_ACTIVATION_COST, label: now.label, outcome: outcome(forced) };
 }
 
 /**
@@ -513,6 +536,7 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
 module.exports = {
   CuaSession,
   toTarget,
+  FOREGROUND_ACTIVATION_COST,
   findWeChatWindow,
   currentConversation,
   ensureConversation,

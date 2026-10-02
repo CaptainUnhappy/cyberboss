@@ -18,6 +18,7 @@ const path = require("path");
 
 const {
   CuaSession,
+  FOREGROUND_ACTIVATION_COST,
   ensureConversation,
   sendMessage,
   outcome,
@@ -88,7 +89,7 @@ function test_switches_only_after_background_fails() {
   const result = ensureConversation(session, TARGET, "文件传输助手");
   assert.strictEqual(result.switched, true);
   assert.strictEqual(result.route, "foreground-click");
-  assert.strictEqual(result.cost, "one focus steal");
+  assert.strictEqual(result.cost, FOREGROUND_ACTIVATION_COST, "the reported cost must be the measured one, not a vague claim");
   const clicks = calls.filter((c) => c.tool === "click");
   assert.strictEqual(clicks.length, 2, "the escalation must happen exactly once");
   assert.strictEqual(clicks[0].args.delivery_mode, undefined, "rung 1 must stay in the background");
