@@ -460,7 +460,7 @@ class StreamDelivery {
     // stays a plain reply - no "===== 本轮模型回复 =====" glue (operator's rule,
     // 2026-09-30: 这条通道可以主动多发). Every other route keeps the prefix-merge
     // shape it was built for.
-    if (state.deferredReplyPrefix && isWeFlowUiaReplyTarget(state.replyTarget)) {
+    if (state.deferredReplyPrefix && isDesktopReplyTarget(state.replyTarget)) {
       await this.sendDeferredPrefixAsOwnMessage(state);
     }
 
@@ -1307,12 +1307,19 @@ function normalizePositiveIntegerText(value) {
 }
 
 /**
- * The personal-account route (WeFlow UIA bridge), as opposed to the official bot
- * channel. It is the one route that needs no reply window, which is what decides
- * whether a leftover batch can be sent as a message of its own.
+ * The desktop route (a UI-driven personal account), as opposed to the official bot
+ * channel. What matters here is not which driver runs it but a property they share:
+ * it needs no reply window, which is what decides whether a leftover batch can be
+ * sent as a message of its own.
+ *
+ * This used to name the WeFlow UIA bridge alone. When the channel moved to Cua the
+ * predicate stopped matching the provider that was actually in use, so a deferred
+ * prefix was never attached on the new path (the same migration miss as the reply
+ * route, the inbound ack and the deferral gate - this is the fourth).
  */
-function isWeFlowUiaReplyTarget(target) {
-  return normalizeText(target?.provider) === "weflow-uia";
+function isDesktopReplyTarget(target) {
+  const provider = normalizeText(target?.provider);
+  return provider === "weflow-uia" || provider === "wechat-cua";
 }
 
 /**
