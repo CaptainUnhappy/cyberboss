@@ -719,11 +719,20 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
     ...(pressRetryFrom ? { firstAttempt: pressRetryFrom } : {}),
     ...(skippedRepress ? { skippedRepress } : {}),
   });
-  // SendInput sends synchronously and the composer is empty the moment it returns;
-  // this settle only covers the chat-list preview repaint.
+  // SendInput sends synchronously and the composer empties the moment it returns, but
+  // the chat-list preview repaints a moment later. Poll for it instead of judging on one
+  // read: measured 2026-10-02 a delivered reply came back "unverified" because the single
+  // check ran before the repaint, and an unverified send is exactly what the caller must
+  // not record as delivered... nor may it retry it (that would duplicate).
   sleep(250);
   let after = session.snapshot(toTarget(target));
   let verdict = sendVerdict(after, text);
+  const verdictDeadline = Date.now() + 1500;
+  while (!verdict.ok && !verdict.boxHoldsText && Date.now() < verdictDeadline) {
+    sleep(180);
+    after = session.snapshot(toTarget(target));
+    verdict = sendVerdict(after, text);
+  }
   if (!verdict.ok && verdict.boxHoldsText) {
     // Whatever route ran, the box is the judge: text still in it means nothing was
     // sent, so trying once more cannot duplicate anything. This is also the path that
@@ -744,6 +753,11 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   }
   return {
     ok,
+    // `verified` is the STRONGER claim (the preview row showed our text); `ok` only says
+    // the composer let go of it, which is what WeChat does when it sends. (`seen` is the
+    // row label, not a boolean - comparing it to `true` silently reported every delivery
+    // as unverified.)
+    verified: Boolean(verdict.seen),
     // `certainNotSent` is the proof the deferral path needs: our text is still sitting
     // in the composer, so it never left. Without it the caller sees an unconfirmed send,
     // calls it uncertain, and drops the reply instead of retrying it - measured twice on

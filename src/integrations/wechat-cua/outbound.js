@@ -183,12 +183,19 @@ async function sendWeChatCuaText(config, {
   }
 
   // Record before returning: the inbound reader must already know this text is
-  // ours by the time the next poll happens.
+  // ours by the time the next poll happens. This is not bookkeeping - without it the
+  // reader sees our own message as an unexplained row change and answers it. Measured
+  // 2026-10-02: a self-check message sent straight through the client (recording no
+  // echo) made the bot reply 处理中 to itself in the operator's chat.
   ledger.record(chat, content);
 
   return {
     dispatched: true,
-    verified: true,
+    // Honest split: `dispatched` came from the composer letting go, `verified` from the
+    // preview row carrying the text. The caller decides what to do with an unverified
+    // dispatch (it must not retry it - that would duplicate - and it must not claim the
+    // receipt either).
+    verified: result.verified === true,
     localId,
     chat,
     focusCosts,

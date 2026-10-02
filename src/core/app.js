@@ -4781,7 +4781,7 @@ function listPendingWeFlowRevokes(source, config = {}) {
   });
 }
 
-module.exports = { CyberbossApp, formatDeferredRepliesForRetry };
+module.exports = { CyberbossApp, formatDeferredRepliesForRetry, shouldAcknowledgeInbound };
 
 function parseChannelCommand(text) {
   const normalized = typeof text === "string" ? text.trim() : "";
@@ -5165,6 +5165,15 @@ function buildReminderSystemTrigger(reminder, config = {}) {
 }
 
 function shouldAcknowledgeInbound(prepared) {
+  // Our OWN message never earns a 处理中. An outgoing row is the account's own bubble
+  // (the ledger did not attribute it, so it is the operator - or another signed-in
+  // device - typing as this account); the pipeline records it as `self_manual` and
+  // suppresses the reply, so the acknowledgement would be pure noise in that chat.
+  // Measured 2026-10-02: a self-check message sent through the outbound path put a
+  // 处理中 into the operator's own chat while the reply itself was correctly suppressed.
+  if (prepared?.direction === "outgoing" || prepared?.origin === "self_manual") {
+    return false;
+  }
   // The immediate "处理中" acknowledgement exists so the user knows the message
   // arrived while the model works. It used to be gated on the WeFlow UIA bridge -
   // the provider a desktop-driven reply travelled under - so when the channel moved

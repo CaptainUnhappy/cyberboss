@@ -38,7 +38,14 @@ function makeClient({ openChat = CHAT, sendLands = true } = {}) {
     { role: "ListItem", label: `Someone else\nhi\n12:00\n`, element_token: "row-other", element_index: 2, frame: { y: 180, w: 300, h: 78 } },
   ];
   session.snapshot = () => ({
-    elements: [...rows(), { role: "Edit", label: state.open, value: state.box, element_token: "box" }],
+    // Same element set as the `get_window_state` branch below, including what was
+    // already sent: the client's verification reads THIS, so a fake that omitted the
+    // sent rows made every delivery look unverified.
+    elements: [
+      ...rows(),
+      { role: "Edit", label: state.open, value: state.box, element_token: "box" },
+      ...state.sent.map((text, i) => ({ role: "ListItem", label: text, element_token: `b${i}`, frame: { y: 300 + i * 60, w: 722, h: 68 } })),
+    ],
     screenshot_width: 1102,
     screenshot_height: 800,
     window_title: "微信",
