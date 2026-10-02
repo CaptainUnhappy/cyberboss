@@ -502,9 +502,18 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
     // refusal - and if the window is minimized, it is restored first.
     firstAttempt = outcome(typed);
     if (firstAttempt.reason === "window_minimized") {
-      bringWindowForward(session, target);
-      sleep(600);
-      conv = currentConversation(session, target);
+      // POLICY: never raise the window ourselves.
+      //
+      // Un-minimizing has no background path: the driver can only do it with
+      // bring_to_front, which raises WeChat AND leaves it in front. Measured
+      // 2026-10-01: a conversation switch activates for 150-300ms and returns the
+      // focus, but a restore *stays* - and that is the "the bot popped my window up
+      // while I was working" complaint. A minimized client means the user put it
+      // away, so the honest thing is to fail certainly and let the caller's
+      // deferral path retry the reply later (see stream-delivery.deferSystemReply,
+      // which now defers certain CUA failures too).
+      steps.push({ step: "type", landed: false, outcome: outcome(typed), firstAttempt });
+      return { ok: false, verify: "the WeChat window is minimized; refusing to raise it (the reply will be retried)", steps };
     }
     if (conv.box) {
       typed = typeInto(session, target, conv.box, text, "foreground");
@@ -528,10 +537,7 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
     // = the message went out and only our view of it is stale, so pressing again
     // would send a second copy. Verification below decides, not this branch.
     pressRetryFrom = pressRefusal;
-    if (isWindowMinimized(sent)) {
-      bringWindowForward(session, target);
-      sleep(600);
-    }
+    // (no restore either: the same policy as above)
     conv = currentConversation(session, target);
     if (conv.box && String(conv.box.value ?? "") === text) {
       sent = session.call("press_key", { ...toTarget(target), element_token: conv.box.element_token, key: "return" });

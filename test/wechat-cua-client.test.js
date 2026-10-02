@@ -185,36 +185,27 @@ test_a_refused_return_is_re_pressed_only_while_the_text_is_still_there();
 test_a_refused_return_with_an_empty_box_is_not_pressed_again();
 test_an_unknown_draft_is_never_typed_over();
 test_our_own_unsent_leftover_is_cleared_before_the_next_attempt();
-test_a_minimized_window_is_restored_before_the_write_is_retried();
+test_a_minimized_window_is_refused_not_raised();
 
-function test_a_minimized_window_is_restored_before_the_write_is_retried() {
-  // Measured 2026-10-01: WeChat sat in the taskbar and every write failed - the
-  // reads kept working, the refusals said `window_minimized`, and the tokens died
-  // so fast that `stale_element_token` looked like the cause. Restoring the window
-  // costs one foreground activation and only after a refusal.
-  const text = "AFTER-RESTORE";
+function test_a_minimized_window_is_refused_not_raised() {
+  // Measured 2026-10-01: un-minimizing needs bring_to_front, which raises WeChat and
+  // LEAVES it in front - unlike a conversation switch, whose activation is transient
+  // (150-300ms). Raising the user's window on our own initiative is the thing they
+  // complained about, so the send refuses instead, and the failure is *certain*
+  // (nothing was typed), which lets the caller defer the reply and retry it later.
+  const text = "MINIMIZED-REFUSAL";
   const { session, calls } = fakeDriver([
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手"), searchBox()]) },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-1"), searchBox()]) },
     { tool: "type_text", reply: { __failed: true, payload: { refusal: { code: "window_minimized", message: "the window is minimized" } } } },
     { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-2"), searchBox()]) },
-    { tool: "bring_to_front", reply: { route: "global_input", effect: "confirmed" } },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", "", "tok-box-3"), searchBox()]) },
-    { tool: "type_text", reply: { route: "global_input", effect: "confirmed" } },
-    { tool: "get_window_state", reply: snapshot([row("文件传输助手"), box("文件传输助手", text, "tok-box-3"), searchBox()]) },
-    { tool: "press_key", reply: { route: "synthetic_events", effect: "unverifiable" } },
-    { tool: "get_window_state", reply: snapshot([row(`文件传输助手 ${text} 13:21`), box("文件传输助手"), searchBox()]) },
   ]);
   const result = sendMessage(TARGET, "文件传输助手", text, { session });
-  const restored = calls.filter((c) => c.tool === "bring_to_front");
-  assert.strictEqual(restored.length, 1, "a minimized window must be restored once");
-  assert.strictEqual(restored[0].args.pid, TARGET.pid);
-  const types = calls.filter((c) => c.tool === "type_text");
-  assert.strictEqual(types.length, 2);
-  assert.strictEqual(types[1].args.element_token, "tok-box-3", "the retry must use a token taken AFTER the restore");
-  assert.strictEqual(result.steps[1].firstAttempt.reason, "window_minimized");
-  assert.strictEqual(result.ok, true, `expected the send to be confirmed, got ${result.verify}`);
-  console.log("ok   a minimized window is restored once, then the write is retried from a fresh snapshot");
+  assert.strictEqual(result.ok, false, "a minimized window must not be reported as sent");
+  assert.match(result.verify, /minimized/, "and the reason must name the actual condition");
+  assert.strictEqual(calls.some((c) => c.tool === "bring_to_front"), false, "the bot must NOT raise the user's window");
+  assert.strictEqual(calls.some((c) => c.tool === "press_key"), false, "and it must not press return either");
+  console.log("ok   a minimized window is refused (no raise), so the caller can defer instead");
 }
 
 function test_an_unknown_draft_is_never_typed_over() {
