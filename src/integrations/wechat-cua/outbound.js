@@ -108,6 +108,18 @@ async function sendWeChatCuaText(config, {
 
   const result = sendMessage(win, chat, content, { session: cua });
   const focusCosts = result.steps.filter((s) => s.cost && s.cost !== "none").map((s) => `${s.step}:${s.cost}`);
+  // A minimized client is the one case where sending makes the window VISIBLY come
+  // back: the driver can only un-minimize with bring_to_front, which raises it and
+  // leaves it in front (unlike a conversation switch, whose activation is transient,
+  // measured 150-300ms). That behaviour is deliberate - it is how a reply reaches a
+  // user who minimized WeChat - but it must never be invisible, because from the
+  // outside it looks exactly like "the bot is stealing my screen". If this line gets
+  // noisy, the alternative is to stop restoring and defer the reply instead.
+  const restoredFromMinimized = result.steps.some((step) => step.firstAttempt?.reason === "window_minimized")
+    || result.steps.some((step) => step.skippedRepress && step.firstAttempt?.reason === "window_minimized");
+  if (restoredFromMinimized) {
+    console.warn(`[cyberboss] cua send: WeChat was minimized and had to be brought forward to type (chat=${chat})`);
+  }
   const localId = localIdFor({ talker: resolvedTalker, text: content, attempt });
 
   if (!result.ok) {
@@ -134,6 +146,7 @@ async function sendWeChatCuaText(config, {
     focusCosts,
     steps: result.steps,
     verification: result.verify,
+    restoredFromMinimized,
     ...(claim ? { ledgerClaim: Boolean(claim) } : {}),
   };
 }
