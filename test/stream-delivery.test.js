@@ -856,6 +856,69 @@ test("uncertain WeChat CUA failure is never deferred", async () => {
   assert.deepEqual(deferred, []);
 });
 
+test("a certain not-dispatched RESULT is deferred, not just recorded", async () => {
+  // Measured live on 2026-10-02, twice: the CUA client reports a failed send as a
+  // RESULT (`dispatched:false`, `uncertain:false`), not as a throw. That branch only
+  // recorded the failure, so the reply never entered the deferred queue and the user
+  // got nothing - while the throw branch had deferred since the first fix.
+  const deferred = [];
+  const { sent, streamDelivery } = createHarness({
+    async sendText() {
+      return { dispatched: false, verified: false, localId: "", uncertain: false, verificationError: "text stayed in the composer" };
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  streamDelivery.queueReplyTargetForThread("thread-cua-certain-result", {
+    userId: "柳毓琳",
+    contextToken: "",
+    provider: "wechat-cua",
+    // A tracked reply is the production shape for a desktop reply: without an obligation
+    // the stream treats the turn as fire-and-forget and never reaches the branch.
+    replyObligationId: `reply-obligation:${"e".repeat(64)}`,
+  });
+  streamDelivery.onReplyDeliveryDeferred = async () => {};
+
+  await runCompletedTurnWithResultOnly(streamDelivery, {
+    threadId: "thread-cua-certain-result",
+    turnId: "turn-cua-certain-result",
+    text: "这条必须补发",
+  });
+
+  assert.deepEqual(sent, []);
+  assert.equal(deferred.length, 1, "a certain not-dispatched result must be deferred");
+  assert.equal(deferred[0].text, "这条必须补发");
+  assert.equal(deferred[0].provider, "wechat-cua");
+});
+
+test("an UNCONFIRMED send result stays uncertain and is never deferred", async () => {
+  // The other half: if the client cannot prove nothing left (the composer is empty and
+  // no row appeared), re-sending later could duplicate a message the user already got.
+  const deferred = [];
+  const { streamDelivery } = createHarness({
+    async sendText() {
+      return { dispatched: false, verified: false, localId: "", uncertain: true, verificationError: "no preview row" };
+    },
+  });
+  streamDelivery.onDeferredSystemReply = async (payload) => {
+    deferred.push(payload);
+  };
+  streamDelivery.queueReplyTargetForThread("thread-cua-uncertain-result", {
+    userId: "柳毓琳",
+    contextToken: "",
+    provider: "wechat-cua",
+  });
+
+  await runCompletedTurnWithResultOnly(streamDelivery, {
+    threadId: "thread-cua-uncertain-result",
+    turnId: "turn-cua-uncertain-result",
+    text: "不要重复投递",
+  });
+
+  assert.deepEqual(deferred, []);
+});
+
 test("system send_message retries explicitly without context after a stale-token failure", async () => {
   const attempts = [];
   const { sent, streamDelivery } = createHarness({

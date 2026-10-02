@@ -776,8 +776,27 @@ class StreamDelivery {
       }
       const resultWasCertainlyNotDispatched = outcome.result?.uncertain === false
         && outcome.result?.verified !== true;
+      const dispatchFailure = new Error("the desktop send did not dispatch and nothing was typed");
+      // The flag is what `deferSystemReply` reads to decide that retrying later cannot
+      // duplicate anything; without it the deferral below silently returns false.
+      if (resultWasCertainlyNotDispatched) {
+        dispatchFailure.deliveryUncertain = false;
+      }
+      // A CERTAIN "not dispatched" result has to take the same route as a thrown certain
+      // failure: defer first, record second. Measured 2026-10-02 (twice, on the live
+      // channel): a send that came back `dispatched:false` was only RECORDED as failed -
+      // the reply never entered the deferred queue, and the user got neither the reply
+      // nor any log line saying so. The catch branch below has deferred since the first
+      // fix; this branch, which is how the CUA client reports a failed send, had not.
+      if (resultWasCertainlyNotDispatched) {
+        const deferred = await this.deferSystemReply(state, payload.text, dispatchFailure, "plain_reply");
+        if (deferred) {
+          await this.invokeReplyLifecycle(this.onReplyDeliveryDeferred, state, { error: dispatchFailure });
+          return;
+        }
+      }
       await this.invokeReplyLifecycle(this.onReplyDeliveryFailed, state, {
-        error: new Error("WeFlow UIA send did not return a verified local id"),
+        error: dispatchFailure,
         deliveryUncertain: !resultWasCertainlyNotDispatched,
       });
     } catch (error) {

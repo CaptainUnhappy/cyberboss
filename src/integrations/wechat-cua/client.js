@@ -630,7 +630,9 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   const landed = String(conv.box?.value ?? "") === text;
   pushStep({ step: "type", landed, outcome: outcome(typed), ...(firstAttempt ? { firstAttempt } : {}) });
   if (!landed) {
-    return { ok: false, verify: "text never reached the message box", steps };
+    // Nothing was typed, so nothing can have been sent: say so, because the caller's
+    // deferral logic keys on this flag and otherwise drops the reply as "uncertain".
+    return { ok: false, verify: "text never reached the message box", steps, certainNotSent: true };
   }
 
   /**
@@ -742,6 +744,11 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   }
   return {
     ok,
+    // `certainNotSent` is the proof the deferral path needs: our text is still sitting
+    // in the composer, so it never left. Without it the caller sees an unconfirmed send,
+    // calls it uncertain, and drops the reply instead of retrying it - measured twice on
+    // 2026-10-02 (`failed / delivery_uncertain`, user got nothing, and no log line).
+    certainNotSent: verdict.boxHoldsText === true,
     verify: verdict.seen ? `preview row: ${JSON.stringify(verdict.seen.slice(0, 60))}` : "the text never appeared in any preview row",
     steps,
   };

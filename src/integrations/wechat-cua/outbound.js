@@ -138,6 +138,13 @@ async function sendWeChatCuaText(config, {
     throw error;
   }
   const focusCosts = result.steps.filter((s) => s.cost && s.cost !== "none").map((s) => `${s.step}:${s.cost}`);
+  // A slow send is a bug report, not a mystery: measured 2026-10-02 an acknowledgement
+  // took 9927ms and nothing in the log said where it went. Now the step offsets do.
+  const slowestStepMs = result.steps.reduce((max, step) => Math.max(max, Number(step.ms) || 0), 0);
+  if (slowestStepMs > 4000) {
+    const breakdown = result.steps.map((step) => `${step.step}:${Number(step.ms) || 0}ms`).join(" ");
+    console.warn(`[cyberboss] cua send slow chat=${chat} totalMs=${slowestStepMs} ${breakdown}`);
+  }
   // A minimized client is the one case where sending makes the window VISIBLY come
   // back: the driver can only un-minimize with bring_to_front, which raises it and
   // leaves it in front (unlike a conversation switch, whose activation is transient,
@@ -153,6 +160,16 @@ async function sendWeChatCuaText(config, {
   const localId = localIdFor({ talker: resolvedTalker, text: content, attempt });
 
   if (!result.ok) {
+    // `uncertain` is the difference between "deferred and retried" and "dropped":
+    // stream-delivery only defers a result that says `uncertain === false`. When the
+    // client can prove nothing left (our text is still in the composer, or it never got
+    // there), the honest answer is `uncertain: false` - and measured 2026-10-02 the
+    // missing flag is why two replies were recorded as terminal failures with the user
+    // seeing nothing at all.
+    const certainNotSent = result.certainNotSent === true;
+    if (!certainNotSent) {
+      console.warn(`[cyberboss] cua send unconfirmed (treated as uncertain) chat=${chat}: ${String(result.verify).slice(0, 120)}`);
+    }
     return {
       dispatched: false,
       verified: false,
@@ -160,6 +177,7 @@ async function sendWeChatCuaText(config, {
       chat,
       focusCosts,
       steps: result.steps,
+      uncertain: !certainNotSent,
       verificationError: result.verify,
     };
   }
