@@ -276,12 +276,15 @@ class WeChatCuaInboxSource {
     // A low-frequency, information-bearing line: what the reader did, and how much
     // direction it got WITHOUT opening a conversation (the click-free path). Without
     // this the free-direction work is invisible from outside the process.
-    if (this.stats.polls % 20 === 0 || this.lastLoggedDirectionCount !== this.stats.directionWithoutClick) {
-      this.lastLoggedDirectionCount = this.stats.directionWithoutClick;
+    if (this.stats.polls % 20 === 0 || this.lastLoggedDirectionCount !== (this.source?.stats?.directionWithoutClick ?? 0)) {
+      this.lastLoggedDirectionCount = this.source?.stats?.directionWithoutClick ?? 0;
       this.logger.log?.(
-        `[cyberboss] cua inbox stats polls=${this.stats.polls} events=${this.stats.events} `
-        + `delivered=${this.stats.delivered} directionFree=${this.stats.directionWithoutClick} `
-        + `selfManual=${this.stats.selfManual} suppressed=${this.stats.suppressed} errors=${this.stats.errors}`
+        `[cyberboss] cua inbox stats polls=${this.stats.polls} `
+        + `delivered=${this.stats.delivered} suppressed=${this.stats.suppressed} errors=${this.stats.errors} `
+        // these three live on the INNER source: the outer object never had them, which
+        // printed as "undefined" and made the free-direction path look unmeasurable
+        + `events=${this.source?.stats?.events ?? 0} directionFree=${this.source?.stats?.directionWithoutClick ?? 0} `
+        + `selfManual=${this.source?.stats?.selfManual ?? 0}`
       );
     }
     return delivered;
