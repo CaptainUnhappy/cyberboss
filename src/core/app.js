@@ -1757,6 +1757,16 @@ class CyberbossApp {
     if (isSharedContentOnlyPreparedMessage(prepared)) {
       if (typeof this.enqueuePendingSharedContentInbound === "function") {
         this.enqueuePendingSharedContentInbound({ bindingKey, workspaceRoot, prepared });
+        // Acknowledge on ARRIVAL, not at promotion.
+        //
+        // A picture with no text waits the whole 15s quiet window for a prompt
+        // before it is dispatched, and the acknowledgement used to be sent at that
+        // dispatch: measured 2026-10-03, an image-only message logged
+        // `inbound acknowledged … latencyMs=16966`, and the operator read those
+        // 17 seconds as "the bot ignored my picture". The window is still right
+        // for the TURN (text may follow the picture); it is wrong for the ack,
+        // whose only job is to say "I have it".
+        await this.acknowledgeSharedContentOnArrival({ bindingKey, workspaceRoot, prepared });
         return;
       }
     }
@@ -1783,7 +1793,45 @@ class CyberbossApp {
     );
   }
 
-  enqueuePendingSharedContentInbound({ bindingKey, workspaceRoot, prepared }) {
+  /**
+   * One "处理中" for a burst of shared content, sent the moment it arrives.
+   *
+   * The normal inbox path acks through `acknowledgeBufferedInboundOnce`, but that
+   * goes through the pending-inbound store's per-scope claim, and shared content
+   * lives in its own store section (`sharedScopes`) which that claim does not
+   * look at - so the shared path simply never acked until promotion. This keeps
+   * the same one-ack-per-burst rule with the same activity bookkeeping, and marks
+   * the draft so promotion does not ack a second time.
+   */
+  async acknowledgeSharedContentOnArrival({ bindingKey, workspaceRoot, prepared }) {
+    if (typeof shouldAcknowledgeInbound === "function" && !shouldAcknowledgeInbound(prepared)) {
+      return false;
+    }
+    const scopeKey = buildSharedContentScopeKey(bindingKey, workspaceRoot, prepared?.chatId);
+    if (!scopeKey) {
+      return false;
+    }
+    if (!(this.inboundAckActivityAtMs instanceof Map)) {
+      this.inboundAckActivityAtMs = new Map();
+    }
+    const quietWindowMs = resolvePendingInboundQuietWindowMs(this);
+    const activityAtMs = resolveInboundAckActivityAtMs({ buffered: null, prepared, nowMs: Date.now() });
+    const ackedActivityAtMs = Number(this.inboundAckActivityAtMs.get(scopeKey) || 0);
+    if (quietWindowMs > 0
+      && ackedActivityAtMs > 0
+      && activityAtMs > 0
+      && activityAtMs <= ackedActivityAtMs + quietWindowMs) {
+      return false;
+    }
+    this.inboundAckActivityAtMs.set(scopeKey, Math.max(ackedActivityAtMs, activityAtMs || Date.now()));
+    const draft = this.pendingSharedContentInboundByScope?.get(scopeKey);
+    if (draft) {
+      draft.acknowledgedOnArrival = true;
+    }
+    return this.acknowledgeWeFlowUiaInbound(prepared);
+  }
+
+  async enqueuePendingSharedContentInbound({ bindingKey, workspaceRoot, prepared }) {
     const scopeKey = buildSharedContentScopeKey(bindingKey, workspaceRoot, prepared?.chatId);
     if (!scopeKey || !prepared) {
       return;
@@ -1909,6 +1957,10 @@ class CyberbossApp {
       { messageId: "weflow:shared-standalone" },
       queued
     );
+    if (draft.acknowledgedOnArrival) {
+      // Already answered the moment it arrived; promotion must not repeat it.
+      promoted.suppressAcknowledgement = true;
+    }
     promoted.sourceMessageIds = normalizeSourceMessageIds(queued.flatMap((message) => [
       message?.messageId,
       ...(Array.isArray(message?.sourceMessageIds) ? message.sourceMessageIds : []),
@@ -2083,9 +2135,11 @@ class CyberbossApp {
       // metadata only: it must not split otherwise contiguous quiet-window
       // input into separate model turns.
       preparedWithReference.sharedHandoffScopeKey = scopeKey;
-      if (batchIndex > 0 || promptAcknowledged) {
+      if (batchIndex > 0 || promptAcknowledged || draft.acknowledgedOnArrival) {
         // The first durable batch owns the single user-facing processing ack.
-        // Later batches belong to the same prompt and must not emit duplicates.
+        // Later batches belong to the same prompt and must not emit duplicates,
+        // and a burst that was already acknowledged on arrival (a picture with no
+        // text) must not be acknowledged again when a prompt finally arrives.
         preparedWithReference.acknowledgementStatus = "sent";
         preparedWithReference.acknowledgementAt = normalizeIsoTime(trailingPrepared.receivedAt)
           || new Date().toISOString();

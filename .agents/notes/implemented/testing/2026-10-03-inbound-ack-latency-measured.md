@@ -101,6 +101,36 @@ B2 15:56:23.1                                  -> 轮次记录 15:56:45.9  （+2
 - 3 条 6s 间隔的消息**合并成 1 轮，但发了 2 条「处理中」**（两次独立测量都是 2 条）。
   2026-09-29 的"只对第一条 ack"在这里没有完全成立；聚合是按"轮"的，不是按"处理中"的。
 
+## 「图片没有文字」这条路的 ack 曾经等满 15 秒（2026-10-03 当天修复）
+
+用户问「刚刚消息回复的处理中为什么发送过慢」——查到的原因不是写侧，而是**共享内容路径**：
+
+- 只有图片、没有文字的消息走 `enqueuePendingSharedContentInbound`（等 15 秒看有没有后续文字），
+  **ack 被放在"promotion"那一刻**才发；
+- 生产日志证据：`inbound acknowledged … latencyMs=16966`（图片消息）；
+- 判据本身没问题（`shouldAcknowledgeInbound` 对它是 true），是时机错了。
+
+修法：到达即 ack，promotion 不再重复。
+
+- `handlePreparedMessage` 在入队后调用 `acknowledgeSharedContentOnArrival`（新方法）；
+- 一个 burst 只 ack 一次，复用与普通路径相同的 `inboundAckActivityAtMs` 记账（窗口内不重复、
+  窗口外新 burst 立刻再 ack）；
+- 共享草稿上打 `acknowledgedOnArrival`，promotion（两条合并路径）据此设
+  `suppressAcknowledgement` / `acknowledgementStatus = "sent"`，不会补发第二条；
+- 为什么不能直接用 `acknowledgeBufferedInboundOnce`：它的 claim 只查 pending store 的
+  `scopes`，共享内容在 `sharedScopes` 里，永远 claim 不到——这正是当初"共享路径没有 ack"的根因。
+
+实测（同一类消息，生产）：
+
+| | ack latencyMs |
+|---|---|
+| 修复前 | **16966** |
+| 修复后 | **2664**（sendMs=5069，当时窗口被最小化，写侧偏慢） |
+| 修复后 promotion | 不再出现第二条 `inbound acknowledged` |
+
+单测：`test/shared-content-ack-on-arrival.test.js`（5 项：到达即 ack、窗口内不重复、窗口外重新 ack、
+自己的消息不 ack、草稿被标记）。
+
 ## Consequences
 
 - 「处理中」确实在发：bench 期间机器人打了 10+ 条 `inbound acknowledged`，链路是
