@@ -148,19 +148,43 @@ delivered 16 message(s), 3 of them pictures
 stats: imageOriginal=2 imageThumbnail=1 imageMissing=0
 ```
 
-### 5. 生产（重启后的真实进程）
+### 5. 生产（重启后的真实进程），一条命令走完全链
 
-发送后立刻出现的新行，取自 `tmp/shared-prod.log`：
+`node scripts/wechat-db-image-e2e.js tmp/probe-images/e2e-900x1400.png --seconds=20`
 
 ```
-[cyberboss] wechat-db inbox stats polls=1 … imageOriginal=0 imageFallback=0 imageThumbnail=0 imageMissing=0
-[cyberboss] wechat-db reader: [wechat-db] ffmpeg decoded c6188ec0….hevc to a blank frame; trying another suffix
-[cyberboss] wechat-db inbox image chat=文件传输助手 quality=fallback size=1600x1000 source=c6188ec0…_h.dat
++    15ms  image e2e-900x1400.png (51743B); 7 known picture(s) in filehelper
++  2983ms  sent (refusal=ok)
++  2985ms  arrived as md5=0522caff5a0cb9db7493043a441e44fd (+2ms)
++  8124ms  reader: localId=311 quality=original size=900x1400 source=(cache) 0522caff….png
++  8124ms          attachment=…\wechat-db-cache\cyberboss-wechat-db\media\0522caff….png
++  8124ms          on disk: 54205B
+             [production] wechat-db inbox image chat=文件传输助手 quality=original size=900x1400 source=0522caff….dat
+             [production] wechat-db inbox delivered talker=filehelper localId=311 direction=outgoing lagMs=1234 pollMs=800
++ 28183ms  CONCLUSION: production reported "… quality=original size=900x1400 …"
 ```
 
-`quality=fallback` 是这台客户端的常态：`<md5>.dat`（wxgf 原件）解出空白帧，真正能看的是 `_h`，
-1600x1000 正是原图尺寸。`_t` 从未在生产里胜出过——也就是说**用户此前抱怨的"没有正常获取原始图片"，
+发送 → 读取器判定 → 附件文件 → **生产日志**，全链 8.1 秒贯通。同一脚本上一次跑的是
+1600x1000 的图，那行是 `quality=fallback size=1600x1000 source=…_h.dat`——`quality=fallback`
+是这台客户端的常态：`<md5>.dat`（wxgf 原件）解出空白帧，真正能看的是 `_h`，而 1600x1000
+正是原图尺寸。`_t` 从未在生产里胜出过，也就是说**用户此前抱怨的"没有正常获取原始图片"，
 根源不在选择规则，而在"选择结果根本看不见"**。
+
+### 6. 一轮自造的性能回归及其数字
+
+改完上面这些之后生产出现 `slow poll costMs=8200`，两个原因在同一个进程内可复现
+（`scripts/wechat-db-timing-probe.py`，每个会话连查两次）：
+
+```
+wxid_ubo0cy5xh4px22 -> 柳毓琳       poll#1 12859ms  (waitedMs +8000, thumbnail 171x180)
+wxid_ubo0cy5xh4px22 -> 柳毓琳       poll#2    16ms  (磁盘没变 → 不再等)
+filehelper          -> 文件传输助手 poll#1   219ms / poll#2 31ms
+wxid_s3178hwvzsl922 -> Azzy         poll#1    31ms / poll#2 32ms
+```
+
+修完重启生产：`lastPollMs=99`，`slow poll` 行消失。细节与修法见
+[入站改读数据库](../feature/2026-10-03-wechat-db-inbound.md) §11；回归由
+`test/wechat-db-media-resolver.test.js`（3 项，合成 attach 目录、不需要密钥）守住。
 
 ## Alternatives considered
 

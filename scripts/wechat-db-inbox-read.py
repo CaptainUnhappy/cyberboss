@@ -350,6 +350,12 @@ class MediaResolver:
         # really the neighbouring picture's).
         self.last_source = ""      # "4b4cad98..._h.dat" or "(cache)"
         self.resolution: dict = {}
+        # HEVC payloads ffmpeg already rendered as an empty canvas. Keyed by the
+        # payload's first bytes so a re-sent (different) picture is judged again.
+        self._wxgf_blank: set = set()
+        # (md5, folder, newest source mtime) already waited for. A second look at
+        # an unchanged disk must not wait again - see `resolve_image`.
+        self._image_seen: set = set()
 
     def start_snapshot_budget(self) -> None:
         """Reset the per-snapshot wait budget: a snapshot waits at most this long
@@ -475,12 +481,28 @@ class MediaResolver:
             self._record(published, quality, source, width, height)
             return str(published), ""
 
+        # The newest mtime among this picture's sources: the identity of "the
+        # state of the disk" for the wait decision below.
+        tried_mtime = max(
+            (candidate.stat().st_mtime for candidate in self._variant_files(md5, folder, months).values()),
+            default=0.0,
+        )
+
         # Wait - within this snapshot's budget - for an original that has not
         # landed yet, instead of shipping the thumbnail the next poll would see.
         # Measured 2026-10-03 with a real send: the client writes `<md5>_t.dat`,
         # `<md5>_h.dat` and `<md5>.dat` within ~2 seconds, so this wait normally
         # costs nothing; it exists for the case where it does not.
-        budget_ms = self._wait_budget_ms if self._in_snapshot else max(0, self.image_wait_ms)
+        #
+        # It is spent ONCE per picture per source state, not on every poll. The
+        # alternative was measured: a picture whose original is a permanently
+        # blank HEVC frame (4b4cad98 on this machine) had the reader wait the full
+        # 8 seconds on every single poll - `slow poll costMs=8200`, forever, on a
+        # warm cache. If nothing on disk has changed since the last look, waiting
+        # again cannot produce a different answer.
+        folder_key = (md5, str(folder), tried_mtime)
+        waiting = folder_key not in self._image_seen
+        budget_ms = (self._wait_budget_ms if self._in_snapshot else max(0, self.image_wait_ms)) if waiting else 0
         deadline = time.monotonic() + (budget_ms / 1000.0)
         chosen = None
         tried = {}
@@ -497,6 +519,7 @@ class MediaResolver:
             self.stats["waitedMs"] += spent
             time.sleep(spent / 1000.0)
             deadline = min(deadline, time.monotonic() + (budget_ms / 1000.0))
+        self._image_seen.add(folder_key)
 
         if not chosen:
             self.stats["missing"] += 1
@@ -691,8 +714,19 @@ class MediaResolver:
         raw HEVC stream (the first NAL start code sits ~33 bytes in). Feeding the
         `.dat` itself to ffmpeg fails with "could not find codec parameters" -
         measured 2026-10-03.
+
+        A payload that decodes to an empty canvas is remembered **in memory**, not
+        on disk. Writing a marker file looked harmless and was not: its mtime is
+        newer than the `.png` published from the `_h` variant, so the cached
+        winner was invalidated on every poll, the reader fell back to picking
+        variants again, and the blank variant was re-run through ffmpeg every
+        8 seconds (measured 2026-10-03: `slow poll costMs=8370` on a warm cache).
         """
         if not self.ffmpeg:
+            return ""
+        source = self.cache_dir / f"{md5}{suffix}.hevc"
+        key = (md5, suffix, payload[:64])
+        if key in self._wxgf_blank:
             return ""
         body = payload
         for marker in (b"\x00\x00\x00\x01", b"\x00\x00\x01"):
@@ -700,13 +734,12 @@ class MediaResolver:
             if index > 0:
                 body = body[index:]
                 break
-        source = self.cache_dir / f"{md5}{suffix}.hevc"
         out = self.cache_dir / f"{md5}{suffix}.png"
         try:
-            source.write_bytes(body)
             result = subprocess.run(
-                [self.ffmpeg, "-y", "-loglevel", "error", "-f", "hevc", "-i", str(source),
+                [self.ffmpeg, "-y", "-loglevel", "error", "-f", "hevc", "-i", "pipe:0",
                  "-frames:v", "1", str(out)],
+                input=body,
                 capture_output=True,
                 timeout=60,
             )
@@ -714,14 +747,15 @@ class MediaResolver:
                 if _is_blank_png(out):
                     # A HEVC stream whose first frame is an empty canvas: worse
                     # than the thumbnail, so let the caller try the next suffix.
-                    log(f"ffmpeg decoded {source.name} to a blank frame; trying another suffix")
+                    log(f"ffmpeg decoded {md5[:8]}{suffix} to a blank frame; trying another suffix")
+                    self._wxgf_blank.add(key)
                     out.unlink(missing_ok=True)
                     return ""
                 return str(out)
-            log(f"ffmpeg could not decode {source.name}: "
+            log(f"ffmpeg could not decode {md5[:8]}{suffix}: "
                 + result.stderr.decode("utf-8", "replace")[:160])
         except Exception as error:  # noqa: BLE001
-            log(f"ffmpeg failed for {source.name}: {error}")
+            log(f"ffmpeg failed for {md5[:8]}{suffix}: {error}")
         return ""
 
 

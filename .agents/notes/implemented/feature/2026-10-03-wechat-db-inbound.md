@@ -191,6 +191,36 @@ node --test test/wechat-db-worker.test.js  # 11：帧/关联/超时杀进程/崩
 的"原图"一节）：图片报告 6/6 张图报出真实像素（1280x1356 / 1600x1000 / 1260x2800 / 1920x1080 …）；
 强制预览 → 打开会话 → 重读 = `improved=1 waitedMs=2500 size=180x102->800x300`；生产重启后
 真实发送立刻打出 `wechat-db inbox image chat=文件传输助手 quality=fallback size=1600x1000`。
+一条命令走完整条链：`node scripts/wechat-db-image-e2e.js <png>`（发送 → 读取器判定 → 附件路径
+→ 生产日志），实测 900x1400 的图 8.1s 内全链贯通、`quality=original`。
+
+### 11. 两个自己造出来的性能回归（同日修掉）
+
+改完 §10 后重启生产，日志立刻变成 `slow poll costMs=8200`（修复前稳态 40-99ms）。
+两个原因，都是这一轮的改动"看起来更严谨"造成的：
+
+1. **空白帧标记文件把缓存打废了。** 旧代码把 ffmpeg 的输入写成
+   `<cache>/media/<md5><suffix>.hevc`，这份"我试过了"的标记比从 `_h` 发布的 `.png` **新**，
+   于是 `_cached_winner` 的"比所有来源都新"判据每轮都失败 → 每轮重新选变体 → 每轮重跑 ffmpeg。
+   现在空白帧只记在**内存**里（`_wxgf_blank`，键含载荷前 64 字节，所以重新发的图会重新判定），
+   磁盘上不再有第二份可变来源。
+2. **等待预算对"永远不会来的原图"每轮都付一次。** 4b4cad98 的原件是永久空白帧、`_t` 是唯一可用
+   变体，于是每一次轮询都走完整 8000ms 预算。现在等待是"每张图、每个磁盘状态**一次**"：
+   来源文件的 mtime 没变就不再等——磁盘没变，再等也给不出别的答案。
+
+实测（`scripts/wechat-db-timing-probe.py`，同一进程内连查两次）：
+
+| 会话 | poll#1 | poll#2 |
+|---|---|---|
+| 柳毓琳（原件永久空白） | 12859ms（冷解密 + 8000ms 等待） | **16ms** |
+| 文件传输助手 | 219ms | 31ms |
+| Azzy | 31ms | 32ms |
+
+修完重启生产：`slow poll` 不再出现，稳态 `lastPollMs=99`。
+
+回归测试：`test/wechat-db-media-resolver.test.js`（3 项，真读取器 + 合成 attach 目录，**不需要密钥**：
+`.dat` 按 V2 容器手工构造、AES 密钥固定注入）——原图落地后必须升级、来源消失后不许再报
+"original"、等待只付一次。
 
 ## Alternatives considered
 

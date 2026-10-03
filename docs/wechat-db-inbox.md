@@ -96,13 +96,30 @@ the same account: it is delivered as `self_manual` and answered.
 
 | script | what it answers |
 | --- | --- |
+| `scripts/wechat-db-image-e2e.js [png] [chatLabel]` | the whole chain for ONE picture in one timeline: sends it through the clipboard, reads the row back, prints quality/pixels/source and the file, then finds the matching line in the production log. Positional arguments on purpose - Windows argument handling has eaten `--image <path>` twice in this repo |
 | `scripts/wechat-db-image-report.js` | for every picture in the watched chats: quality, pixels, which variant won, plus the reader's own media counters |
+| `scripts/wechat-db-timing-probe.py` | where a poll spends its time, per chat and per picture, twice in a row (so "the wait is paid on every poll" is visible instead of guessed) |
 | `scripts/wechat-db-image-arrival-probe.js <png>` | sends a real picture through the clipboard and watches, per 2s, which `<md5>*_?.dat` files the client writes and when |
 | `scripts/wechat-db-image-redownload-probe.js <talker> <md5> [--open]` | hides a picture's original and watches whether the client ever brings it back (it does not - see above); `--restore` puts the files back |
 | `scripts/wechat-db-image-upgrade-poll-probe.js <talker> [localId] [--hide-original]` | the whole production poll with one picture reported as a preview: opens the chat through Cua, waits, re-reads, prints the envelope and the counters |
 
 All of them are read-mostly: the only writes are to `tmp/`, and the two that
 touch the account directory tell you how to undo it.
+
+### Why the reader does not wait on every poll
+
+The bounded wait for an original is spent **once per picture per disk state**, not
+once per poll. Without that rule, a picture whose original is a permanently blank
+HEVC frame - `4b4cad98…` on this machine - made every poll wait the full 8
+seconds, forever, on a warm cache (measured: `slow poll costMs=8200`; the same
+chat's next poll after the fix: **16ms**). If nothing on disk has changed since
+the last look, waiting again cannot produce a different answer.
+
+The same change retired a second trap: a blank-frame marker used to be written
+into the cache and, being newer than the `.png` published from the `_h` variant,
+it invalidated the cached answer on every poll. Blank frames are remembered in
+memory now, keyed by the payload's first bytes so a re-sent picture is judged
+again.
 
 ## Images
 
@@ -138,7 +155,8 @@ What is certain either way: reading pixels cannot fetch what the client has not
 downloaded. So two things happen, in this order:
 
 1. the reader waits a bounded moment for the original
-   (`CYBERBOSS_WECHAT_DB_IMAGE_WAIT_MS`, default 8s, one budget per snapshot);
+   (`CYBERBOSS_WECHAT_DB_IMAGE_WAIT_MS`, default 8s, one budget per snapshot, and
+   only once per picture per disk state - see below);
 2. if the message still carries a preview, the inbox **opens that one
    conversation through Cua** (a single foreground click, once per chat per 30s
    cooldown), waits `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE_WAIT_MS` (default 2.5s) and
