@@ -350,11 +350,12 @@ class MediaResolver:
         # really the neighbouring picture's).
         self.last_source = ""      # "4b4cad98..._h.dat" or "(cache)"
         self.resolution: dict = {}
-        # HEVC payloads ffmpeg already rendered as an empty canvas. Keyed by the
-        # payload's first bytes so a re-sent (different) picture is judged again.
+        # HEVC payloads ffmpeg already rendered as an empty canvas, and the
+        # pictures whose wait has been paid for. Both are per-process on purpose:
+        # neither may become a second file on disk whose mtime can invalidate the
+        # published answer (see `_convert_wxgf`).
         self._wxgf_blank: set = set()
-        # (md5, folder, newest source mtime) already waited for. A second look at
-        # an unchanged disk must not wait again - see `resolve_image`.
+        # (md5, folder, newest source mtime) already waited for - see `resolve_image`.
         self._image_seen: set = set()
 
     def start_snapshot_budget(self) -> None:
@@ -478,6 +479,7 @@ class MediaResolver:
             quality, source, published, width, height = cached
             self.stats["resolved"] += 1
             self.stats["lastReason"] = ""
+            self._prune_stale(md5, keep=quality)
             self._record(published, quality, source, width, height)
             return str(published), ""
 
@@ -564,6 +566,26 @@ class MediaResolver:
         if self._timing:
             log(f"image {md5[:8]} chose {self.stats['lastChosen']}")
         return str(published), ""
+
+    def _prune_stale(self, md5: str, keep: str) -> None:
+        """Drop the published copy of the variant that did NOT win.
+
+        A cached decision must be the ONLY decision: while `4b4cad98…_thumb.jpg`
+        (written when the picture looked like a preview) was still on disk next to
+        `4b4cad98….png`, "which one is published?" depended on two timestamps
+        instead of on the pixels, and the picture was reported as a preview again
+        (visible in the field: `quality=original` and "本地文件未取到" in the same
+        message). Removing the loser makes the answer deterministic.
+        """
+        losers = (md5,) if keep == "thumbnail" else (f"{md5}_thumb",)
+        for stem in losers:
+            for extension in (".png", ".jpg", ".gif", ".webp", ".bmp"):
+                path = self.cache_dir / f"{stem}{extension}"
+                if path.is_file():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
 
     def _record(self, path, quality: str, source: str, width: int, height: int) -> None:
         """One place that writes `self.resolution` - a second writer is how the
@@ -715,26 +737,31 @@ class MediaResolver:
         `.dat` itself to ffmpeg fails with "could not find codec parameters" -
         measured 2026-10-03.
 
-        A payload that decodes to an empty canvas is remembered **in memory**, not
-        on disk. Writing a marker file looked harmless and was not: its mtime is
-        newer than the `.png` published from the `_h` variant, so the cached
-        winner was invalidated on every poll, the reader fell back to picking
-        variants again, and the blank variant was re-run through ffmpeg every
-        8 seconds (measured 2026-10-03: `slow poll costMs=8370` on a warm cache).
+        What this returns is cached on disk under a name no candidate list looks
+        at (`<md5><suffix>.hevc[.png]`, never `<md5><suffix>.png`), and its
+        freshness is decided by **comparing the payload**, not by timestamps.
+        Both details were paid for: a marker file whose mtime was newer than the
+        `.png` published from the `_h` variant invalidated the cached answer on
+        every poll, and re-running ffmpeg on a permanently blank frame cost
+        8 seconds of waiting per poll (measured `slow poll costMs=8200`).
         """
         if not self.ffmpeg:
             return ""
         source = self.cache_dir / f"{md5}{suffix}.hevc"
-        key = (md5, suffix, payload[:64])
-        if key in self._wxgf_blank:
-            return ""
+        try:
+            if source.is_file() and source.read_bytes() == payload:
+                out = self.cache_dir / f"{md5}{suffix}.hevc.png"
+                # Same payload as last time: whatever ffmpeg said then still holds.
+                return str(out) if out.is_file() else ""
+        except OSError:
+            pass
         body = payload
         for marker in (b"\x00\x00\x00\x01", b"\x00\x00\x01"):
             index = body.find(marker)
             if index > 0:
                 body = body[index:]
                 break
-        out = self.cache_dir / f"{md5}{suffix}.png"
+        out = self.cache_dir / f"{md5}{suffix}.hevc.png"
         try:
             result = subprocess.run(
                 [self.ffmpeg, "-y", "-loglevel", "error", "-f", "hevc", "-i", "pipe:0",
@@ -748,9 +775,10 @@ class MediaResolver:
                     # A HEVC stream whose first frame is an empty canvas: worse
                     # than the thumbnail, so let the caller try the next suffix.
                     log(f"ffmpeg decoded {md5[:8]}{suffix} to a blank frame; trying another suffix")
-                    self._wxgf_blank.add(key)
                     out.unlink(missing_ok=True)
+                    source.write_bytes(payload)
                     return ""
+                source.write_bytes(payload)
                 return str(out)
             log(f"ffmpeg could not decode {md5[:8]}{suffix}: "
                 + result.stderr.decode("utf-8", "replace")[:160])

@@ -173,16 +173,18 @@ stats: imageOriginal=2 imageThumbnail=1 imageMissing=0
 ### 6. 一轮自造的性能回归及其数字
 
 改完上面这些之后生产出现 `slow poll costMs=8200`，两个原因在同一个进程内可复现
-（`scripts/wechat-db-timing-probe.py`，每个会话连查两次）：
+（`scripts/wechat-db-timing-probe.py`，每个会话连查三次；#1 付冷解密与等待，#2/#3 是机器人
+日常所处的稳态）：
 
 ```
-wxid_ubo0cy5xh4px22 -> 柳毓琳       poll#1 12859ms  (waitedMs +8000, thumbnail 171x180)
-wxid_ubo0cy5xh4px22 -> 柳毓琳       poll#2    16ms  (磁盘没变 → 不再等)
-filehelper          -> 文件传输助手 poll#1   219ms / poll#2 31ms
-wxid_s3178hwvzsl922 -> Azzy         poll#1    31ms / poll#2 32ms
+wxid_ubo0cy5xh4px22 -> 柳毓琳       poll#1 12875ms (waitedMs +8000, thumbnail 171x180)
+wxid_ubo0cy5xh4px22 -> 柳毓琳       poll#2    15ms / poll#3 32ms   (磁盘没变 → 不再等)
+filehelper          -> 文件传输助手 poll#1    93ms / poll#2 63ms / poll#3 78ms  (9 张图)
+wxid_s3178hwvzsl922 -> Azzy         poll#1    31ms / poll#2 32ms / poll#3 15ms
 ```
 
-修完重启生产：`lastPollMs=99`，`slow poll` 行消失。细节与修法见
+修完重启生产：`slow poll` 只剩冷启动那一次（9369ms，与改动前同量级），稳态
+`lastPollMs=120-133ms`。细节与修法见
 [入站改读数据库](../feature/2026-10-03-wechat-db-inbound.md) §11；回归由
 `test/wechat-db-media-resolver.test.js`（3 项，合成 attach 目录、不需要密钥）守住。
 

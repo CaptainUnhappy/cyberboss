@@ -48,7 +48,10 @@ def stats():
 
 
 for chat in chats:
-    for attempt in (1, 2):
+    # Three passes: #1 pays the cold decrypt and the per-picture wait, #2 is the
+    # steady state a running bot lives in, #3 catches anything that re-decides
+    # itself on every pass (that is exactly how a warm cache cost 8s per poll).
+    for attempt in (1, 2, 3):
         before = stats()
         t0 = time.monotonic()
         try:

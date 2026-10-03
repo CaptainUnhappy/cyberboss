@@ -117,9 +117,16 @@ the last look, waiting again cannot produce a different answer.
 
 The same change retired a second trap: a blank-frame marker used to be written
 into the cache and, being newer than the `.png` published from the `_h` variant,
-it invalidated the cached answer on every poll. Blank frames are remembered in
-memory now, keyed by the payload's first bytes so a re-sent picture is judged
-again.
+it invalidated the cached answer on every poll. ffmpeg results are now cached under
+a name no candidate list looks at (`<md5><suffix>.hevc[.png]`), and freshness is
+decided by comparing the **payload bytes** rather than a timestamp - so a re-sent
+picture is judged again and an unchanged one is never decoded twice. When a cached
+decision is used, the losing published copy is deleted, so "original or preview?"
+has exactly one answer on disk.
+
+Measured on a warm cache, three passes per chat: 柳毓琳 15-32ms, 文件传输助手
+63-93ms, Azzy 15-32ms (production `lastPollMs`: 120-133ms for all three chats and
+their nine pictures).
 
 ## Images
 
