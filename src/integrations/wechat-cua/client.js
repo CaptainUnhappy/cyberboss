@@ -25,11 +25,21 @@
 // the view.
 //
 // A labeled session also has a *lifecycle*: it can be ended (`end_session`, the
-// daemon restarting, the transport lease going away), and every later call is
-// then refused with a plain-text message on stderr:
+// daemon restarting, the transport lease going away, an idle timeout), and every
+// later call is then refused. The wording has changed between builds:
 //
 //   session has ended; tool call 'list_windows' was rejected. Call start_session
 //   with session '<label>' to start it again, or use a new session label.
+//
+//   session '<label>' has ended; call start_session with session '<label>' to
+//   start it again, or use a new session label      (0.31.0, measured 2026-10-03)
+//
+// The first pattern only matched the first wording, so on the current build the
+// refusal was never recognised, `revive()` never ran, and a bot that had been
+// idle for a while silently lost the ability to send anything: measured
+// 2026-10-03, `deferred retry failed ... session 'cyberboss-out-6780' has ended`
+// on repeat while the driver was perfectly healthy. Both the refusal CODE and
+// both wordings are matched now.
 //
 // Measured 2026-10-01 against 0.31.0: exit code 1, stdout empty, stderr carries
 // that sentence, and `start_session` on the same label answers `revived: true`.
@@ -44,7 +54,7 @@ const DRIVER = process.env.CUA_DRIVER
   || "C:\\Users\\79388\\AppData\\Local\\Programs\\Cua\\cua-driver\\bin\\cua-driver.exe";
 
 /** The driver's refusal when a call arrives for a session that is no longer live. */
-const SESSION_ENDED = /session has ended/i;
+const SESSION_ENDED = /session (?:'[^']*' )?has ended|session_ended/i;
 
 /**
  * The driver's refusal when the token came from a snapshot that has been
@@ -130,6 +140,9 @@ function failureText(res) {
 
 /** Is this failure the "your session is gone" refusal (as opposed to a bad call)? */
 function isSessionEnded(res) {
+  if (!res?.__failed) return false;
+  // The structured code is the durable signal; the prose is the fallback.
+  if (res.payload?.refusal?.code === "session_ended") return true;
   return SESSION_ENDED.test(String(failureText(res)));
 }
 
