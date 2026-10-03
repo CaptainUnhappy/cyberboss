@@ -203,6 +203,20 @@ class PreviewInboundSource {
     this.stats = { polls: 0, events: 0, skippedOwnEcho: 0, skippedNotAllowed: 0, deepReads: 0, selfManual: 0, directionWithoutClick: 0 };
   }
 
+  /**
+   * Point this reader at a new WeChat window.
+   *
+   * WeChat restarts change the pid and the window id; the old handle then refuses every
+   * snapshot (`No window with window_id … exists`) and the channel goes deaf while the
+   * driver itself is perfectly healthy. The baseline (`primed`) and the watermarks are
+   * deliberately kept: they are about which MESSAGES are old, and a restart must not
+   * make the whole chat list look new.
+   */
+  rebind(target) {
+    this.target = target;
+    return this.target;
+  }
+
   /** One read, no side effects. Returns the events observed since the last call. */
   poll({ isOwnEcho = () => false } = {}) {
     const rows = readRows(this.session, this.target);

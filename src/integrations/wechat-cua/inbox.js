@@ -28,6 +28,18 @@ const { PreviewInboundSource } = require("./inbound");
 const { SentLedger } = require("./loop");
 const { ensureDriverRunning, isDaemonDown } = require("./daemon");
 
+/**
+ * Is this failure "the window I was told to read no longer exists"?
+ *
+ * WeChat restarts (login, update, crash) change the pid and the window id, and the
+ * driver then refuses every snapshot of the old handle. Measured 2026-10-03: the inbox
+ * logged exactly this on every poll and never re-resolved, so the channel stayed deaf
+ * while the daemon was fine - the recovery ladder was aimed at the driver instead.
+ */
+function isStaleWindow(detail) {
+  return /No window with window_id|window_target_not_found|window does not exist/i.test(String(detail || ""));
+}
+
 /** Stable-ish id for de-duplication: there is no server id on this path. */
 function synthesizeId(event) {
   const seed = `${event.peer}\u0000${event.text}\u0000${event.time}\u0000${event.unread}`;
@@ -116,6 +128,31 @@ class WeChatCuaInboxSource {
       this.target = findWeChatWindow(this.session);
     }
     return this.target;
+  }
+
+  /**
+   * Forget the cached window and find it again.
+   *
+   * The driver refuses a snapshot of a window that no longer exists, so the reader has
+   * to be re-pointed at whatever WeChat is now (new pid, new window_id). Priming is
+   * deliberately NOT repeated: the baseline is about which messages are old, and a
+   * restart must not replay the chat list as new.
+   */
+  refreshTarget() {
+    try {
+      this.target = null;
+      const window = findWeChatWindow(this.session);
+      if (this.source && typeof this.source.rebind === "function") {
+        this.source.rebind(window);
+      }
+      this.logger.warn?.(
+        `[cyberboss] cua inbox re-resolved the WeChat window after it disappeared: pid=${window.pid} window=${window.window_id}`
+      );
+      return window;
+    } catch (error) {
+      this.logger.warn?.(`[cyberboss] cua inbox could not re-resolve the WeChat window: ${error.message}`);
+      return null;
+    }
   }
 
   async start() {
@@ -316,6 +353,16 @@ class WeChatCuaInboxSource {
   recoverFromFailure(error) {
     const detail = String(error?.message || "");
     this.stats.consecutiveErrors = (this.stats.consecutiveErrors || 0) + 1;
+    // A WINDOW that disappeared is not a driver failure: WeChat restarted (a login, an
+    // update, a crash) and the cached pid/window_id are simply gone. Measured
+    // 2026-10-03: after a WeChat restart the inbox logged `No window with window_id …`
+    // every poll for as long as it ran - the channel was deaf and every recovery below
+    // was aimed at the wrong thing (the daemon was healthy). Re-resolving costs one
+    // list_windows call, so it happens on the first failure, not after a threshold.
+    if (isStaleWindow(detail) && typeof this.refreshTarget === "function") {
+      this.refreshTarget();
+      return this.stats.consecutiveErrors;
+    }
     if (this.stats.consecutiveErrors < this.recoverAfterFailures) {
       return this.stats.consecutiveErrors;
     }
