@@ -253,6 +253,26 @@ def _looks_complete(decoded: bytes, extension: str) -> bool:
     return marker in decoded[-64:]
 
 
+def _image_size(data: bytes) -> tuple:
+    """(width, height) for a PNG or JPEG, (0, 0) when it cannot be told."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:3] == b"\xff\xd8\xff":
+        index = 2
+        while index < len(data) - 9:
+            if data[index] == 0xFF and data[index + 1] in (0xC0, 0xC1, 0xC2, 0xC3):
+                height = int.from_bytes(data[index + 5:index + 7], "big")
+                width = int.from_bytes(data[index + 7:index + 9], "big")
+                return width, height
+            index += 1
+    return 0, 0
+
+
+def _image_area(data: bytes) -> int:
+    width, height = _image_size(data)
+    return width * height
+
+
 def _is_blank_png(path: Path, min_bytes_per_pixel: float = 0.01) -> bool:
     """Is this PNG an (almost) uniform canvas?
 
@@ -302,6 +322,7 @@ class MediaResolver:
         self.extra_key = (aes_key.strip(), xor_key) if aes_key.strip() else None
         self.ffmpeg = ffmpeg or os.environ.get("CYBERBOSS_WECHAT_DB_FFMPEG", "") or shutil.which("ffmpeg") or ""
         self._keys = None
+        self._timing = os.environ.get("CYBERBOSS_WECHAT_DB_TIMING") == "1"
         self.stats = {"resolved": 0, "missing": 0, "keyFailures": 0, "ffmpeg": 0, "lastReason": ""}
 
     def keys(self):
@@ -375,11 +396,20 @@ class MediaResolver:
     def resolve_image(self, md5: str, talker: str, create_time: int):
         """Locate, decrypt and cache one image -> (path, failure reason).
 
-        Suffix order matters and is NOT the order it looks like: `_t` is the
-        thumbnail (measured 2026-10-03: 180x102 for a 720x240 original), so the
-        full-size file is tried first and the thumbnail is the last resort. The
-        full-size file is sometimes a `wxgf` container instead of a picture,
-        which is what ffmpeg is for.
+        Which variant wins is decided by PIXELS, not by file format. Both earlier
+        rules were wrong in production:
+
+          * "thumbnail first" (`_t`, ``, `_h`) handed the operator a 180x102 image
+            for a 720x240 original;
+          * "a directly readable image beats a container" handed them a **171x180**
+            thumbnail for a picture whose `wxgf` original decodes (ffmpeg) to
+            1280x1356 - the operator's exact complaint on 2026-10-03: "好像没有
+            正常获取原始图片".
+
+        So every variant is decoded (directly, or through ffmpeg when it is a
+        `wxgf` container), blank frames are dropped, and the one with the largest
+        area wins - with the original preferred on a tie. Thumbnails only win when
+        nothing else exists, which is the case that made this necessary.
         """
         if not md5 or len(md5) != 32:
             self.stats["missing"] += 1
@@ -394,67 +424,96 @@ class MediaResolver:
         if create_time:
             months.append(datetime.fromtimestamp(create_time).strftime("%Y-%m"))
         months.extend(entry.name for entry in folder.iterdir() if entry.is_dir() and entry.name not in months)
-        # `_h` first, then the bare name, then the thumbnail. Measured 2026-10-03:
-        # for one message `_h` was the 690KB full picture while the bare name was
-        # a wxgf container whose HEVC frame decodes to a blank 1280x1356 canvas;
-        # for another the bare name was the good one. So every suffix is decoded,
-        # a real image always beats a container, and a blank frame is rejected.
-        decoded_by_suffix = {}
+
+        # A previously chosen winner is reused as long as it is newer than every
+        # source file: a two-second poll must not re-decode (or re-run ffmpeg on)
+        # the same picture forever.
+        chosen = self._cached_winner(md5, folder, months)
+        if chosen:
+            return str(chosen), ""
+
+        best = None  # (area, rank, path)
         saw_wxgf = False
-        for suffix in ("_h", "", "_t"):
+        for rank, suffix in enumerate(("", "_h", "_t")):
             for month in months:
                 candidate = folder / month / "Img" / f"{md5}{suffix}.dat"
                 if not candidate.is_file():
                     continue
-                # Reuse an earlier decode of this exact file, so a two-second
-                # poll does not re-decrypt (and re-run ffmpeg on) every picture
-                # in the window over and over.
-                for extension in (".png", ".jpg", ".gif", ".webp", ".bmp"):
-                    cached = self.cache_dir / f"{md5}{suffix}{extension}"
-                    if cached.is_file() and cached.stat().st_mtime >= candidate.stat().st_mtime:
-                        return str(cached), ""
-                try:
-                    data = candidate.read_bytes()
-                except OSError as error:
-                    log(f"image {candidate.name} unreadable: {error}")
-                    continue
-                decoded, extension = self.decode_dat(data)
+                decoded, extension = self._decode_variant(candidate, md5, suffix)
                 if not decoded:
-                    self.stats["keyFailures"] += 1
-                    self.stats["lastReason"] = "no image key decrypted this file"
                     continue
-                decoded_by_suffix[suffix] = (decoded, extension)
-                saw_wxgf = saw_wxgf or extension == ".hevc"
+                if extension == ".hevc":
+                    saw_wxgf = True
+                    continue
+                area = _image_area(decoded)
+                if area <= 0:
+                    area = len(decoded)  # unknown dimensions: fall back to bytes
+                if best is None or area > best[0]:
+                    out = self.cache_dir / f"{md5}{suffix}{extension}"
+                    out.write_bytes(decoded)
+                    best = (area, rank, out)
                 break
 
-        for suffix in ("_h", "", "_t"):
-            entry = decoded_by_suffix.get(suffix)
-            if not entry or entry[1] == ".hevc":
-                continue
-            decoded, extension = entry
-            out = self.cache_dir / f"{md5}{suffix}{extension}"
-            out.write_bytes(decoded)
-            self.stats["resolved"] += 1
-            self.stats["lastReason"] = ""
-            return str(out), ""
+        if best is None:
+            self.stats["missing"] += 1
+            if saw_wxgf:
+                self.stats["lastReason"] = "the image is a wxgf (HEVC) container and ffmpeg could not decode it"
+            else:
+                self.stats["lastReason"] = self.stats["lastReason"] or "no readable image file on disk"
+            return "", self.stats["lastReason"]
 
-        for suffix in ("_h", "", "_t"):
-            entry = decoded_by_suffix.get(suffix)
-            if not entry or entry[1] != ".hevc":
-                continue
-            converted = self._convert_wxgf(entry[0], md5, suffix)
-            if converted:
-                self.stats["resolved"] += 1
-                self.stats["ffmpeg"] += 1
-                self.stats["lastReason"] = ""
-                return converted, ""
+        winner = best[2]
+        # Publish the winner under a suffix-free name so the next poll finds it
+        # without re-deciding.
+        published = self.cache_dir / f"{md5}{winner.suffix}"
+        if winner != published:
+            published.write_bytes(winner.read_bytes())
+        detail = "x".join(str(part) for part in _image_size(winner.read_bytes()))
+        self.stats["resolved"] += 1
+        self.stats["lastReason"] = ""
+        self.stats["lastChosen"] = f"{winner.name} {winner.stat().st_size}B {detail}"
+        if self._timing:
+            log(f"image {md5[:8]} chose {self.stats['lastChosen']}")
+        return str(published), ""
 
-        self.stats["missing"] += 1
-        if saw_wxgf:
-            self.stats["lastReason"] = "the image is a wxgf (HEVC) container and ffmpeg could not decode it"
-        else:
-            self.stats["lastReason"] = self.stats["lastReason"] or "no readable image file on disk"
-        return "", self.stats["lastReason"]
+    def _cached_winner(self, md5: str, folder: Path, months: list) -> Path | None:
+        """An earlier winner, still newer than every `<md5>*` source file."""
+        newest_source = 0.0
+        for suffix in ("", "_h", "_t"):
+            for month in months:
+                candidate = folder / month / "Img" / f"{md5}{suffix}.dat"
+                if candidate.is_file():
+                    newest_source = max(newest_source, candidate.stat().st_mtime)
+        for extension in (".png", ".jpg", ".gif", ".webp", ".bmp"):
+            published = self.cache_dir / f"{md5}{extension}"
+            if published.is_file() and published.stat().st_mtime >= newest_source:
+                return published
+        return None
+
+    def _decode_variant(self, candidate: Path, md5: str, suffix: str):
+        """One `.dat` -> (image bytes, extension); containers go through ffmpeg."""
+        for extension in (".png", ".jpg", ".gif", ".webp", ".bmp"):
+            cached = self.cache_dir / f"{md5}{suffix}{extension}"
+            if cached.is_file() and cached.stat().st_mtime >= candidate.stat().st_mtime:
+                return cached.read_bytes(), extension
+        try:
+            data = candidate.read_bytes()
+        except OSError as error:
+            log(f"image {candidate.name} unreadable: {error}")
+            return b"", ""
+        decoded, extension = self.decode_dat(data)
+        if not decoded:
+            self.stats["keyFailures"] += 1
+            self.stats["lastReason"] = "no image key decrypted this file"
+            return b"", ""
+        if extension != ".hevc":
+            (self.cache_dir / f"{md5}{suffix}{extension}").write_bytes(decoded)
+            return decoded, extension
+        converted = self._convert_wxgf(decoded, md5, suffix)
+        if not converted:
+            return b"", ""
+        self.stats["ffmpeg"] += 1
+        return Path(converted).read_bytes(), ".png"
 
     def _convert_wxgf(self, payload: bytes, md5: str, suffix: str) -> str:
         """Decode a wxgf (HEVC) payload with ffmpeg.

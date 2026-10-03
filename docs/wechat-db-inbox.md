@@ -106,13 +106,21 @@ this machine on 2026-10-03:
    the turn.
 
 Suffix handling is the part that bites. `_t` is the **thumbnail** (measured
-180x102 for a 720x240 original) and the bare name is sometimes a `wxgf` container
-(WeChat's HEVC wrapper) whose first frame can be a **blank canvas**. So every
-suffix is decoded, a directly-readable image always beats a container, `_h` is
-preferred over the bare name, and a converted frame that is nearly uniform
-(<0.01 bytes per pixel) is rejected. `wxgf` payloads are decoded with ffmpeg
-(`-f hevc`, after cutting to the first NAL start code); without ffmpeg such a
-message falls back to whichever suffix holds a plain image.
+180x102 for a 720x240 original, and 171x180 for a picture whose original is
+1280x1356), the bare name is often a `wxgf` container (WeChat's HEVC wrapper), and
+a `_h` variant may or may not exist. Two rules were tried and both were wrong in
+production:
+
+| rule | what it did |
+| --- | --- |
+| thumbnail first (`_t`, ``, `_h`) | handed over a 180x102 image for a 720x240 original |
+| "a directly readable image beats a container" | handed over a **171x180** thumbnail for a picture whose `wxgf` original decodes to 1280x1356 |
+
+So selection is by **pixels, not by file format**: every variant is decoded
+(directly, or through ffmpeg when it is a `wxgf` container), blank frames are
+dropped, and the variant with the largest area wins - the original preferred on a
+tie. `wxgf` payloads are decoded with ffmpeg (`-f hevc`, after cutting to the
+first NAL start code). Thumbnails only win when nothing else exists.
 
 | setting | meaning |
 | --- | --- |
