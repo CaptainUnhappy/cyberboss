@@ -2205,10 +2205,10 @@ class CyberbossApp {
     }
     if (
       this.replyObligationStore
-      // Both desktop providers: an inbound turn on either of them deserves a durable
+      // Every desktop provider: an inbound turn on any of them deserves a durable
       // reply obligation. Without one there is no deferSystemReply branch at all, so a
       // certain send failure drops the reply instead of retrying it (measured 2026-10-02).
-      && (prepared.provider === "weflow-uia" || prepared.provider === "wechat-cua")
+      && isDesktopProvider(prepared.provider)
       && prepared.deliveryPolicy !== SILENT_DELIVERY_POLICY
       && prepared.deliveryPolicy !== MODEL_CANARY_DELIVERY_POLICY
       && obligationSourceIds.length
@@ -5603,7 +5603,13 @@ function groupDeferredReplies(replies) {
 
 /** The channels the bot drives itself on the personal account (no reply window). */
 function isDesktopProvider(provider) {
-  return provider === "weflow-uia" || provider === "wechat-cua";
+  // `wechat-db` is the database reader for the SAME desktop client: the message
+  // came in through the account's own database and the reply goes out through
+  // Cua. Treating it as a desktop provider is what keeps the "处理中"
+  // acknowledgement firing - the last time a channel's provider was not added
+  // here, the acknowledgement silently stopped being sent at all (see the comment
+  // in shouldAcknowledgeInbound).
+  return provider === "weflow-uia" || provider === "wechat-cua" || provider === "wechat-db";
 }
 
 /**

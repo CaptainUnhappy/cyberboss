@@ -1,5 +1,5 @@
 const crypto = require("crypto");
-const DESKTOP_PROVIDERS = new Set(["weflow-uia", "wechat-cua"]);
+const DESKTOP_PROVIDERS = new Set(["weflow-uia", "wechat-cua", "wechat-db"]);
 const fs = require("fs");
 const path = require("path");
 

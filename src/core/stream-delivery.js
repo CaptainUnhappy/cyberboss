@@ -1349,7 +1349,7 @@ function normalizePositiveIntegerText(value) {
  */
 function isDesktopReplyTarget(target) {
   const provider = normalizeText(target?.provider);
-  return provider === "weflow-uia" || provider === "wechat-cua";
+  return provider === "weflow-uia" || provider === "wechat-cua" || provider === "wechat-db";
 }
 
 /**
@@ -1363,7 +1363,7 @@ function isDesktopReplyTarget(target) {
  * The turn had run, the answer existed, and it went nowhere (measured 2026-10-01,
  * the first complete CUA turn).
  */
-const REPLY_ROUTE_PROVIDERS = new Set(["weflow-uia", "wechat-cua"]);
+const REPLY_ROUTE_PROVIDERS = new Set(["weflow-uia", "wechat-cua", "wechat-db"]);
 
 function applyWeFlowReplyRoute(payload, target) {
   const provider = normalizeText(target?.provider);

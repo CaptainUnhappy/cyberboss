@@ -81,6 +81,9 @@ class WechatDbInboxSource {
       lastError: "",
       lastPollAt: "",
       lastPollMs: 0,
+      // Detection lag: how long after WeChat stored a row the inbox noticed it.
+      lastLagMs: 0,
+      maxLagMs: 0,
     };
   }
 
@@ -130,6 +133,16 @@ class WechatDbInboxSource {
     try {
       const result = await this.pollOnce();
       this.stats.lastPollMs = Date.now() - startedAt;
+      // A poll that costs more than its own interval pushes the next one out, and
+      // that delay is invisible in the delivered/ack numbers - measured
+      // 2026-10-03, a re-decrypting poll cost seconds and the "处理中" arrived
+      // late with nothing in the log saying why.
+      if (this.stats.lastPollMs > Math.max(500, this.pollIntervalMs)) {
+        this.logger.warn?.(
+          `[cyberboss] wechat-db inbox slow poll costMs=${this.stats.lastPollMs} `
+          + `intervalMs=${this.pollIntervalMs} chats=${this.chats.length}`
+        );
+      }
       return result;
     } catch (error) {
       this.stats.errors += 1;
@@ -188,7 +201,17 @@ class WechatDbInboxSource {
         const shouldDispatch = !ownEcho
           && (!firstSnapshot || replayIds.has(message.id));
         if (shouldDispatch) {
-          const accepted = await this.onMessage(buildEnvelope(message, { peer, talker }), chatSnapshot);
+          // How long the bot took to NOTICE: from the moment WeChat stored the row
+          // to the moment this poll handed it over. This is the first half of the
+          // operator's "处理中 is late" complaint, and without it the only number
+          // available was the ack's total latency, which cannot say whether the
+          // time went into noticing or into sending.
+          const lagMs = message.timestamp ? Date.now() - message.timestamp * 1000 : 0;
+          if (lagMs > 0) {
+            this.stats.lastLagMs = lagMs;
+            this.stats.maxLagMs = Math.max(this.stats.maxLagMs || 0, lagMs);
+          }
+          const accepted = await this.onMessage(buildEnvelope(message, { peer, talker }), chatSnapshot, { lagMs });
           if (accepted === false) {
             // Not accepted means "ask me again later" (no reply route yet, the
             // ledger has not caught up). Leave it unseen so the next poll
@@ -199,6 +222,10 @@ class WechatDbInboxSource {
           }
           processed += 1;
           this.stats.delivered += 1;
+          this.logger.log?.(
+            `[cyberboss] wechat-db inbox delivered talker=${talker} localId=${message.localId} `
+            + `direction=${message.direction} lagMs=${lagMs} pollMs=${this.pollIntervalMs}`
+          );
         }
         this.rememberSeen(message.id);
         seen.add(message.id);
@@ -216,7 +243,7 @@ class WechatDbInboxSource {
       this.logger.log?.(
         `[cyberboss] wechat-db inbox stats polls=${this.stats.polls} delivered=${this.stats.delivered} `
         + `suppressed=${this.stats.suppressed} deferred=${this.stats.deferred} errors=${this.stats.errors} `
-        + `lastPollMs=${this.stats.lastPollMs}`
+        + `lastPollMs=${this.stats.lastPollMs} lastLagMs=${this.stats.lastLagMs} maxLagMs=${this.stats.maxLagMs}`
       );
     }
     return {

@@ -1,0 +1,84 @@
+# Agent Note: 「处理中」的到达时间被测出来了，瓶颈不在读侧
+
+Status: implemented
+
+## Problem
+
+用户的诉求是"第一时间回复处理中"。此前只有一句模糊的抱怨，没有任何可证伪的数字；而这条链路上有三个各自能吃秒级的环节，不测就不知道钱花在哪：
+
+1. **通知**：消息落库 → 机器人看见（轮询间隔 + 单次轮询成本）；
+2. **确认**：看见 → `acknowledgeWeFlowUiaInbound` 真的被触发（判据、provider 白名单）；
+3. **写入**：`处理中` 三个字真的进到微信气泡里（Cua 写侧阶梯）。
+
+## Decision
+
+### 1. 让每个环节都自己报数
+
+- 入站源：每条投递打一行 `wechat-db inbox delivered talker=… localId=… direction=… lagMs=…`，
+  统计行追加 `lastLagMs/maxLagMs`；单次轮询超过 `max(500ms, 间隔)` 时打
+  `slow poll costMs=…`（慢轮询会把下一次推迟，而这一点在 delivered/ack 里是看不见的）。
+- 读取器：`CYBERBOSS_WECHAT_DB_TIMING=1` 时打每个会话的 `resolve/read/summarize` 耗时。
+- 已有的一行恰好是用户视角的数字：`inbound acknowledged … latencyMs=… sendMs=…`。
+
+### 2. 让 `wechat-db` 被当成桌面通道
+
+`sent` 侧的 provider 白名单里加 `wechat-db`（`isDesktopProvider`、`isDesktopReplyTarget`、
+`REPLY_ROUTE_PROVIDERS`、`reply-obligation-store.DESKTOP_PROVIDERS`、weixin 适配器的发送分支）。
+上一次通道迁移就是因为漏了这种白名单，"处理中"直接静默消失——同样的坑不踩第三次。
+（实际派发时 provider 会被改写成 `wechat-cua`，所以这是防御，不是修 bug；但它必须和别的桌面通道行为一致。）
+
+### 3. 把轮询间隔从 2000ms 降到 800ms
+
+轮询成本的实测（`tmp/probe-poll-cost.js`）：冷启动 4935-5042ms，**稳态 142-207ms**。
+聊天身份（wxid + 显示名）现在带 10 分钟缓存，稳态只碰消息分片：读取器自报
+`resolve=0ms read=0-16ms summarize=0-16ms`，三个会话合计约 50ms。
+2000ms 间隔里绝大部分是白等，所以降到 800ms。
+
+## Evidence
+
+**读取器成本**（serve 模式，12 次轮询）：冷 5042ms → 稳态 150-207ms（median 168）。
+未加缓存前，每次有消息进来都会重新解密 session.db + contact.db + message 分片，单次轮询 3.4-4.7s。
+
+**发送阶梯**（`tmp/probe-send-steps.js`，会话已打开）：
+
+```
+open    route=already-open cost=none
+type    669 / 1038 / 1168 ms   landed=true
+send    860 / 1222 / 1386 ms
+total   1404 / 1842 / 2063 ms
+```
+
+**端到端，生产机器人，反复跑**（`scripts/wechat-db-ack-bench.js`：脚本往微信里打字 = 运营手打，
+然后读生产日志里机器人自己的两行数字）：
+
+| 配置 | 轮次 | Enter → 机器人看见 | Enter → 「处理中」确认 | 应用侧 sendMs |
+|---|---|---|---|---|
+| poll=2000ms | 5 | min 3763 / median 4872 / max 5264 ms | — | 2751-3050 ms |
+| poll=800ms | 6 | min 3569 / median 3865 / max 5002 ms | 见下 | 2799-3138 ms |
+
+（"Enter → 看见"包含写完 `处理中` 的时间：delivered 那行是在 handler 返回之后才打的。）
+
+**应用侧自报**（10 次以上，`/tmp/ack-bench.json`）：
+`inbound acknowledged … latencyMs=60-1163ms`、`sendMs=2799-3138ms`。
+`latencyMs` 用的是消息行自己的 `create_time`，而实测该时间戳比本机时钟**超前 1.9-3.7s**
+（`lagMs` 连续为负），所以它是乐观值；操作者真实等待以 bench 的本机时钟为准。
+
+## Alternatives considered
+
+1. **只凭 `latencyMs` 一个数字判断快慢。** 否决：它用消息行的 `create_time` 作起点，而那个时间戳比本机时钟超前 1.9-3.7s，会把 3.9s 的真实等待报成 281ms。必须同时有本机时钟的端到端数字。
+2. **把轮询间隔直接降到 200ms。** 否决：稳态单次轮询 150-200ms（含 RPC 与 JSON），200ms 间隔等于满负荷跑，而收益只是把白等再压 600ms；800ms 是"白等减半、CPU 仍空闲"的折中，实测中位数降到 3865ms 已经证明这一步有效。
+3. **把 `处理中` 改成不经校验的 fire-and-forget。** 否决：那正是"驱动说发了、其实没发"的老毛病（PostMessage 那条路就是这么骗人的）。宁可多等 860-1386ms 的校验，也不报一个没落地的确认。
+4. **为 ack 单独做一条"极简写侧"（只 type + return，不查会话不校验）。** 暂缓：可以省掉首次快照（约 300-700ms），但它绕过了现有的发送阶梯与回声账本，风险与收益不成比例；等写侧合并快照那次改造一起做。
+
+## Consequences
+
+- 「处理中」确实在发：bench 期间机器人打了 10+ 条 `inbound acknowledged`，链路是
+  落库 → 轮询 → 判据 → Cua 写入 → 预览校验。
+- 轮询间隔减半把"白等"从 0-2000ms 压到 0-800ms，端到端中位数 4872 → 3865ms。
+- **剩下的瓶颈是写入本身（约 3s）**：一个 `type_text` 加一个换行发送，各带一次微信无障碍树快照
+  （type 669-1168ms、send 860-1386ms）。要再快就得动写侧：合并快照、跳过校验、或缓存会话/输入框
+  元素句柄——那是 Cua 客户端那一层的改造，不是读侧能解决的。
+- 观测本身有代价：`CYBERBOSS_WECHAT_DB_TIMING=1` 每次轮询打三行，跑完基准就关掉了（默认不开）。
+- 一个仍然存在的语义问题：判据本意是"自己发的消息不ack"，但实测 operator 手打的消息**也会**收到
+  `处理中`（`prepared` 到判据那一步时 `direction/origin` 已不在）。这不影响用户诉求（手打本来就期望有回应），
+  但注释与行为不一致，记在这里以免下次误判。

@@ -608,7 +608,8 @@ class SnapshotReader:
     """One decrypted account, queried on demand. Safe to keep alive."""
 
     def __init__(self, account_dir: str, key: str, cache_dir: str = "", my_wxid: str = "",
-                 image_key: str = "", image_xor_key: int = -1, ffmpeg: str = ""):
+                 image_key: str = "", image_xor_key: int = -1, ffmpeg: str = "",
+                 chat_cache_sec: float = 600.0):
         self.account_dir = Path(account_dir)
         self.key = key
         self.cache_dir = cache_dir
@@ -617,6 +618,16 @@ class SnapshotReader:
         self._sessions: list[dict] = []
         self._sessions_at = 0.0
         self._failed = ""
+        # Resolving a chat (wxid + display name) needs session.db AND contact.db,
+        # and each of those is re-decrypted whenever WeChat touches it - which it
+        # does on every message, because the unread badge and the row summary
+        # change. Measured 2026-10-03: a poll that re-decrypted all three files
+        # cost 3-5s, which is what made "处理中" arrive seconds late. A chat's
+        # identity does not change between polls, so it is cached and the steady
+        # state only touches the message shard.
+        self._chat_cache: dict[str, tuple] = {}
+        self._chat_cache_sec = chat_cache_sec
+        self._timing = os.environ.get("CYBERBOSS_WECHAT_DB_TIMING") == "1"
         self.media = MediaResolver(
             self.account_dir,
             Path(cache_dir) if cache_dir else Path(tempfile_root()) / "cyberboss-wechat-db",
@@ -664,35 +675,66 @@ class SnapshotReader:
         return self._sessions
 
     def resolve_chat(self, want: str) -> dict:
-        """Accept a wxid or a display name and return the session row."""
+        """Accept a wxid or a display name and return `{username, display_name}`.
+
+        The answer is cached for `chat_cache_sec`: it costs session.db and
+        contact.db, both of which WeChat invalidates on every incoming message,
+        and neither of which changes the identity of a conversation.
+        """
         target = str(want or "").strip()
         if not target:
             raise ValueError("chat is required")
+        cached = self._chat_cache.get(target)
+        if cached and (time.monotonic() - cached[0]) < self._chat_cache_sec:
+            return cached[1]
         sessions = self.sessions()
+        found = None
         for row in sessions:
             if row.get("username") == target:
-                return row
-        lowered = target.lower()
-        for row in sessions:
-            names = [
-                row.get("display_name"), row.get("displayName"),
-                row.get("nickname"), row.get("displayname"),
-            ]
-            if any(str(name or "").strip().lower() == lowered for name in names):
-                return row
-        for row in sessions:
-            if str(row.get("summary") or "").strip() == target:
-                return row
-        raise ValueError(f"chat not found in this account: {target}")
+                found = row
+                break
+        if found is None:
+            lowered = target.lower()
+            for row in sessions:
+                names = [
+                    row.get("display_name"), row.get("displayName"),
+                    row.get("nickname"), row.get("displayname"),
+                ]
+                if any(str(name or "").strip().lower() == lowered for name in names):
+                    found = row
+                    break
+        if found is None:
+            for row in sessions:
+                # A "chat" the user typed as a display name that is also someone
+                # else's last message: only accept it if nothing better matched.
+                if str(row.get("summary") or "").strip() == target:
+                    found = row
+                    break
+        if found is None:
+            raise ValueError(f"chat not found in this account: {target}")
+        resolved = {
+            "username": str(found.get("username") or ""),
+            "display_name": str(found.get("display_name") or found.get("displayName") or ""),
+            "unread_count": int_value(found.get("unread_count")),
+        }
+        self._chat_cache[target] = (time.monotonic(), resolved)
+        self._chat_cache[resolved["username"]] = (time.monotonic(), resolved)
+        return resolved
 
     def snapshot(self, chat: str, limit: int) -> dict:
+        started = time.monotonic()
         self.open()
         session = self.resolve_chat(chat)
         talker = str(session.get("username") or "")
+        resolved_at = time.monotonic()
         rows = self._reader.get_messages(talker, limit=limit)
+        read_at = time.monotonic()
         messages = [summarize_message(row, self._my_wxid(), talker, self.media) for row in rows]
-        messages.sort(key=lambda item: (item["timestamp"], item["localId"], item["id"]))
-        display = str(session.get("display_name") or session.get("displayName") or "")
+        display = str(session.get("display_name") or "")
+        if self._timing:
+            log(f"snapshot {talker}: resolve={(resolved_at - started) * 1000:.0f}ms "
+                + f"read={(read_at - resolved_at) * 1000:.0f}ms "
+                + f"summarize={(time.monotonic() - read_at) * 1000:.0f}ms rows={len(rows)}")
         return {
             "chat": display or talker,
             "chatUsername": talker,

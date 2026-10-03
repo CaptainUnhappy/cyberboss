@@ -95,11 +95,17 @@ function createWeixinChannelAdapter(config, { weflowMessageLedger = null } = {})
       const chunkIdempotencyKey = idempotencyKey
         ? (sendChunks.length === 1 ? idempotencyKey : `${idempotencyKey}:chunk:${index + 1}`)
         : "";
-      if (provider === "wechat-cua") {
+      if (provider === "wechat-cua" || provider === "wechat-db") {
         // RDP-free path: Cua drives this session's WeChat client directly. It
         // returns the same vocabulary as the bridge (dispatched / verified /
         // localId), so the ledger and the stream layer below do not need to know
         // which driver answered.
+        //
+        // `wechat-db` is the database READER for the same client, and its replies
+        // still go out through Cua. Naming it here matters: an unrecognised
+        // provider falls through to the official iLink API and is addressed with a
+        // display name, which is how a complete CUA turn once went nowhere
+        // (measured 2026-10-01, `sendMessage ret=-3 errmsg=invalid arguments`).
         lastResult = await sendWeChatCuaText(config, {
           text: deliveryChunk,
           talker: weflowTalker || weflowContact || userId,
