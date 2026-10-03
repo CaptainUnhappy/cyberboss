@@ -91,6 +91,37 @@ function readConfig() {
     // poll costs one snapshot (~150ms over the MCP transport), so 1500ms is cheap.
     wechatCuaInboxPollMs: readIntEnv("CYBERBOSS_WECHAT_CUA_POLL_MS") || 1_500,
     wechatCuaAllowPeers: readTextEnv("CYBERBOSS_WECHAT_CUA_ALLOW_PEERS"),
+    // The database reader: the same conversation, read from the SQLCipher files
+    // instead of from pixels. Strictly more information (sender wxid, server id,
+    // full body, a direction that is read rather than inferred) and no foreground
+    // cost, so it supersedes the CUA *reader* while the CUA *writer* keeps sending.
+    // Opt-in: it needs the account's key, which only a memory read of the running
+    // WeChat can produce.
+    wechatDbInboxEnabled: mode === "start" && readBoolEnv("CYBERBOSS_ENABLE_WECHAT_DB_INBOX"),
+    wechatDbKey: readTextEnv("CYBERBOSS_WECHAT_DB_KEY"),
+    wechatDbDataDir: readTextEnv("CYBERBOSS_WECHAT_DB_DIR") || readTextEnv("WECHAT_DATA_DIR"),
+    wechatDbWxid: readTextEnv("CYBERBOSS_WECHAT_DB_WXID") || readTextEnv("WXID"),
+    wechatDbAccountDir: readTextEnv("CYBERBOSS_WECHAT_DB_ACCOUNT_DIR"),
+    wechatDbSelfWxid: readTextEnv("CYBERBOSS_WECHAT_DB_SELF_WXID"),
+    wechatDbCacheDir: readTextEnv("CYBERBOSS_WECHAT_DB_CACHE_DIR"),
+    wechatDbPythonCommand: readTextEnv("CYBERBOSS_WECHAT_DB_PYTHON") || "python",
+    // Which conversations to watch. Display names or wxids both work; the reader
+    // resolves either. Empty falls back to the WeFlow inbox scope, which the
+    // operator has already curated, rather than to "every conversation on the
+    // account" - a bot holding a real WeChat account must not start answering
+    // strangers because a variable was left unset.
+    wechatDbInboxChats: (readTextEnv("CYBERBOSS_WECHAT_DB_INBOX_CHATS")
+      || readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHATS")
+      || readTextEnv("CYBERBOSS_WEFLOW_INBOX_CHAT"))
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean),
+    wechatDbInboxPollMs: readIntEnv("CYBERBOSS_WECHAT_DB_POLL_MS") || 2_000,
+    wechatDbInboxHistoryLimit: readIntEnv("CYBERBOSS_WECHAT_DB_HISTORY_LIMIT") || 50,
+    wechatDbInboxReplayOnStart: readBoolEnv("CYBERBOSS_WECHAT_DB_REPLAY_ON_START"),
+    wechatDbInboxReplayLimit: readIntEnv("CYBERBOSS_WECHAT_DB_REPLAY_LIMIT") || 20,
+    wechatDbInboxCursorFile: path.join(stateDir, "wechat-db-inbox-cursor.json"),
+    wechatDbReaderScript: path.resolve(__dirname, "..", "..", "scripts", "wechat-db-inbox-read.py"),
     // Opt-in: never take the foreground, not even for the 150-300ms activation a
     // conversation switch costs. A reply whose conversation is not already open is
     // then deferred instead of being delivered now.

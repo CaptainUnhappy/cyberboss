@@ -184,6 +184,8 @@ class CyberbossApp {
     this.wechatCliInboxSource = null;
     this.weflowInboxSource = null;
     this.wechatCuaInboxSource = null;
+    this.wechatDbInboxSource = null;
+    this.wechatDbWorker = null;
     this.weflowCanaryInboxSource = null;
     this.voiceTranscriptionService = new VoiceTranscriptionService({ config });
     this.streamDelivery = new StreamDelivery({
@@ -347,6 +349,7 @@ class CyberbossApp {
       console.warn(`[cyberboss] voice transcription warmup failed: ${formatErrorMessage(error)}`);
     });
     await this.ensureWeFlowCanaryInboxStarted();
+    await this.ensureWechatDbInboxStarted();
     await this.ensureWeChatCuaInboxStarted();
     if (this.config.startWithRestartNotification) {
       void this.sendRestartNotification().catch((error) => {
@@ -361,6 +364,11 @@ class CyberbossApp {
       await this.closeWechatCliInbox();
       await this.closeWeFlowInbox();
       await this.closeWeFlowCanaryInbox();
+      // The CUA inbox polls a timer and the db inbox owns a Python child: both
+      // outlive a graceful stop unless they are closed here. The db one matters
+      // most - an orphaned reader keeps a decrypted snapshot on disk.
+      await this.closeWeChatCuaInbox();
+      await this.closeWechatDbInbox();
       await this.closeVoiceTranscription();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -421,6 +429,8 @@ class CyberbossApp {
       await this.closeWechatCliInbox();
       await this.closeWeFlowInbox();
       await this.closeWeFlowCanaryInbox();
+      await this.closeWeChatCuaInbox();
+      await this.closeWechatDbInbox();
       await this.closeVoiceTranscription();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -501,9 +511,92 @@ class CyberbossApp {
    * row, our own sends are separated only by the echo ledger, and a deep read
    * costs a foreground click.
    */
+  /**
+   * The database inbound source: read the account's own SQLCipher files.
+   *
+   * It supersedes the CUA *reader* when it is on - same conversations, but with
+   * the sender's wxid, the full body and a real direction, and without a
+   * foreground click - while the CUA *writer* still sends the replies. Running
+   * both readers at once would deliver every message twice under two different
+   * ids, so `ensureWeChatCuaInboxStarted` refuses to start the CUA one when this
+   * is enabled.
+   */
+  async ensureWechatDbInboxStarted() {
+    if (!this.config.wechatDbInboxEnabled || this.wechatDbInboxSource) {
+      return this.wechatDbInboxSource;
+    }
+    if (!this.config.wechatDbKey) {
+      console.error(
+        "[cyberboss] wechat-db inbox is enabled but CYBERBOSS_WECHAT_DB_KEY is empty; "
+        + "the database cannot be decrypted. See docs/wechat-db-inbox.md."
+      );
+      return null;
+    }
+    if (!this.config.wechatDbInboxChats.length) {
+      console.error(
+        "[cyberboss] wechat-db inbox is enabled but no chat is configured "
+        + "(CYBERBOSS_WECHAT_DB_INBOX_CHATS or CYBERBOSS_WEFLOW_INBOX_CHAT); not reading anyone."
+      );
+      return null;
+    }
+    const { WechatDbWorker } = require("../integrations/wechat-db/worker");
+    const { WechatDbInboxSource } = require("../integrations/wechat-db/inbox");
+    const { sharedLedger } = require("../integrations/wechat-cua/outbound");
+    this.wechatDbWorker = new WechatDbWorker({
+      pythonCommand: this.config.wechatDbPythonCommand,
+      scriptPath: this.config.wechatDbReaderScript,
+      env: {
+        CYBERBOSS_WECHAT_DB_KEY: this.config.wechatDbKey,
+        CYBERBOSS_WECHAT_DB_DIR: this.config.wechatDbDataDir,
+        CYBERBOSS_WECHAT_DB_WXID: this.config.wechatDbWxid,
+        CYBERBOSS_WECHAT_DB_ACCOUNT_DIR: this.config.wechatDbAccountDir,
+        CYBERBOSS_WECHAT_DB_SELF_WXID: this.config.wechatDbSelfWxid,
+        CYBERBOSS_WECHAT_DB_CACHE_DIR: this.config.wechatDbCacheDir,
+        CYBERBOSS_STATE_DIR: this.config.stateDir,
+      },
+    });
+    this.wechatDbInboxSource = new WechatDbInboxSource({
+      config: this.config,
+      worker: this.wechatDbWorker,
+      chats: this.config.wechatDbInboxChats,
+      // The same echo ledger the CUA writer records into: it is how an outgoing
+      // row we sent is told apart from the operator typing in the same account.
+      ledger: sharedLedger,
+      pollIntervalMs: this.config.wechatDbInboxPollMs,
+      historyLimit: this.config.wechatDbInboxHistoryLimit,
+      replayOnStart: this.config.wechatDbInboxReplayOnStart,
+      replayLimit: this.config.wechatDbInboxReplayLimit,
+      onMessage: (message, snapshot) => this.handleWeFlowInboxMessage(message, snapshot),
+    });
+    await this.wechatDbInboxSource.start();
+    return this.wechatDbInboxSource;
+  }
+
+  async closeWechatDbInbox() {
+    const source = this.wechatDbInboxSource;
+    const worker = this.wechatDbWorker;
+    this.wechatDbInboxSource = null;
+    this.wechatDbWorker = null;
+    if (source) {
+      await source.stop();
+    }
+    if (worker) {
+      await worker.stop().catch(() => {});
+    }
+    return source;
+  }
+
   async ensureWeChatCuaInboxStarted() {
     if (!this.config.wechatCuaInboxEnabled || this.wechatCuaInboxSource) {
       return this.wechatCuaInboxSource;
+    }
+    if (this.config.wechatDbInboxEnabled) {
+      // Two readers over the same conversations would deliver every message
+      // twice under different ids, and both would be answered.
+      console.log(
+        "[cyberboss] cua inbox skipped: the wechat-db inbox reads the same conversations with more detail"
+      );
+      return null;
     }
     const { WeChatCuaInboxSource, sharedLedger } = (() => {
       const inboxModule = require("../integrations/wechat-cua/inbox");
