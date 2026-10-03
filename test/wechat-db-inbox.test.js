@@ -379,6 +379,120 @@ test("an original needs no upgrade, and a cooldown stops repeats", async () => {
   assert.deepEqual(opened, [], "a full-size picture must not steal the foreground");
 });
 
+test("an upgrade attempt that does not improve says so instead of staying silent", async () => {
+  // The failure this guards: every counter said "upgraded" while the turn ran with
+  // a 180x102 preview, because "improved=0" went into a log line nobody read.
+  const preview = snapshot([message({
+    id: "pic",
+    kind: "image",
+    imageQuality: "thumbnail",
+    imageSize: "180x102",
+    imageSource: "abc_t.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\abc_thumb.jpg", origin: "direct" }],
+  })]);
+  const worker = { async snapshots() { return { chats: [preview], failures: [] }; } };
+  const warnings = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    imageUpgrade: () => true,
+    imageUpgradeWaitMs: 0,
+    imageUpgradeCooldownMs: 0,
+    onMessage: async () => true,
+    logger: { log() {}, warn: (line) => warnings.push(line), error() {}, debug() {} },
+  });
+  await source.upgradeThumbnailImages([preview]);
+  assert.equal(source.stats.imageUpgrades, 1);
+  assert.equal(source.stats.imageUpgraded, 0);
+  assert.equal(warnings.length, 1, "a stuck preview has to be visible in the log");
+  assert.match(warnings[0], /still a preview/);
+  assert.match(warnings[0], /180x102/, "and it has to say how small the picture is");
+});
+
+test("what the model actually got is counted per picture, with its size", async () => {
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    {
+      chats: [snapshot([
+        message({
+          id: "full",
+          kind: "image",
+          imageQuality: "original",
+          imageSize: "1280x1356",
+          imageSource: "abc_h.dat",
+          attachments: [{ kind: "image", path: "C:\\cache\\media\\abc.png", origin: "direct" }],
+        }),
+        message({
+          id: "small",
+          kind: "image",
+          imageQuality: "thumbnail",
+          imageSize: "171x180",
+          imageSource: "def_t.dat",
+          attachments: [{ kind: "image", path: "C:\\cache\\media\\def_thumb.jpg", origin: "direct" }],
+        }),
+        message({
+          id: "gone",
+          kind: "image",
+          imageQuality: "missing",
+          text: "[图片]（本地文件未取到：no readable image file on disk）",
+        }),
+      ])],
+      failures: [],
+    },
+  ]);
+  const delivered = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async (msg) => { delivered.push(msg); return true; },
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.equal(delivered.length, 3);
+  assert.equal(source.stats.imageOriginal, 1);
+  assert.equal(source.stats.imageThumbnail, 1);
+  assert.equal(source.stats.imageMissing, 1);
+  // ...and the envelope carries the facts into the turn, not just the log.
+  const full = delivered.find((item) => item.id === "full");
+  assert.equal(full.imageQuality, "original");
+  assert.equal(full.imageSize, "1280x1356");
+  assert.equal(full.imageSource, "abc_h.dat");
+  assert.equal(delivered.find((item) => item.id === "small").imageSize, "171x180");
+});
+
+test("a stale preview from the old reader (no size) still counts as a picture", async () => {
+  // Compatibility: an older reader reports imageQuality and nothing else. The
+  // counters must not read "unknown" as "the model got nothing".
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    {
+      chats: [snapshot([
+        message({ id: "old", kind: "image", imageQuality: "thumbnail", attachments: [
+          { kind: "image", path: "C:\\cache\\media\\old_thumb.jpg", origin: "direct" },
+        ] }),
+        message({ id: "older-still", kind: "image", attachments: [
+          { kind: "image", path: "C:\\cache\\media\\plain.jpg", origin: "direct" },
+        ] }),
+      ])],
+      failures: [],
+    },
+  ]);
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async () => true,
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.equal(source.stats.imageThumbnail, 1);
+  assert.equal(source.stats.imageMissing, 1, "no quality reported and no file read is still a picture we cannot see");
+});
+
 test("replayOnStart delivers the most recent incoming rows exactly once", async () => {
   const worker = fakeWorker([
     {

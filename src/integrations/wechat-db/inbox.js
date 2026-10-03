@@ -97,6 +97,15 @@ class WechatDbInboxSource {
       // original by opening the conversation once.
       imageUpgrades: 0,
       imageUpgraded: 0,
+      // What the model actually received, per picture. Measured 2026-10-03: the
+      // operator could not tell a 171x180 preview from a 1280x1356 original in
+      // the log, so "did the bot get the real picture?" was unanswerable without
+      // reading the disk by hand.
+      imageOriginal: 0,
+      imageFallback: 0,
+      imageThumbnail: 0,
+      imageMissing: 0,
+      lastImage: "",
     };
   }
 
@@ -214,11 +223,13 @@ class WechatDbInboxSource {
         const before = new Map((snapshot.messages || []).map((message) => [normalizeText(message?.id), message]));
         const after = new Map((refreshed.messages || []).map((message) => [normalizeText(message?.id), message]));
         let improved = 0;
+        const better = [];
         for (const [id, message] of before) {
           const next = after.get(id);
           if (next && normalizeText(next.imageQuality) === "original"
             && normalizeText(message.imageQuality) !== "original") {
             improved += 1;
+            better.push(`${message.imageSize || "?"}->${next.imageSize || "?"}`);
           }
         }
         upgraded[index] = {
@@ -241,7 +252,24 @@ class WechatDbInboxSource {
         this.logger.log?.(
           `[cyberboss] wechat-db image upgrade chat=${peer} improved=${improved} `
           + `waitedMs=${this.imageUpgradeWaitMs}`
+          + (better.length ? ` size=${better.join(",")}` : "")
         );
+        if (!improved) {
+          // Report the state the turn will actually run with. Silence here is how
+          // a preview reaches the model while every counter says "upgraded".
+          const stuck = (upgraded[index].messages || []).filter(
+            (message) => normalizeText(message?.imageQuality) === "thumbnail"
+          );
+          if (stuck.length) {
+            const first = stuck[0];
+            this.logger.warn?.(
+              `[cyberboss] wechat-db image upgrade chat=${peer} still a preview after `
+              + `${this.imageUpgradeWaitMs}ms: ${stuck.length} picture(s) `
+              + `size=${normalizeText(first.imageSize) || "unknown"} `
+              + `source=${normalizeText(first.imageSource) || "unknown"}; the client has nothing better on disk`
+            );
+          }
+        }
       } catch (error) {
         this.logger.warn?.(`[cyberboss] wechat-db image upgrade failed chat=${peer}: ${error.message}`);
       }
@@ -331,6 +359,7 @@ class WechatDbInboxSource {
           }
           processed += 1;
           this.stats.delivered += 1;
+          this.noteImage(message, peer);
           this.logger.log?.(
             `[cyberboss] wechat-db inbox delivered talker=${talker} localId=${message.localId} `
             + `direction=${message.direction} lagMs=${lagMs} pollMs=${this.pollIntervalMs}`
@@ -353,7 +382,9 @@ class WechatDbInboxSource {
         `[cyberboss] wechat-db inbox stats polls=${this.stats.polls} delivered=${this.stats.delivered} `
         + `suppressed=${this.stats.suppressed} deferred=${this.stats.deferred} errors=${this.stats.errors} `
         + `lastPollMs=${this.stats.lastPollMs} lastLagMs=${this.stats.lastLagMs} maxLagMs=${this.stats.maxLagMs} `
-        + `imageUpgrades=${this.stats.imageUpgrades} imageUpgraded=${this.stats.imageUpgraded}`
+        + `imageUpgrades=${this.stats.imageUpgrades} imageUpgraded=${this.stats.imageUpgraded} `
+        + `imageOriginal=${this.stats.imageOriginal} imageFallback=${this.stats.imageFallback} `
+        + `imageThumbnail=${this.stats.imageThumbnail} imageMissing=${this.stats.imageMissing}`
       );
     }
     return {
@@ -364,8 +395,7 @@ class WechatDbInboxSource {
   }
 
   /** Is this outgoing row something this bot sent (rather than the operator)? */
-  isOwnEcho(peer, text) {
-    if (!this.ledger || typeof this.ledger.matches !== "function") {
+  isOwnEcho(peer, text) {    if (!this.ledger || typeof this.ledger.matches !== "function") {
       return false;
     }
     try {
@@ -373,6 +403,42 @@ class WechatDbInboxSource {
     } catch (error) {
       this.logger.warn?.(`[cyberboss] wechat-db echo check failed: ${error.message}`);
       return false;
+    }
+  }
+
+  /**
+   * Record what a delivered picture actually is, and say it in the log.
+   *
+   * The operator's complaint was "the bot did not get the original picture", and
+   * for a whole day the log could not confirm or deny it: a delivered image was
+   * one word (`kind=image`) whether the file was 171x180 or 1280x1356. These four
+   * counters are what make the next question answerable from the log alone.
+   */
+  noteImage(message, peer) {
+    if (normalizeText(message?.kind) !== "image") {
+      return;
+    }
+    const quality = normalizeText(message.imageQuality) || "missing";
+    const size = normalizeText(message.imageSize) || "unknown";
+    const source = normalizeText(message.imageSource) || "unknown";
+    if (quality === "original") {
+      this.stats.imageOriginal += 1;
+    } else if (quality === "thumbnail") {
+      this.stats.imageThumbnail += 1;
+    } else if (quality === "missing") {
+      this.stats.imageMissing += 1;
+    } else {
+      this.stats.imageFallback += 1;
+    }
+    this.stats.lastImage = `${quality} ${size} ${source}`;
+    const line = `[cyberboss] wechat-db inbox image chat=${peer} quality=${quality} `
+      + `size=${size} source=${source}`;
+    // A picture the model will see as a preview (or not at all) is a defect the
+    // operator has to be able to find; a full-size one is routine.
+    if (quality === "original" || quality === "fallback") {
+      this.logger.log?.(line);
+    } else {
+      this.logger.warn?.(line);
     }
   }
 
@@ -439,6 +505,12 @@ function buildEnvelope(message, { peer, talker }) {
     receivedAt: message.receivedAt,
     quotedContexts: message.quotedContexts,
     attachments: message.attachments,
+    // Which file the picture came from, and how big it is. Carried into the turn
+    // so a reply that says "this is 171x180" is checkable against the row that
+    // produced it.
+    imageQuality: message.imageQuality,
+    imageSize: message.imageSize,
+    imageSource: message.imageSource,
     attachmentFailures: [],
     source: "wechat-db",
     confidence: "db-row",
@@ -483,9 +555,14 @@ function normalizeSnapshotMessage(value) {
     senderId: normalizeText(value.senderId),
     isGroup: Boolean(value.isGroup),
     quotedContexts: Array.isArray(value.quotedContexts) ? value.quotedContexts : [],
-    // `original` / `thumbnail` / `missing`: whether the picture on disk is the
-    // real one. The source opens the conversation once when it is only a preview.
+    // `original` / `thumbnail` / `fallback` / `missing`: whether the picture on
+    // disk is the real one. The source opens the conversation once when it is only
+    // a preview.
     imageQuality: normalizeText(value.imageQuality),
+    // Which file that was and how many pixels it has, on the message: the pair
+    // that turns "the bot got a picture" into "the bot got the 1280x1356 one".
+    imageSize: normalizeText(value.imageSize),
+    imageSource: normalizeText(value.imageSource),
     // Media the reader already put on disk (a decrypted image, say). The app's
     // attachment persistence takes it from here; dropping it would turn every
     // picture back into the "[图片]" the operator complained about.

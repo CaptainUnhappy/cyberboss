@@ -74,20 +74,35 @@ python scripts/wechat-db-inbox-read.py --chat 柳毓琳 --limit 5
 
 # the whole chain as the app builds it (config -> worker -> reader -> source)
 node scripts/wechat-db-read-probe.js
+
+# what the reader puts on disk for every picture in the watched chats
+node scripts/wechat-db-image-report.js
 ```
 
 Startup lines to look for:
 
 ```
-[cyberboss] wechat-db inbox enabled chats=[...] pollMs=2000 limit=50 replayOnStart=false
+[cyberboss] wechat-db inbox enabled chats=[...] pollMs=800 limit=50 replayOnStart=false
 [cyberboss] wechat-db reader: [wechat-db] opened D:\xwechat_files\wxid_..._f2b4 (cache ...)
-[cyberboss] wechat-db inbox stats polls=30 delivered=1 suppressed=2 deferred=0 errors=0 lastPollMs=37
+[cyberboss] wechat-db inbox stats polls=30 delivered=1 suppressed=2 deferred=0 errors=0 lastPollMs=37 ... imageOriginal=6 imageThumbnail=0
 [cyberboss] cua inbox skipped: the wechat-db inbox reads the same conversations with more detail
 ```
 
 `suppressed` counts outgoing rows this bot sent (they are in the CUA echo
 ledger). An outgoing row the ledger does **not** know is the operator typing in
 the same account: it is delivered as `self_manual` and answered.
+
+## Image probes
+
+| script | what it answers |
+| --- | --- |
+| `scripts/wechat-db-image-report.js` | for every picture in the watched chats: quality, pixels, which variant won, plus the reader's own media counters |
+| `scripts/wechat-db-image-arrival-probe.js <png>` | sends a real picture through the clipboard and watches, per 2s, which `<md5>*_?.dat` files the client writes and when |
+| `scripts/wechat-db-image-redownload-probe.js <talker> <md5> [--open]` | hides a picture's original and watches whether the client ever brings it back (it does not - see above); `--restore` puts the files back |
+| `scripts/wechat-db-image-upgrade-poll-probe.js <talker> [localId] [--hide-original]` | the whole production poll with one picture reported as a preview: opens the chat through Cua, waits, re-reads, prints the envelope and the counters |
+
+All of them are read-mostly: the only writes are to `tmp/`, and the two that
+touch the account directory tell you how to undo it.
 
 ## Images
 
@@ -106,13 +121,21 @@ this machine on 2026-10-03:
    attachment, which persists it into `<state>/inbox/<date>/` and attaches it to
    the turn.
 
-### The original is often not on disk yet
+### The original is not always on disk yet
 
-WeChat writes `<md5>_t.dat` (the preview) the moment a picture arrives and the
-full `<md5>.dat` **only when the conversation is rendered**: measured
-2026-10-03, a picture's original appeared 22 seconds after the message, exactly
-when the bot opened the chat to reply. Reading pixels cannot fetch what the client
-has not downloaded, so two things happen, in this order:
+Two measurements, and they disagree - so both are written down rather than one
+being called "the" behaviour:
+
+- 2026-10-03, a peer's picture in this account: `<md5>_t.dat` (the preview) was
+  stored on arrival and the full picture only appeared **22 seconds later**,
+  exactly when the bot opened the chat to reply.
+- 2026-10-03, a controlled send (`scripts/wechat-db-image-arrival-probe.js`, a
+  real picture through the clipboard, filesystem polled every 2s): `.dat`,
+  `_h.dat` and `_t.dat` all landed within **2 seconds** of the send, i.e. there
+  was no preview-only window to observe at all.
+
+What is certain either way: reading pixels cannot fetch what the client has not
+downloaded. So two things happen, in this order:
 
 1. the reader waits a bounded moment for the original
    (`CYBERBOSS_WECHAT_DB_IMAGE_WAIT_MS`, default 8s, one budget per snapshot);
@@ -120,8 +143,20 @@ has not downloaded, so two things happen, in this order:
    conversation through Cua** (a single foreground click, once per chat per 30s
    cooldown), waits `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE_WAIT_MS` (default 2.5s) and
    reads the database again. If the original arrived, the turn gets it; if not,
-   the preview is kept and the message text says it is one.
+   the preview is kept, the message text says it is one, and the log says why:
+
+   ```
+   [cyberboss] wechat-db image upgrade chat=Azzy improved=1 waitedMs=2500 size=180x102->800x300
+   [cyberboss] wechat-db image upgrade chat=Azzy still a preview after 2500ms: 1 picture(s) size=180x102 source=abc_t.dat; the client has nothing better on disk
+   ```
+
    Switch it off with `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE=false`.
+
+**Opening the chat is not a re-download button.** Measured 2026-10-03
+(`scripts/wechat-db-image-redownload-probe.js`): after moving a picture's
+`<md5>.dat` away and opening the conversation through Cua, the file did **not**
+come back within 2 minutes. The upgrade path can therefore rescue a picture the
+client is still fetching, but it cannot bring back one the client no longer has.
 
 Fetching the original straight from WeChat's CDN does **not** work: the locator in
 the message body (`cdnthumburl`, the same on all three sizes here) answers
@@ -148,11 +183,46 @@ tie. `wxgf` payloads are decoded with ffmpeg (`-f hevc`, after cutting to the
 first NAL start code). Thumbnails only win when nothing else exists, and the
 published cache name then carries `_thumb` so the fact survives.
 
+A blank `wxgf` frame is a real case, not a hypothetical: a sender's cut-off upload
+leaves a `<md5>.dat` that decrypts fine and whose only frame is an empty canvas
+(`4b4cad98…` on this machine, 42KB). Measuring that as "area 0" is what makes the
+`_h` frame next to it win - otherwise a broken original would beat a perfectly
+good 1280x1355 picture.
+
+The published file under `<cache>/media/` is only reused while the variant it came
+from still exists **and** is not newer than it. Both halves matter: comparing
+timestamps alone let a published original outlive the file it came from, and the
+reader then kept answering `original` for a picture whose original was gone
+(2026-10-03).
+
+Every decoded picture is also reported on the message itself - `imageQuality`
+(`original` / `fallback` / `thumbnail` / `missing`), `imageSize` (`1280x1356`) and
+`imageSource` (which `.dat` won) - and the inbox counts them:
+
+```
+[cyberboss] wechat-db inbox image chat=Azzy quality=original size=1280x1356 source=abc_h.dat
+[cyberboss] wechat-db inbox stats polls=30 … imageUpgrades=1 imageUpgraded=1 imageOriginal=6 imageFallback=0 imageThumbnail=0 imageMissing=0
+```
+
+`quality=thumbnail` and `quality=missing` are logged at warn level on purpose:
+those are the two cases where the model did not get the picture, and "did the bot
+get the original?" has to be answerable from the log alone.
+
 | setting | meaning |
 | --- | --- |
 | `CYBERBOSS_WECHAT_DB_IMAGE_KEY` | pin the AES key instead of deriving it (`CYBERBOSS_WECHAT_CLI_IMAGE_AES_KEY` is also honoured) |
 | `CYBERBOSS_WECHAT_DB_IMAGE_XOR_KEY` | pin the XOR byte (`CYBERBOSS_WECHAT_CLI_IMAGE_XOR_KEY` is also honoured) |
+| `CYBERBOSS_WECHAT_DB_IMAGE_WAIT_MS` | how long one snapshot waits for an original that has not landed (default 8000) |
 | `CYBERBOSS_WECHAT_DB_FFMPEG` | ffmpeg path; default is whatever `ffmpeg` resolves to on `PATH` |
+
+### Test hooks
+
+Both are for probes only; neither is set in production.
+
+| hook | what it does |
+| --- | --- |
+| `--force-thumbnail-md5 <md5>` / `CYBERBOSS_WECHAT_DB_FORCE_THUMBNAIL_MD5` | report that one picture as a preview even though its original is on disk. The genuine state cannot be produced from this machine (only the peer's device can), so the upgrade path would otherwise never be exercised end to end. The reader says `FORCED thumbnail mode for …` on stderr when it is set |
+| `python scripts/wechat-db-inbox-read.py --serve` + `{"cmd":"stats"}` | what the reader did with every picture it touched: `resolved`, `thumbnailOnly`, `blankFrames`, `missing`, `keyFailures`, `waitedMs`, and the last decision |
 
 Voice, video and file attachments are **not** resolved yet: they arrive as their
 placeholders (`[语音]`, `[视频]`, `[文件]`).

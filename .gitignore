@@ -30,3 +30,9 @@ wechat-login-qr.*
 wechatpad-root.html
 tmp/
 .env.bak-*
+
+# A literal `~` directory in the repo root: an unexpanded home path someone
+# created by accident (2026-07-03). It holds a copy of the operator's home
+# directory - NTUSER.DAT, .ssh, .claude.json - and `git add -A` would otherwise
+# stage all of it. The directory itself is the operator's to delete, not ours.
+~/

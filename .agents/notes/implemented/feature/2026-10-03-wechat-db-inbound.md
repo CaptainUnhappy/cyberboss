@@ -147,7 +147,50 @@ node --test test/wechat-db-worker.test.js  # 11：帧/关联/超时杀进程/崩
   `wechat-db image upgrade chat=柳毓琳 improved=1 waitedMs=2500` → 质量回到 `original`，
   `upgrades=1 upgraded=1`。
 - 仍未覆盖：**对端真发一张图**（只有对方设备能造出"原图尚未下载"的初始状态），
-  这条留给用户发一张图后看日志确认。
+  这条留给用户发一张图后看日志确认。**2026-10-03 的下一步工作补齐了这条的一半**（见 §10）：
+  真实发送与真实读取器都跑通了，唯一没法自造的是"对端设备"这一个前提。
+
+### 10. 原图流程收尾：看得见、判得对、验证得到（第三轮）
+
+用户要求"继续实现原始图片获取流程并端到端验证"。做完这件事冒出来的**三个真实缺陷**：
+
+1. **读侧把"哪张图、多大、来自哪个变体"丢掉了。** `MediaResolver.last_quality` 是解析器上的
+   一个字段，`summarize_message` 在每次 `resolve_image()` 之后读它——一张快照里有第二张图时，
+   第二张的 `thumbnail` 就会盖住第一张的 `original`。Node 侧据此判断"有没有变好"，于是
+   `imageUpgraded` 会数出假提升。现在 `resolve_image()` 把
+   `quality / width / height / source` 记进 `self.resolution`，**由调用它的那条消息当场取走**，
+   并随消息上报 `imageQuality` / `imageSize` / `imageSource`。
+2. **缓存里的成品会活得比它的来源长。** `<cache>/media/<md5>.png` 只要比"现存变体的最新
+   mtime"新就会被直接复用；而"来源文件被删掉"时，"最新 mtime"会退化成剩下的那个 `_t.dat`
+   或 0，于是**一张已经不在磁盘上的原图继续被报成 `original`**。实测把 4b4cad98 的 `.dat`
+   挪走后，读侧仍然回答 `original`（图片报告里表现为 `original` + "本地文件未取到"）。
+   现在复用的前提是"它声称的那个变体仍然存在"：`md5.png` 要求 `""`/`_h` 在，`md5_thumb.jpg`
+   只要求 `_t` 在。
+3. **"原图没拿到"在生产里看不出来。** 交付一张 171x180 和一张 1280x1356，日志里都是
+   `kind=image`。现在每条图片消息一行
+   `wechat-db inbox image chat=… quality=… size=… source=…`（`thumbnail`/`missing` 走 warn），
+   统计行追加 `imageOriginal/imageFallback/imageThumbnail/imageMissing`。
+
+**验证过程中被推翻的两条旧说法**（写下来，因为它们决定了这条路还能不能走）：
+
+- **"打开会话就会把原图拉下来"只在"客户端正在下载"时成立。** 实测
+  （`scripts/wechat-db-image-redownload-probe.js`）：把某张图的 `<md5>.dat` 挪走，
+  再用 Cua 打开那个会话，**2 分钟内原文件没有回来**。所以 image upgrade 能救"客户端还在拉"的图，
+  救不了"客户端已经没有"的图。
+- **"缩略图先到、原图 22 秒后才到"不是唯一形态。** 用真实剪贴板发一张真图
+  （`scripts/wechat-db-image-arrival-probe.js`，每 2s 看一次磁盘）：`.dat` / `_h.dat` / `_t.dat`
+  **全部在发送后 2 秒内落地**，根本没有"只有预览"的窗口。同一台机器上，对端那两条消息的原图
+  也都比缩略图早（19:50:42 对次日 14:18）。因此这条路主路径上是顺的，`_t` 只在少数情况下胜出。
+
+**顺带暴露的一件事**：这台客户端上 `<md5>.dat`（wxgf/HEVC 原件）**经常解出空白帧**——4b4cad98、
+32e9b7e4、c6188ec0 三条真实消息都是如此，真正能看的是旁边的 `_h`。这正好是"按像素面积选"
+存在的理由：把空白帧算成面积 0，`_h` 就赢了（实测
+`quality=fallback size=1600x1000 source=c6188ec0…_h.dat`）；否则一条坏原件会盖掉一张好图。
+
+验证（全部走真实读取器 + 真实客户端，见 [入站延迟实测](../testing/2026-10-03-inbound-ack-latency-measured.md)
+的"原图"一节）：图片报告 6/6 张图报出真实像素（1280x1356 / 1600x1000 / 1260x2800 / 1920x1080 …）；
+强制预览 → 打开会话 → 重读 = `improved=1 waitedMs=2500 size=180x102->800x300`；生产重启后
+真实发送立刻打出 `wechat-db inbox image chat=文件传输助手 quality=fallback size=1600x1000`。
 
 ## Alternatives considered
 
@@ -165,5 +208,8 @@ node --test test/wechat-db-worker.test.js  # 11：帧/关联/超时杀进程/崩
 - 代价三：读的是**别人的客户端落盘的数据**，只能在"这台机器 + 已登录账号"范围内工作；换机器要重来。
 - 代价四：**语音 / 视频 / 文件**仍未解析（图片已解析，见 §8），这几种目前仍是 `[语音]` 这类占位。
 - 代价五：图片解析依赖 `uin` 推导密钥，ffmpeg 只在 `wxgf` 原件时才需要；两条都可被 `CYBERBOSS_WECHAT_DB_IMAGE_KEY` / `CYBERBOSS_WECHAT_DB_FFMPEG` 覆盖。
+- 代价六（§10 之后的已知缺口）：**"交付时还只有预览"没有补救路径**。消息一旦投递就被记入 seen 集合，
+  原图在 10 秒之后才落地的话，那一轮就永远是预览——只能靠用户重发一次。要补就得让"迟到升级"
+  去发一条独立消息（缓存里有图，但没有"只发一张图"的出站原语），这属于下一轮，不在本轮范围。
 - 副作用（正）：`filehelper`（文件传输助手）也被读，于是"同号手打 → 机器人回答"这条自检路径不再依赖截图方向判断。
 - 运维：两个 Cyberboss 共用同一账号时必须各给一个 `CYBERBOSS_WECHAT_DB_CACHE_DIR`，否则明文快照互相覆盖（Windows `WinError 5`）。

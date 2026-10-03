@@ -268,11 +268,6 @@ def _image_size(data: bytes) -> tuple:
     return 0, 0
 
 
-def _image_area(data: bytes) -> int:
-    width, height = _image_size(data)
-    return width * height
-
-
 def _is_blank_png(path: Path, min_bytes_per_pixel: float = 0.01) -> bool:
     """Is this PNG an (almost) uniform canvas?
 
@@ -315,7 +310,7 @@ class MediaResolver:
     """Turn an image row's md5 into a file a model can actually look at."""
 
     def __init__(self, account_dir: Path, cache_dir: Path, aes_key: str = "", xor_key: int = -1,
-                 ffmpeg: str = ""):
+                 ffmpeg: str = "", force_thumbnail_md5: str = ""):
         self.account_dir = Path(account_dir)
         self.cache_dir = Path(cache_dir) / "media"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -323,6 +318,15 @@ class MediaResolver:
         self.ffmpeg = ffmpeg or os.environ.get("CYBERBOSS_WECHAT_DB_FFMPEG", "") or shutil.which("ffmpeg") or ""
         self._keys = None
         self._timing = os.environ.get("CYBERBOSS_WECHAT_DB_TIMING") == "1"
+        # Test hook: report ONE picture as a preview even though its original is on
+        # disk. The genuine state - a peer's picture whose original WeChat has not
+        # downloaded yet - cannot be produced on this machine (only the peer's
+        # device can), so a probe has to force the condition to exercise the
+        # upgrade path end to end. Never set in production; the reader says so on
+        # stderr when it is set.
+        self.force_thumbnail_md5 = (force_thumbnail_md5 or "").strip().lower()
+        if self.force_thumbnail_md5:
+            log(f"FORCED thumbnail mode for {self.force_thumbnail_md5} (test hook, not production)")
         # How long to wait for an original that WeChat has not downloaded yet.
         # Measured 2026-10-03: WeChat writes `<md5>_t.dat` (the thumbnail) the
         # moment the message arrives and the original `<md5>.dat` **22 seconds
@@ -335,9 +339,17 @@ class MediaResolver:
             self.image_wait_ms = 8000
         self._wait_budget_ms = 0
         self._in_snapshot = False
-        self.last_quality = ""
         self.stats = {"resolved": 0, "missing": 0, "keyFailures": 0, "ffmpeg": 0, "thumbnailOnly": 0,
-                      "waitedMs": 0, "lastReason": "", "lastChosen": ""}
+                      "blankFrames": 0, "noSource": 0, "waitedMs": 0, "lastReason": "", "lastChosen": ""}
+        # Facts about what was chosen for one picture, so `summarize_message` can
+        # report them on the MESSAGE. A single `last_quality` field on the resolver
+        # was a bug waiting to happen: the moment a snapshot holds two pictures the
+        # second one's quality is what the first one reports, and "which picture
+        # did the operator actually get" is the one question this file exists to
+        # answer (measured 2026-10-03: imageUpgraded counted improvements that were
+        # really the neighbouring picture's).
+        self.last_source = ""      # "4b4cad98..._h.dat" or "(cache)"
+        self.resolution: dict = {}
 
     def start_snapshot_budget(self) -> None:
         """Reset the per-snapshot wait budget: a snapshot waits at most this long
@@ -433,7 +445,11 @@ class MediaResolver:
         `wxgf` container), blank frames are dropped, and the one with the largest
         area wins - with the original preferred on a tie. Thumbnails only win when
         nothing else exists, which is the case that made this necessary.
+
+        What was chosen is recorded in `self.resolution` (quality / pixels / which
+        variant), for the MESSAGE that asked - see the note in `__init__`.
         """
+        self.resolution = {}
         if not md5 or len(md5) != 32:
             self.stats["missing"] += 1
             self.stats["lastReason"] = "the row carries no image id"
@@ -451,20 +467,28 @@ class MediaResolver:
         # A previously chosen winner is reused as long as it is newer than every
         # source file: a two-second poll must not re-decode (or re-run ffmpeg on)
         # the same picture forever.
-        chosen = self._cached_winner(md5, folder, months)
-        if chosen:
-            # `_cached_winner` already decided original-vs-thumbnail from the name.
-            return str(chosen), ""
+        cached = self._cached_winner(md5, folder, months)
+        if cached is not None:
+            quality, source, published, width, height = cached
+            self.stats["resolved"] += 1
+            self.stats["lastReason"] = ""
+            self._record(published, quality, source, width, height)
+            return str(published), ""
 
         # Wait - within this snapshot's budget - for an original that has not
         # landed yet, instead of shipping the thumbnail the next poll would see.
+        # Measured 2026-10-03 with a real send: the client writes `<md5>_t.dat`,
+        # `<md5>_h.dat` and `<md5>.dat` within ~2 seconds, so this wait normally
+        # costs nothing; it exists for the case where it does not.
         budget_ms = self._wait_budget_ms if self._in_snapshot else max(0, self.image_wait_ms)
         deadline = time.monotonic() + (budget_ms / 1000.0)
+        chosen = None
+        tried = {}
         while True:
-            best, saw_wxgf = self._pick_variant(md5, folder, months)
-            if best is not None and (best[1] < 2 or time.monotonic() >= deadline):
+            chosen, tried = self._pick_variant(md5, folder, months)
+            if chosen and (chosen["rank"] < 2 or time.monotonic() >= deadline):
                 break
-            if best is None and time.monotonic() >= deadline:
+            if not chosen and time.monotonic() >= deadline:
                 break
             spent = 500
             budget_ms = max(0, budget_ms - spent)
@@ -474,78 +498,160 @@ class MediaResolver:
             time.sleep(spent / 1000.0)
             deadline = min(deadline, time.monotonic() + (budget_ms / 1000.0))
 
-        if best is None:
+        if not chosen:
             self.stats["missing"] += 1
-            self.last_quality = ""
-            if saw_wxgf:
-                self.stats["lastReason"] = "the image is a wxgf (HEVC) container and ffmpeg could not decode it"
+            if tried.get("blank"):
+                self.stats["blankFrames"] += 1
+                self.stats["lastReason"] = (
+                    "the only copy on disk is a HEVC stream that decodes to an empty canvas "
+                    "(a cut-off upload); opening the conversation does not bring it back "
+                    "- measured 2026-10-03"
+                )
+            elif tried.get("unreadable"):
+                self.stats["noSource"] += 1
+                self.stats["lastReason"] = (
+                    f"{tried['unreadable']} is not an image format this reader can weigh"
+                )
             else:
                 self.stats["lastReason"] = self.stats["lastReason"] or "no readable image file on disk"
+            self._record(None, "missing", "", 0, 0)
             return "", self.stats["lastReason"]
 
-        area, rank, winner = best
         # Publish under a suffix-free name so the next poll finds it without
         # re-deciding. A thumbnail is published with `_thumb` in the name, because
         # "we only have the thumbnail" has to survive the cache and reach the
         # message text (otherwise a low-resolution picture is passed off as the
         # picture, which is precisely what the operator complained about).
-        stem = f"{md5}_thumb" if rank == 2 else md5
-        published = self.cache_dir / f"{stem}{winner.suffix}"
-        if winner != published:
-            published.write_bytes(winner.read_bytes())
-        self.last_quality = "original" if rank == 0 else ("thumbnail" if rank == 2 else "fallback")
-        if rank == 2:
-            self.stats["thumbnailOnly"] += 1
+        stem = f"{md5}_thumb" if chosen["rank"] == 2 else md5
+        published = self.cache_dir / f"{stem}{chosen['suffix']}{chosen['extension']}"
+        raw = chosen["decoded"]
+        if not published.is_file() or published.stat().st_size != len(raw):
+            published.write_bytes(raw)
         self.stats["resolved"] += 1
         self.stats["lastReason"] = ""
-        self.stats["lastChosen"] = (
-            f"{winner.name} {winner.stat().st_size}B "
-            f"{'x'.join(str(part) for part in _image_size(winner.read_bytes()))} ({self.last_quality})"
-        )
+        quality = "original" if chosen["rank"] == 0 else ("thumbnail" if chosen["rank"] == 2 else "fallback")
+        if self.force_thumbnail_md5 and md5.lower() == self.force_thumbnail_md5:
+            # Test hook: same file, reported as a preview so the Node side runs its
+            # upgrade path (open the chat, wait, re-read) against a live client.
+            quality = "thumbnail"
+        if chosen["rank"] == 2:
+            self.stats["thumbnailOnly"] += 1
+        width, height = _image_size(raw)
+        self._record(published, quality, chosen["source"], width, height)
         if self._timing:
             log(f"image {md5[:8]} chose {self.stats['lastChosen']}")
         return str(published), ""
 
-    def _pick_variant(self, md5: str, folder: Path, months: list):
-        """Best (area, rank, path) among the variants on disk right now."""
-        best = None
-        saw_wxgf = False
-        for rank, suffix in enumerate(("", "_h", "_t")):
-            for month in months:
-                candidate = folder / month / "Img" / f"{md5}{suffix}.dat"
-                if not candidate.is_file():
-                    continue
-                decoded, extension = self._decode_variant(candidate, md5, suffix)
-                if not decoded:
-                    continue
-                if extension == ".hevc":
-                    saw_wxgf = True
-                    continue
-                area = _image_area(decoded) or len(decoded)
-                if best is None or area > best[0]:
-                    out = self.cache_dir / f"{md5}{suffix}{extension}"
-                    out.write_bytes(decoded)
-                    best = (area, rank, out)
-                break
-        return best, saw_wxgf
+    def _record(self, path, quality: str, source: str, width: int, height: int) -> None:
+        """One place that writes `self.resolution` - a second writer is how the
+        cached branch lost its path and reported a picture it had just handed over
+        as "no local file" (found 2026-10-03 by the image report)."""
+        self.last_source = source
+        self.resolution = {
+            "path": str(path) if path else "",
+            "quality": quality,
+            "source": source,
+            "width": width,
+            "height": height,
+        }
+        size = f"{width}x{height}" if width and height else "unknown"
+        self.stats["lastChosen"] = f"{source or '(none)'} {size} ({quality})"
 
-    def _cached_winner(self, md5: str, folder: Path, months: list) -> Path | None:
-        """An earlier winner, still newer than every `<md5>*` source file."""
-        newest_source = 0.0
+    def _pick_variant(self, md5: str, folder: Path, months: list):
+        """Best variant among the ones on disk right now -> (best, notes).
+
+        `rank` is the suffix that won (0 = the original, 2 = the `_t` preview) and
+        `source` names the file it came from, because "which file was this
+        actually?" is the question that took a day to answer on 2026-10-03.
+
+        Every month folder is weighed, not just the first one that has a file: a
+        picture can be re-sent and land in a second month folder, and the older
+        copy must not win by being found first.
+
+        An undecodable original is the interesting case: when the sender's upload
+        is cut off, `<md5>.dat` exists but holds a truncated HEVC stream whose
+        first frame ffmpeg renders as an empty canvas. That is worse than the
+        `_h` frame next to it, so a blank result must lose on pixels - otherwise
+        a broken original would beat a perfectly good 1280x1355 image.
+        """
+        candidates = []
+        notes = {}
+        for suffix, candidate in self._variant_files(md5, folder, months).items():
+            decoded, extension = self._decode_variant(candidate, md5, suffix)
+            if not decoded:
+                notes["blank" if extension == ".hevc" else "failed"] = candidate.name
+                continue
+            width, height = _image_size(decoded)
+            area = width * height if width and height else 0
+            if not area:
+                # An image format `_image_size` cannot read (a HEIC, say). It
+                # still beats nothing, but it must never outrank a real
+                # picture, so it is not even a candidate.
+                notes["unreadable"] = candidate.name
+                continue
+            candidates.append({
+                "area": area,
+                "rank": ("", "_h", "_t").index(suffix),
+                "suffix": suffix,
+                "extension": extension,
+                "decoded": decoded,
+                "source": candidate.name,
+                "width": width,
+                "height": height,
+            })
+        if not candidates:
+            return None, notes
+        # Largest area wins; on a tie the original (`""`, then `_h`) is preferred,
+        # which is what `rank` orders.
+        candidates.sort(key=lambda item: (-item["area"], item["rank"]))
+        return candidates[0], notes
+
+    def _variant_files(self, md5: str, folder: Path, months: list) -> dict:
+        """Every `<md5>*_?.dat` on disk right now, keyed by suffix ("" / "_h" / "_t")."""
+        found = {}
         for suffix in ("", "_h", "_t"):
             for month in months:
                 candidate = folder / month / "Img" / f"{md5}{suffix}.dat"
                 if candidate.is_file():
-                    newest_source = max(newest_source, candidate.stat().st_mtime)
+                    found[suffix] = candidate
+                    break
+        return found
+
+    def _cached_winner(self, md5: str, folder: Path, months: list):
+        """An earlier winner -> (quality, source, path, width, height), if current.
+
+        "Current" is stricter than "newer than every source file": the source the
+        answer came from must still exist. Comparing mtimes alone was wrong in a
+        way that mattered on 2026-10-03 - the published copy is written into this
+        cache, so once the client's own file went away the cache kept answering
+        "original" from a picture whose source was gone, and the reader never got
+        as far as noticing that only the preview was left. A picture that is no
+        longer on disk must be re-decided, not remembered.
+        """
+        sources = self._variant_files(md5, folder, months)
+        if not sources:
+            return None
+        newest_source = max(candidate.stat().st_mtime for candidate in sources.values())
         for stem in (md5, f"{md5}_thumb"):
+            # What the name promises has to be there: an `md5.png` claims the
+            # original, so `""`/`_h` must exist; an `md5_thumb.jpg` claims the
+            # preview, which is `_t` alone.
+            needed = ("_t",) if stem.endswith("_thumb") else ("", "_h")
+            if not any(suffix in sources for suffix in needed):
+                continue
             for extension in (".png", ".jpg", ".gif", ".webp", ".bmp"):
                 published = self.cache_dir / f"{stem}{extension}"
                 if published.is_file() and published.stat().st_mtime >= newest_source:
-                    # Only two answers reach the caller: the picture, or a preview
-                    # of it. "cached" as a third value made the Node side treat a
-                    # perfectly good original as "not an improvement".
-                    self.last_quality = "thumbnail" if stem.endswith("_thumb") else "original"
-                    return published
+                    quality = "thumbnail" if stem.endswith("_thumb") else "original"
+                    if self.force_thumbnail_md5 and md5.lower() == self.force_thumbnail_md5:
+                        quality = "thumbnail"
+                    # Measure what is actually on disk rather than trusting the
+                    # name: the published file is the only thing the model sees.
+                    try:
+                        width, height = _image_size(published.read_bytes())
+                    except OSError:
+                        width, height = 0, 0
+                    return quality, f"(cache) {published.name}", published, width, height
         return None
 
     def _decode_variant(self, candidate: Path, md5: str, suffix: str):
@@ -565,11 +671,16 @@ class MediaResolver:
             self.stats["lastReason"] = "no image key decrypted this file"
             return b"", ""
         if extension != ".hevc":
+            # `self.resolution` is deliberately NOT touched here: this is the
+            # per-variant cache, not a decision about which variant won.
             (self.cache_dir / f"{md5}{suffix}{extension}").write_bytes(decoded)
             return decoded, extension
+        # A wxgf (HEVC) container. Returning the payload together with the
+        # `.hevc` marker is what lets the caller tell "this picture is a blank
+        # frame, try the `_h` next to it" apart from "nothing decrypted at all".
         converted = self._convert_wxgf(decoded, md5, suffix)
         if not converted:
-            return b"", ""
+            return b"", ".hevc"
         self.stats["ffmpeg"] += 1
         return Path(converted).read_bytes(), ".png"
 
@@ -671,7 +782,11 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
         match = re.search(rb"[0-9a-fA-F]{32}", packed)
         md5 = match.group(0).decode("ascii").lower() if match else ""
         path, reason = media.resolve_image(md5, talker, create_time)
-        quality = media.last_quality if path else "missing"
+        # The facts belong to THIS picture: `media.resolution` is set by the call
+        # above, so a snapshot holding several pictures cannot report one of them
+        # under another's quality.
+        facts = dict(media.resolution or {})
+        quality = str(facts.get("quality") or ("missing" if not path else "fallback"))
         if path:
             attachments.append({
                 "kind": "image",
@@ -680,11 +795,12 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
                 "origin": "direct",
                 "attachmentRef": f"direct-{local_id}-1",
             })
+            width = int(facts.get("width") or 0)
+            height = int(facts.get("height") or 0)
             if quality == "thumbnail":
                 # Say it out loud: a 94x210 thumbnail passed off as "the picture"
                 # made the operator ask why the bot could not read the original
                 # (measured 2026-10-03). WeChat had simply not downloaded it yet.
-                width, height = _image_size(Path(path).read_bytes())
                 text = f"{PLACEHOLDER.get(kind, '[图片]')}（微信只下载了缩略图 {width}x{height}，原图尚未到达）"
             else:
                 text = ""
@@ -722,11 +838,18 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
         "quotedContexts": quoted,
         "attachments": attachments,
         # `original` when the picture itself was decoded, `thumbnail` when only
-        # WeChat's preview exists on disk (the client downloads the original only
-        # once the conversation is opened), `missing` when neither is readable.
-        # The Node side uses this to decide whether it is worth opening the chat
-        # once so the original lands, then re-reading.
+        # WeChat's preview exists on disk, `fallback` when the `_h` frame (or a
+        # decodable non-original variant) is what the model will see, `missing`
+        # when nothing readable is on disk. The Node side uses this to decide
+        # whether it is worth opening the chat once so the original lands, then
+        # re-reading.
         "imageQuality": quality if kind == "image" else "",
+        # WHICH file and HOW BIG, on the message: without these two the operator
+        # sees a picture and cannot tell 171x180 from 1280x1356 (measured
+        # 2026-10-03: "好像没有正常获取原始图片" took a day to answer).
+        "imageSize": f"{int(facts.get('width') or 0)}x{int(facts.get('height') or 0)}"
+        if kind == "image" and path else "",
+        "imageSource": str(facts.get("source") or "") if kind == "image" else "",
         # Extra fields the CLI contract never had; a database row knows them.
         "talker": talker,
         "senderId": sender,
@@ -740,7 +863,7 @@ class SnapshotReader:
 
     def __init__(self, account_dir: str, key: str, cache_dir: str = "", my_wxid: str = "",
                  image_key: str = "", image_xor_key: int = -1, ffmpeg: str = "",
-                 chat_cache_sec: float = 600.0):
+                 chat_cache_sec: float = 600.0, force_thumbnail_md5: str = ""):
         self.account_dir = Path(account_dir)
         self.key = key
         self.cache_dir = cache_dir
@@ -765,6 +888,7 @@ class SnapshotReader:
             aes_key=image_key,
             xor_key=image_xor_key,
             ffmpeg=ffmpeg,
+            force_thumbnail_md5=force_thumbnail_md5,
         )
 
     # ── lifecycle ───────────────────────────────────────────────────
@@ -999,6 +1123,7 @@ def build_reader(args) -> SnapshotReader:
         image_key=image_key,
         image_xor_key=image_xor,
         ffmpeg=args.ffmpeg or "",
+        force_thumbnail_md5=args.force_thumbnail_md5 or os.environ.get("CYBERBOSS_WECHAT_DB_FORCE_THUMBNAIL_MD5", ""),
     )
 
 
@@ -1017,6 +1142,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--image-key", default="")
     parser.add_argument("--image-xor-key", type=int, default=None)
     parser.add_argument("--ffmpeg", default="")
+    parser.add_argument("--force-thumbnail-md5", default="")
     return parser.parse_args(argv)
 
 
@@ -1046,6 +1172,13 @@ def serve(reader: SnapshotReader) -> int:
                     }
                     for row in reader.sessions(max_age=0)
                 ]}
+            elif command == "stats":
+                # What the reader did with every picture it touched. Without this
+                # the only way to answer "did the bot get the ORIGINAL?" is to
+                # read the disk by hand, which is how a thumbnail passed for an
+                # original for a whole day (2026-10-03).
+                payload = {"ok": True, "media": dict(reader.media.stats),
+                           "imageWaitMs": reader.media.image_wait_ms}
             elif command == "snapshot":
                 limit = max(1, min(500, int_value(request.get("limit"), 50)))
                 payload = {"ok": True, "snapshot": reader.snapshot(str(request.get("chat") or ""), limit)}
