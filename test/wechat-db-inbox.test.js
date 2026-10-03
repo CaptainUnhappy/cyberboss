@@ -264,6 +264,36 @@ test("a dead reader is reported as an error, never as a quiet chat", async () =>
   assert.equal(source.describe().stats.errors, 1);
 });
 
+test("an image the reader decrypted travels with the message, not as [图片]", async () => {
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    {
+      chats: [snapshot([
+        message({ id: "pic", kind: "image", text: "", attachments: [
+          { kind: "image", path: "C:\\cache\\media\\abc.jpg", origin: "direct", attachmentRef: "direct-7-1" },
+        ] }),
+      ])],
+      failures: [],
+    },
+  ]);
+  const delivered = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async (msg) => { delivered.push(msg); return true; },
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.equal(delivered.length, 1);
+  assert.equal(delivered[0].kind, "image");
+  assert.equal(delivered[0].attachments.length, 1, "a dropped attachment is a picture the bot never sees");
+  assert.equal(delivered[0].attachments[0].path, "C:\\cache\\media\\abc.jpg");
+  assert.equal(delivered[0].attachments[0].fileName, "abc.jpg");
+  assert.equal(delivered[0].attachments[0].kind, "image");
+});
+
 test("replayOnStart delivers the most recent incoming rows exactly once", async () => {
   const worker = fakeWorker([
     {

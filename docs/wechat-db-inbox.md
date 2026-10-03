@@ -89,6 +89,40 @@ Startup lines to look for:
 ledger). An outgoing row the ledger does **not** know is the operator typing in
 the same account: it is delivered as `self_manual` and answered.
 
+## Images
+
+Images are delivered as real files, not as `[图片]`. The chain, all measured on
+this machine on 2026-10-03:
+
+1. the row's `packed_info_data` carries the image md5;
+2. the file lives at `<account>/msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5><suffix>.dat`;
+3. the `.dat` is WeChat's V2 container:
+   `[07 08 'V2' 08 07][aes_size][xor_size][pad][AES-128-ECB][raw][XOR tail]`;
+4. the AES key is **derived, not scanned**:
+   `aes_key = md5(f"{uin}{wxid_base}")[:16]`, `xor_key = uin & 0xFF`, with `uin`
+   read from the filenames in `%APPDATA%\Tencent\xwechat\net\kvcomm`;
+5. the decoded file is written under `<cache>/media/` and handed to the app as an
+   attachment, which persists it into `<state>/inbox/<date>/` and attaches it to
+   the turn.
+
+Suffix handling is the part that bites. `_t` is the **thumbnail** (measured
+180x102 for a 720x240 original) and the bare name is sometimes a `wxgf` container
+(WeChat's HEVC wrapper) whose first frame can be a **blank canvas**. So every
+suffix is decoded, a directly-readable image always beats a container, `_h` is
+preferred over the bare name, and a converted frame that is nearly uniform
+(<0.01 bytes per pixel) is rejected. `wxgf` payloads are decoded with ffmpeg
+(`-f hevc`, after cutting to the first NAL start code); without ffmpeg such a
+message falls back to whichever suffix holds a plain image.
+
+| setting | meaning |
+| --- | --- |
+| `CYBERBOSS_WECHAT_DB_IMAGE_KEY` | pin the AES key instead of deriving it (`CYBERBOSS_WECHAT_CLI_IMAGE_AES_KEY` is also honoured) |
+| `CYBERBOSS_WECHAT_DB_IMAGE_XOR_KEY` | pin the XOR byte (`CYBERBOSS_WECHAT_CLI_IMAGE_XOR_KEY` is also honoured) |
+| `CYBERBOSS_WECHAT_DB_FFMPEG` | ffmpeg path; default is whatever `ffmpeg` resolves to on `PATH` |
+
+Voice, video and file attachments are **not** resolved yet: they arrive as their
+placeholders (`[语音]`, `[视频]`, `[文件]`).
+
 ## Failure modes
 
 | symptom | cause | what happens |

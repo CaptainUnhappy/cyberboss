@@ -58,6 +58,24 @@ src/integrations/wechat-db/inbox.js   轮询、基线、去重、交给 app
 
 本机同时存在 `wxid_ty69l7hjiqt012_f2b4`（Ally，Cua 通道登录的号）和 `wxid_s3178hwvzsl922_9e02`（Azzy 自己的客户端）。按目录名取第一个会拿到**密钥打不开的那个账号**，报出来的却像"密钥错了"。因此未指定 `CYBERBOSS_WECHAT_DB_WXID` 时逐个账号用首页 HMAC 试开。
 
+### 8. 图片要真的取到，而不是 `[图片]`
+
+用户的原始抱怨是「图没收到 我这边只有『图片』两个字」——读库如果还是给占位符，等于没修。实测（2026-10-03）这条链路是通的：
+
+1. 行的 `packed_info_data` 里有图片 md5；
+2. 文件在 `<账号>/msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5><后缀>.dat`；
+3. `.dat` 是 V2 容器：`[07 08 V2 08 07][aes_size][xor_size][pad][AES-128-ECB][raw][XOR 尾巴]`；
+4. **AES 密钥是推导出来的，不用扫内存**：`aes_key = md5(f"{uin}{wxid_base}")[:16]`、`xor_key = uin & 0xFF`，`uin` 从 `%APPDATA%\Tencent\xwechat\net\kvcomm` 的文件名里读；
+5. 解出来的图写进 `<cache>/media/`，交给 app 落进 `<state>/inbox/<日期>/` 并挂到本轮对话上。
+
+踩到的坑（都写进代码注释了）：
+
+- **后缀顺序反直觉**：`_t` 是缩略图（实测 720×240 的图只有 180×102），裸名有时是 `wxgf`（微信的 HEVC 容器），而 `wxgf` 解出来的第一帧可能是**空白画布**。所以现在逐个后缀解密：能直接读的图优先，`_h` 优先于裸名，转出来的帧若接近纯色（<0.01 字节/像素）就丢掉换下一个。
+- **ffmpeg 要吃解码后的载荷**，不是 `.dat` 文件本身：喂 `.dat` 会报 `could not find codec parameters`；正确做法是切到第一个 NAL 起始码，再 `-f hevc`。
+- AES 段必须**按 PKCS7 去掉填充**（`plain[:aes_size]`），否则文件尾部多 16 字节。
+
+实测结果：用户发的 800×300 测试图落盘为 `..._h.png` 800×300（修好之前落的是 180×102 缩略图）；一张 1280×1355 的截图从 HEVC 原件解出 690KB 的 PNG。语音/视频/文件仍未解析，仍是占位符。
+
 ## Evidence
 
 单元（21 项，全绿）：
@@ -107,6 +125,7 @@ node --test test/wechat-db-worker.test.js  # 11：帧/关联/超时杀进程/崩
 - 代价一：**多了一个运行时依赖**——Python 3.9+ 与 `pycryptodome`、`zstandard`。缺依赖时轮询会明确报错，不会静默。
 - 代价二：**密钥是运营负担**。账号重新登录后密钥轮换，需要重新提取并更新 `.env`；期间通道会持续报 `KeyMismatchError`。
 - 代价三：读的是**别人的客户端落盘的数据**，只能在"这台机器 + 已登录账号"范围内工作；换机器要重来。
-- 代价四：媒体（图片/语音/文件）**暂未解析**，目前只给出 `[图片]` 这类占位（与 Cua 读源同等能力）。落盘路径解析、`voice_decode` 是下一步可做的增量。
+- 代价四：**语音 / 视频 / 文件**仍未解析（图片已解析，见 §8），这几种目前仍是 `[语音]` 这类占位。
+- 代价五：图片解析依赖 `uin` 推导密钥，ffmpeg 只在 `wxgf` 原件时才需要；两条都可被 `CYBERBOSS_WECHAT_DB_IMAGE_KEY` / `CYBERBOSS_WECHAT_DB_FFMPEG` 覆盖。
 - 副作用（正）：`filehelper`（文件传输助手）也被读，于是"同号手打 → 机器人回答"这条自检路径不再依赖截图方向判断。
 - 运维：两个 Cyberboss 共用同一账号时必须各给一个 `CYBERBOSS_WECHAT_DB_CACHE_DIR`，否则明文快照互相覆盖（Windows `WinError 5`）。

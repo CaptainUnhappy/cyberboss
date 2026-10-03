@@ -37,6 +37,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -185,7 +187,317 @@ def strip_group_prefix(content: str) -> str:
     return re.sub(r"^[A-Za-z0-9_@.\-]+:\n?", "", content, count=1)
 
 
-def summarize_message(row: dict, my_wxid: str, talker: str) -> dict:
+# ── images ──────────────────────────────────────────────────────────────
+#
+# WeChat 4.x keeps chat images as `<md5>.dat` under
+# `msg/attach/<md5(talker)>/<YYYY-MM>/Img/`, encrypted with the same V2 scheme
+# the cache files use:
+#
+#   [6B 07 08 'V2' 08 07] [4B aes_size LE] [4B xor_size LE] [1B pad]
+#   [PKCS7-aligned AES-128-ECB block] [raw] [xor_size bytes XORed with uin & 0xFF]
+#
+# and the AES key is DERIVED, not scanned:
+#
+#   aes_key = md5(f"{uin}{wxid_base}")[:16]      uin from the filenames in
+#   xor_key = uin & 0xFF                         %APPDATA%\Tencent\xwechat\net\kvcomm
+#
+# Verified on this machine 2026-10-03: a real message's `_t` file decrypts to a
+# 1280x1355 JPEG. The full-size file can be a `wxgf` container (WeChat's HEVC
+# wrapper) instead, which only ffmpeg can turn into a picture, so the suffixes
+# are tried in order and the first one a model can actually read wins.
+
+V2_MAGIC = b"\x07\x08V2\x08\x07"
+V1_MAGIC = b"\x07\x08V1\x08\x07"
+V1_AES_KEY = "cfcd208495d565ef"  # md5("0")[:16], the fixed V1 key
+
+IMAGE_MAGIC = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF8", ".gif"),
+    (b"RIFF", ".webp"),
+    (b"BM", ".bmp"),
+    (b"wxgf", ".hevc"),
+)
+
+IMAGE_TAIL = {
+    ".jpg": b"\xff\xd9",
+    ".png": b"IEND\xaeB\x60\x82",
+    ".gif": b"\x3b",
+}
+
+
+def _image_extension(header: bytes) -> str:
+    for magic, extension in IMAGE_MAGIC:
+        if header.startswith(magic):
+            return extension
+    return ""
+
+
+def _infer_xor_key(tail: bytes, extension: str):
+    """Recover the XOR byte from the file's own end marker."""
+    marker = IMAGE_TAIL.get(extension)
+    if not marker or len(tail) < len(marker):
+        return None
+    chunk = tail[-len(marker):]
+    key = chunk[0] ^ marker[0]
+    if all((chunk[index] ^ key) == marker[index] for index in range(len(marker))):
+        return key
+    return None
+
+
+def _looks_complete(decoded: bytes, extension: str) -> bool:
+    """Soft check: is the format's end marker somewhere in the last stretch?"""
+    marker = IMAGE_TAIL.get(extension)
+    if not marker:
+        return True
+    return marker in decoded[-64:]
+
+
+def _is_blank_png(path: Path, min_bytes_per_pixel: float = 0.01) -> bool:
+    """Is this PNG an (almost) uniform canvas?
+
+    Measured 2026-10-03: a wxgf original decoded to a 1280x1356 PNG of 4526
+    bytes - 0.0026 bytes per pixel, i.e. an empty frame. Real pictures of any
+    content land far above 1%.
+    """
+    try:
+        data = path.read_bytes()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return False
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        pixels = width * height
+        if pixels <= 0:
+            return False
+        return (len(data) / pixels) < min_bytes_per_pixel
+    except OSError:
+        return False
+
+
+def derive_image_keys(account_name: str) -> list:
+    """Candidate (aes_key, xor_key) pairs for this account."""
+    wxid_base = account_name.rsplit("_", 1)[0] if account_name.count("_") > 1 else account_name
+    uins = []
+    kvcomm = Path(os.environ.get("APPDATA", "")) / "Tencent" / "xwechat" / "net" / "kvcomm"
+    if kvcomm.is_dir():
+        for entry in kvcomm.iterdir():
+            for pattern in (r"key_0_(\d{9,11})_", r"key_(\d{9,11})_\d+_", r"monitordata_(\d{9,11})_"):
+                match = re.search(pattern, entry.name)
+                if match:
+                    uins.append(int(match.group(1)))
+    return [
+        (hashlib.md5(f"{uin}{wxid_base}".encode("utf-8")).hexdigest()[:16], uin & 0xFF)
+        for uin in dict.fromkeys(uins)
+    ]
+
+
+class MediaResolver:
+    """Turn an image row's md5 into a file a model can actually look at."""
+
+    def __init__(self, account_dir: Path, cache_dir: Path, aes_key: str = "", xor_key: int = -1,
+                 ffmpeg: str = ""):
+        self.account_dir = Path(account_dir)
+        self.cache_dir = Path(cache_dir) / "media"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.extra_key = (aes_key.strip(), xor_key) if aes_key.strip() else None
+        self.ffmpeg = ffmpeg or os.environ.get("CYBERBOSS_WECHAT_DB_FFMPEG", "") or shutil.which("ffmpeg") or ""
+        self._keys = None
+        self.stats = {"resolved": 0, "missing": 0, "keyFailures": 0, "ffmpeg": 0, "lastReason": ""}
+
+    def keys(self):
+        if self._keys is None:
+            candidates = []
+            if self.extra_key:
+                candidates.append(self.extra_key)
+            candidates.extend(derive_image_keys(self.account_dir.name))
+            self._keys = candidates
+        return self._keys
+
+    def decode_dat(self, data: bytes):
+        """Decrypt a `.dat` payload -> (bytes, extension), or (b"", "") when it cannot."""
+        if data[:6] == V1_MAGIC:
+            keys = [(V1_AES_KEY, -1)]
+        elif data[:6] == V2_MAGIC:
+            keys = self.keys()
+        else:
+            extension = _image_extension(data)
+            return (data, extension) if extension else (b"", "")
+        if not keys:
+            return b"", ""
+
+        aes_size = int.from_bytes(data[6:10], "little")
+        xor_size = int.from_bytes(data[10:14], "little")
+        # PKCS7 always pads, even a block-aligned payload, so the AES section is
+        # aes_size rounded up plus one full block; `aes_size` itself is the real
+        # plaintext length.
+        aligned = aes_size + (16 - aes_size % 16 if aes_size % 16 else 16)
+        aes_start = 15
+        body_start = aes_start + aligned
+        tail_start = len(data) - xor_size
+        if aes_size <= 0 or xor_size < 0 or tail_start < body_start:
+            return b"", ""
+
+        ciphertext = data[aes_start:body_start]
+        raw = data[body_start:tail_start]      # unencrypted middle section
+        tail = data[tail_start:]               # XOR-encrypted end
+        for aes_key, xor_key in keys:
+            try:
+                from Crypto.Cipher import AES
+
+                plain = AES.new(aes_key.encode("ascii"), AES.MODE_ECB).decrypt(ciphertext)
+            except Exception as error:  # noqa: BLE001
+                log(f"image key {aes_key} unusable: {error}")
+                continue
+            plain = plain[:aes_size]
+            extension = _image_extension(plain)
+            if not extension:
+                continue
+            attempts = []
+            if xor_key >= 0:
+                attempts.append(xor_key)
+            inferred = _infer_xor_key(tail, extension)
+            if inferred is not None and inferred not in attempts:
+                attempts.append(inferred)
+            attempts.append(0x88)  # the long-standing default
+            fallback = b""
+            for key in attempts:
+                decoded = plain + raw + bytes(byte ^ key for byte in tail)
+                if not fallback:
+                    fallback = decoded
+                if _looks_complete(decoded, extension):
+                    return decoded, extension
+            # The AES header proves the key; WeChat sometimes ends a payload
+            # without the format's final marker, so a missing one is not a
+            # reason to throw away a picture that decodes fine.
+            return fallback, extension
+        return b"", ""
+
+    def resolve_image(self, md5: str, talker: str, create_time: int):
+        """Locate, decrypt and cache one image -> (path, failure reason).
+
+        Suffix order matters and is NOT the order it looks like: `_t` is the
+        thumbnail (measured 2026-10-03: 180x102 for a 720x240 original), so the
+        full-size file is tried first and the thumbnail is the last resort. The
+        full-size file is sometimes a `wxgf` container instead of a picture,
+        which is what ffmpeg is for.
+        """
+        if not md5 or len(md5) != 32:
+            self.stats["missing"] += 1
+            self.stats["lastReason"] = "the row carries no image id"
+            return "", self.stats["lastReason"]
+        folder = self.account_dir / "msg" / "attach" / hashlib.md5(talker.encode("utf-8")).hexdigest()
+        if not folder.is_dir():
+            self.stats["missing"] += 1
+            self.stats["lastReason"] = "no media folder for this chat"
+            return "", self.stats["lastReason"]
+        months = []
+        if create_time:
+            months.append(datetime.fromtimestamp(create_time).strftime("%Y-%m"))
+        months.extend(entry.name for entry in folder.iterdir() if entry.is_dir() and entry.name not in months)
+        # `_h` first, then the bare name, then the thumbnail. Measured 2026-10-03:
+        # for one message `_h` was the 690KB full picture while the bare name was
+        # a wxgf container whose HEVC frame decodes to a blank 1280x1356 canvas;
+        # for another the bare name was the good one. So every suffix is decoded,
+        # a real image always beats a container, and a blank frame is rejected.
+        decoded_by_suffix = {}
+        saw_wxgf = False
+        for suffix in ("_h", "", "_t"):
+            for month in months:
+                candidate = folder / month / "Img" / f"{md5}{suffix}.dat"
+                if not candidate.is_file():
+                    continue
+                # Reuse an earlier decode of this exact file, so a two-second
+                # poll does not re-decrypt (and re-run ffmpeg on) every picture
+                # in the window over and over.
+                for extension in (".png", ".jpg", ".gif", ".webp", ".bmp"):
+                    cached = self.cache_dir / f"{md5}{suffix}{extension}"
+                    if cached.is_file() and cached.stat().st_mtime >= candidate.stat().st_mtime:
+                        return str(cached), ""
+                try:
+                    data = candidate.read_bytes()
+                except OSError as error:
+                    log(f"image {candidate.name} unreadable: {error}")
+                    continue
+                decoded, extension = self.decode_dat(data)
+                if not decoded:
+                    self.stats["keyFailures"] += 1
+                    self.stats["lastReason"] = "no image key decrypted this file"
+                    continue
+                decoded_by_suffix[suffix] = (decoded, extension)
+                saw_wxgf = saw_wxgf or extension == ".hevc"
+                break
+
+        for suffix in ("_h", "", "_t"):
+            entry = decoded_by_suffix.get(suffix)
+            if not entry or entry[1] == ".hevc":
+                continue
+            decoded, extension = entry
+            out = self.cache_dir / f"{md5}{suffix}{extension}"
+            out.write_bytes(decoded)
+            self.stats["resolved"] += 1
+            self.stats["lastReason"] = ""
+            return str(out), ""
+
+        for suffix in ("_h", "", "_t"):
+            entry = decoded_by_suffix.get(suffix)
+            if not entry or entry[1] != ".hevc":
+                continue
+            converted = self._convert_wxgf(entry[0], md5, suffix)
+            if converted:
+                self.stats["resolved"] += 1
+                self.stats["ffmpeg"] += 1
+                self.stats["lastReason"] = ""
+                return converted, ""
+
+        self.stats["missing"] += 1
+        if saw_wxgf:
+            self.stats["lastReason"] = "the image is a wxgf (HEVC) container and ffmpeg could not decode it"
+        else:
+            self.stats["lastReason"] = self.stats["lastReason"] or "no readable image file on disk"
+        return "", self.stats["lastReason"]
+
+    def _convert_wxgf(self, payload: bytes, md5: str, suffix: str) -> str:
+        """Decode a wxgf (HEVC) payload with ffmpeg.
+
+        The payload is not a file ffmpeg recognises: it is a WeChat header plus a
+        raw HEVC stream (the first NAL start code sits ~33 bytes in). Feeding the
+        `.dat` itself to ffmpeg fails with "could not find codec parameters" -
+        measured 2026-10-03.
+        """
+        if not self.ffmpeg:
+            return ""
+        body = payload
+        for marker in (b"\x00\x00\x00\x01", b"\x00\x00\x01"):
+            index = body.find(marker)
+            if index > 0:
+                body = body[index:]
+                break
+        source = self.cache_dir / f"{md5}{suffix}.hevc"
+        out = self.cache_dir / f"{md5}{suffix}.png"
+        try:
+            source.write_bytes(body)
+            result = subprocess.run(
+                [self.ffmpeg, "-y", "-loglevel", "error", "-f", "hevc", "-i", str(source),
+                 "-frames:v", "1", str(out)],
+                capture_output=True,
+                timeout=60,
+            )
+            if result.returncode == 0 and out.is_file() and out.stat().st_size > 0:
+                if _is_blank_png(out):
+                    # A HEVC stream whose first frame is an empty canvas: worse
+                    # than the thumbnail, so let the caller try the next suffix.
+                    log(f"ffmpeg decoded {source.name} to a blank frame; trying another suffix")
+                    out.unlink(missing_ok=True)
+                    return ""
+                return str(out)
+            log(f"ffmpeg could not decode {source.name}: "
+                + result.stderr.decode("utf-8", "replace")[:160])
+        except Exception as error:  # noqa: BLE001
+            log(f"ffmpeg failed for {source.name}: {error}")
+        return ""
+
+
+def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolver | None" = None) -> dict:
     """One database row -> the snapshot message Cyberboss consumes."""
     local_id = int_value(row.get("local_id"))
     local_type = int_value(row.get("local_type"))
@@ -227,11 +539,34 @@ def summarize_message(row: dict, my_wxid: str, talker: str) -> dict:
     elif base_type == 10000:
         text = clean(raw, MAX_TEXT, keep_newlines=True)
     elif base_type in {3, 34, 43, 47, 50}:
-        # No media resolution yet: the row names the kind, and the placeholder
-        # keeps the turn honest instead of silently empty.
+        # The row names the kind. For an image we then try to put a real file on
+        # disk, because "[图片]" is exactly the answer the operator complained
+        # about: measured 2026-10-02, the bot told the user it "only got the two
+        # characters 图片" while the picture sat decryptable on the same machine.
         text = PLACEHOLDER.get(kind, "")
     else:
         text = clean(raw, MAX_TEXT, keep_newlines=True) or PLACEHOLDER.get(kind, "")
+
+    attachments = []
+    if kind == "image" and media is not None:
+        packed_hex = str(row.get("packed_info_data") or "")
+        packed = bytes.fromhex(packed_hex) if packed_hex else b""
+        match = re.search(rb"[0-9a-fA-F]{32}", packed)
+        md5 = match.group(0).decode("ascii").lower() if match else ""
+        path, reason = media.resolve_image(md5, talker, create_time)
+        if path:
+            attachments.append({
+                "kind": "image",
+                "path": path,
+                "fileName": os.path.basename(path),
+                "origin": "direct",
+                "attachmentRef": f"direct-{local_id}-1",
+            })
+            text = ""
+        else:
+            # Say WHY, in the message itself: an operator who sees only "[图片]"
+            # cannot tell "the peer sent nothing" from "we lost it".
+            text = f"{PLACEHOLDER.get(kind, '[图片]')}（本地文件未取到：{reason}）"
 
     sender = str(row.get("sender_username") or "")
     is_group = talker.endswith("@chatroom")
@@ -260,7 +595,7 @@ def summarize_message(row: dict, my_wxid: str, talker: str) -> dict:
         "text": text,
         "url": url,
         "quotedContexts": quoted,
-        "attachments": [],
+        "attachments": attachments,
         # Extra fields the CLI contract never had; a database row knows them.
         "talker": talker,
         "senderId": sender,
@@ -272,7 +607,8 @@ def summarize_message(row: dict, my_wxid: str, talker: str) -> dict:
 class SnapshotReader:
     """One decrypted account, queried on demand. Safe to keep alive."""
 
-    def __init__(self, account_dir: str, key: str, cache_dir: str = "", my_wxid: str = ""):
+    def __init__(self, account_dir: str, key: str, cache_dir: str = "", my_wxid: str = "",
+                 image_key: str = "", image_xor_key: int = -1, ffmpeg: str = ""):
         self.account_dir = Path(account_dir)
         self.key = key
         self.cache_dir = cache_dir
@@ -281,6 +617,13 @@ class SnapshotReader:
         self._sessions: list[dict] = []
         self._sessions_at = 0.0
         self._failed = ""
+        self.media = MediaResolver(
+            self.account_dir,
+            Path(cache_dir) if cache_dir else Path(tempfile_root()) / "cyberboss-wechat-db",
+            aes_key=image_key,
+            xor_key=image_xor_key,
+            ffmpeg=ffmpeg,
+        )
 
     # ── lifecycle ───────────────────────────────────────────────────
 
@@ -347,7 +690,7 @@ class SnapshotReader:
         session = self.resolve_chat(chat)
         talker = str(session.get("username") or "")
         rows = self._reader.get_messages(talker, limit=limit)
-        messages = [summarize_message(row, self._my_wxid(), talker) for row in rows]
+        messages = [summarize_message(row, self._my_wxid(), talker, self.media) for row in rows]
         messages.sort(key=lambda item: (item["timestamp"], item["localId"], item["id"]))
         display = str(session.get("display_name") or session.get("displayName") or "")
         return {
@@ -456,7 +799,25 @@ def build_reader(args) -> SnapshotReader:
     account_dir = args.account_dir or os.environ.get("CYBERBOSS_WECHAT_DB_ACCOUNT_DIR") or ""
     account = Path(account_dir) if account_dir else locate_account(base_dir, wxid, key)
     cache_dir = (args.cache_dir or os.environ.get("CYBERBOSS_WECHAT_DB_CACHE_DIR") or "").strip()
-    return SnapshotReader(str(account), key, cache_dir=cache_dir, my_wxid=args.self_wxid or "")
+    # The image key is derived from the account's uin by default; an explicit key
+    # wins so an operator can pin a value that a future WeChat release changes.
+    image_key = (args.image_key or os.environ.get("CYBERBOSS_WECHAT_DB_IMAGE_KEY")
+                 or os.environ.get("CYBERBOSS_WECHAT_CLI_IMAGE_AES_KEY") or "").strip()
+    image_xor = args.image_xor_key
+    if image_xor is None:
+        raw_xor = os.environ.get("CYBERBOSS_WECHAT_DB_IMAGE_XOR_KEY") or os.environ.get("CYBERBOSS_WECHAT_CLI_IMAGE_XOR_KEY") or ""
+        try:
+            image_xor = int(str(raw_xor), 0) if str(raw_xor).strip() else -1
+        except ValueError:
+            image_xor = -1
+    return SnapshotReader(
+        str(account), key,
+        cache_dir=cache_dir,
+        my_wxid=args.self_wxid or "",
+        image_key=image_key,
+        image_xor_key=image_xor,
+        ffmpeg=args.ffmpeg or "",
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -471,6 +832,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--account-dir", default="")
     parser.add_argument("--cache-dir", default="")
     parser.add_argument("--self-wxid", default="")
+    parser.add_argument("--image-key", default="")
+    parser.add_argument("--image-xor-key", type=int, default=None)
+    parser.add_argument("--ffmpeg", default="")
     return parser.parse_args(argv)
 
 

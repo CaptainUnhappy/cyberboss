@@ -301,7 +301,7 @@ function buildEnvelope(message, { peer, talker }) {
     timestamp: message.timestamp,
     receivedAt: message.receivedAt,
     quotedContexts: message.quotedContexts,
-    attachments: [],
+    attachments: message.attachments,
     attachmentFailures: [],
     source: "wechat-db",
     confidence: "db-row",
@@ -346,7 +346,23 @@ function normalizeSnapshotMessage(value) {
     senderId: normalizeText(value.senderId),
     isGroup: Boolean(value.isGroup),
     quotedContexts: Array.isArray(value.quotedContexts) ? value.quotedContexts : [],
+    // Media the reader already put on disk (a decrypted image, say). The app's
+    // attachment persistence takes it from here; dropping it would turn every
+    // picture back into the "[图片]" the operator complained about.
+    attachments: normalizeLocalAttachments(value.attachments),
   };
+}
+
+function normalizeLocalAttachments(value) {
+  return (Array.isArray(value) ? value : [])
+    .filter((item) => item && typeof item === "object" && normalizeText(item.path))
+    .map((item) => ({
+      kind: normalizeText(item.kind) || "file",
+      path: item.path,
+      fileName: normalizeText(item.fileName) || path.basename(item.path),
+      origin: normalizeText(item.origin) || "direct",
+      attachmentRef: normalizeText(item.attachmentRef),
+    }));
 }
 
 function loadCursorState(filePath) {
