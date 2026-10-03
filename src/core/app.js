@@ -566,10 +566,52 @@ class CyberbossApp {
       historyLimit: this.config.wechatDbInboxHistoryLimit,
       replayOnStart: this.config.wechatDbInboxReplayOnStart,
       replayLimit: this.config.wechatDbInboxReplayLimit,
+      // WeChat downloads a picture's original only when its conversation is
+      // rendered, so a preview has to be paid for with one foreground click -
+      // only when a preview is actually what arrived, and only once per chat
+      // per cooldown.
+      imageUpgrade: this.config.wechatDbImageUpgrade && this.config.wechatCuaEnabled
+        ? (peer) => this.openChatForImageUpgrade(peer)
+        : null,
+      imageUpgradeWaitMs: this.config.wechatDbImageUpgradeWaitMs,
       onMessage: (message, snapshot) => this.handleWeFlowInboxMessage(message, snapshot),
     });
     await this.wechatDbInboxSource.start();
     return this.wechatDbInboxSource;
+  }
+
+  /**
+   * Open one conversation so WeChat downloads the picture it only previewed.
+   *
+   * Returns false when no writer is available, so the source skips the upgrade
+   * instead of waiting for something that will not happen.
+   */
+  openChatForImageUpgrade(peer) {
+    const label = normalizeCommandArgument(peer);
+    if (!label) {
+      return false;
+    }
+    const { CuaSession, findWeChatWindow, ensureConversation } = require("../integrations/wechat-cua/client");
+    const session = new CuaSession(`cyberboss-image-${process.pid}`);
+    const window = findWeChatWindow(session);
+    try {
+      ensureConversation(session, window, label);
+    } catch (error) {
+      // A minimized client refuses the click (measured 2026-10-03: "window 0xf09a6
+      // is minimized, so a foreground click would be posted off-screen"). Restore it
+      // the same way the send path does - SW_SHOWNOACTIVATE, which leaves the
+      // foreground alone - and try once more.
+      if (!/minimized/i.test(String(error?.message || ""))) {
+        throw error;
+      }
+      const restored = session.restoreMinimized(window.pid);
+      if (!restored?.ok) {
+        throw error;
+      }
+      ensureConversation(session, window, label);
+    }
+    console.log(`[cyberboss] wechat-db image upgrade opened chat=${label}`);
+    return true;
   }
 
   async closeWechatDbInbox() {

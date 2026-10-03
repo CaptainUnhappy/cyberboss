@@ -94,7 +94,8 @@ the same account: it is delivered as `self_manual` and answered.
 Images are delivered as real files, not as `[图片]`. The chain, all measured on
 this machine on 2026-10-03:
 
-1. the row's `packed_info_data` carries the image md5;
+1. the row's `packed_info_data` carries the image md5 (and the body XML carries
+   `aeskey`, `length`, `cdnthumburl`/`cdnbigimgurl` locators);
 2. the file lives at `<account>/msg/attach/<md5(talker)>/<YYYY-MM>/Img/<md5><suffix>.dat`;
 3. the `.dat` is WeChat's V2 container:
    `[07 08 'V2' 08 07][aes_size][xor_size][pad][AES-128-ECB][raw][XOR tail]`;
@@ -104,6 +105,30 @@ this machine on 2026-10-03:
 5. the decoded file is written under `<cache>/media/` and handed to the app as an
    attachment, which persists it into `<state>/inbox/<date>/` and attaches it to
    the turn.
+
+### The original is often not on disk yet
+
+WeChat writes `<md5>_t.dat` (the preview) the moment a picture arrives and the
+full `<md5>.dat` **only when the conversation is rendered**: measured
+2026-10-03, a picture's original appeared 22 seconds after the message, exactly
+when the bot opened the chat to reply. Reading pixels cannot fetch what the client
+has not downloaded, so two things happen, in this order:
+
+1. the reader waits a bounded moment for the original
+   (`CYBERBOSS_WECHAT_DB_IMAGE_WAIT_MS`, default 8s, one budget per snapshot);
+2. if the message still carries a preview, the inbox **opens that one
+   conversation through Cua** (a single foreground click, once per chat per 30s
+   cooldown), waits `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE_WAIT_MS` (default 2.5s) and
+   reads the database again. If the original arrived, the turn gets it; if not,
+   the preview is kept and the message text says it is one.
+   Switch it off with `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE=false`.
+
+Fetching the original straight from WeChat's CDN does **not** work: the locator in
+the message body (`cdnthumburl`, the same on all three sizes here) answers
+`HTTP 400` on `novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=…` for
+every parameter shape, host and user agent tried, direct and through the proxy
+(2026-10-03). The official iLink channel's `/download?encrypted_query_param=` path
+in `src/adapters/channel/weixin/media-receive.js` is a different contract.
 
 Suffix handling is the part that bites. `_t` is the **thumbnail** (measured
 180x102 for a 720x240 original, and 171x180 for a picture whose original is
@@ -120,7 +145,8 @@ So selection is by **pixels, not by file format**: every variant is decoded
 (directly, or through ffmpeg when it is a `wxgf` container), blank frames are
 dropped, and the variant with the largest area wins - the original preferred on a
 tie. `wxgf` payloads are decoded with ffmpeg (`-f hevc`, after cutting to the
-first NAL start code). Thumbnails only win when nothing else exists.
+first NAL start code). Thumbnails only win when nothing else exists, and the
+published cache name then carries `_thumb` so the fact survives.
 
 | setting | meaning |
 | --- | --- |

@@ -453,7 +453,7 @@ class MediaResolver:
         # the same picture forever.
         chosen = self._cached_winner(md5, folder, months)
         if chosen:
-            self.last_quality = "cached" if chosen.stem.rstrip("_h").rstrip("_t") == md5 else "thumbnail"
+            # `_cached_winner` already decided original-vs-thumbnail from the name.
             return str(chosen), ""
 
         # Wait - within this snapshot's budget - for an original that has not
@@ -541,7 +541,10 @@ class MediaResolver:
             for extension in (".png", ".jpg", ".gif", ".webp", ".bmp"):
                 published = self.cache_dir / f"{stem}{extension}"
                 if published.is_file() and published.stat().st_mtime >= newest_source:
-                    self.last_quality = "thumbnail" if stem.endswith("_thumb") else "cached"
+                    # Only two answers reach the caller: the picture, or a preview
+                    # of it. "cached" as a third value made the Node side treat a
+                    # perfectly good original as "not an improvement".
+                    self.last_quality = "thumbnail" if stem.endswith("_thumb") else "original"
                     return published
         return None
 
@@ -668,6 +671,7 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
         match = re.search(rb"[0-9a-fA-F]{32}", packed)
         md5 = match.group(0).decode("ascii").lower() if match else ""
         path, reason = media.resolve_image(md5, talker, create_time)
+        quality = media.last_quality if path else "missing"
         if path:
             attachments.append({
                 "kind": "image",
@@ -676,7 +680,7 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
                 "origin": "direct",
                 "attachmentRef": f"direct-{local_id}-1",
             })
-            if media.last_quality == "thumbnail":
+            if quality == "thumbnail":
                 # Say it out loud: a 94x210 thumbnail passed off as "the picture"
                 # made the operator ask why the bot could not read the original
                 # (measured 2026-10-03). WeChat had simply not downloaded it yet.
@@ -717,6 +721,12 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
         "url": url,
         "quotedContexts": quoted,
         "attachments": attachments,
+        # `original` when the picture itself was decoded, `thumbnail` when only
+        # WeChat's preview exists on disk (the client downloads the original only
+        # once the conversation is opened), `missing` when neither is readable.
+        # The Node side uses this to decide whether it is worth opening the chat
+        # once so the original lands, then re-reading.
+        "imageQuality": quality if kind == "image" else "",
         # Extra fields the CLI contract never had; a database row knows them.
         "talker": talker,
         "senderId": sender,

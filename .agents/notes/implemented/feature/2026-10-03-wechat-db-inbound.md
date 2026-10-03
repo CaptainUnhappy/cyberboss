@@ -121,6 +121,34 @@ node --test test/wechat-db-worker.test.js  # 11：帧/关联/超时杀进程/崩
 
 顺带修掉两处**关闭路径缺口**：`closeWeChatCuaInbox()` 定义了却从没在 shutdown/finally 里被调用；新加的 `closeWechatDbInbox()` 必须调用，否则重启会留下一个仍持有解密快照的 Python 子进程。
 
+### 9. 原图：微信没下载时，替它把会话打开一次（CDN 路已试死）
+
+用户反馈「还是没有获取到原图」。查清的事实链：
+
+- 微信先写 `<md5>_t.dat`（预览），**原图只在会话被渲染时才下载**：实测那条消息的 `.dat` 晚了 **22 秒**，正好是机器人回复时代替它打开了会话的那一刻。
+- **直连 CDN 行不通**：消息体里的 `cdnthumburl`/`cdnbigimgurl` 定位符在
+  `novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=…` 上一律 `HTTP 400`
+  （换 host、换参数形状、换 UA、走/不走代理都试过，返回体为空）；`fileid` 形状是 403。
+  官方 iLink 通道的 `/download?encrypted_query_param=` 是另一套契约（`media-receive.js`）。
+  WeFlow 的 JS 里确实有 `parseImageInfo`（取 md5/aeskey/cdnthumburl）和 `downloadImage`，
+  但它缓存下来的 32 张图（%APPDATA%\weflow\cache\api-media）说明取图那步是它自己的客户端能力。
+- 因此走**可行的那条**：读取器报告 `imageQuality`，Node 侧发现是 `thumbnail` 就
+  **用 Cua 打开那一个会话一次**（每会话 30 秒冷却），等 2.5 秒后重读数据库，拿到原图再投递；
+  仍拿不到就保留预览并在文本里说明。开关 `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE`。
+- 窗口最小化时 `ensureConversation` 会拒绝（`window_minimized`）：先
+  `restoreMinimized`（SW_SHOWNOACTIVATE，不抢前台）再点一次。
+
+验证：
+
+- 单测 `test/wechat-db-inbox.test.js`：预览 → 打开一次 → 重读得原图；冷却期内不再点；
+  重读没变好时保留预览而不是丢掉附件；原图不触发打开。
+- 真实链路 `scripts/wechat-db-image-upgrade-live.js`（把一条已有原图的消息强制标成预览，
+  其余全是生产代码）：`restored minimized window: {"ok":true}` → 打开会话 →
+  `wechat-db image upgrade chat=柳毓琳 improved=1 waitedMs=2500` → 质量回到 `original`，
+  `upgrades=1 upgraded=1`。
+- 仍未覆盖：**对端真发一张图**（只有对方设备能造出"原图尚未下载"的初始状态），
+  这条留给用户发一张图后看日志确认。
+
 ## Alternatives considered
 
 1. **把 `db_reader` 移植成纯 Node。** Node 24 有 `node:sqlite` 和 zstd，理论上可行，长期也最干净（去掉 Python 依赖）。否决理由：43KB+ 的读取层里全是踩出来的坑（分片路由、占位会话、`real_sender_id` 的 Name2Id 映射、群聊 `wxid:\n正文` 前缀、压缩内容的 hex 形态），重写等于把那些坑再踩一遍，而且要等到全部对齐才能上线；现在是"读侧已经断了"的救火期。用 vendored 文件 + 一个 JSON 协议子进程，当天就能跑通，且把风险限制在一个已验证的组件里。

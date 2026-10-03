@@ -122,6 +122,11 @@ function readConfig() {
     wechatDbInboxReplayLimit: readIntEnv("CYBERBOSS_WECHAT_DB_REPLAY_LIMIT") || 20,
     wechatDbInboxCursorFile: path.join(stateDir, "wechat-db-inbox-cursor.json"),
     wechatDbReaderScript: path.resolve(__dirname, "..", "..", "scripts", "wechat-db-inbox-read.py"),
+    // WeChat downloads a picture's original only when the conversation is shown,
+    // so a message that arrived as a preview gets one foreground click to fetch
+    // it. On by default because the alternative is answering a 94x210 thumbnail.
+    wechatDbImageUpgrade: readBoolEnv("CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE") !== false,
+    wechatDbImageUpgradeWaitMs: readIntEnv("CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE_WAIT_MS") || 2_500,
     // Opt-in: never take the foreground, not even for the 150-300ms activation a
     // conversation switch costs. A reply whose conversation is not already open is
     // then deferred instead of being delivered now.

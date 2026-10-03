@@ -294,6 +294,91 @@ test("an image the reader decrypted travels with the message, not as [图片]", 
   assert.equal(delivered[0].attachments[0].kind, "image");
 });
 
+test("a picture that arrived as a preview is upgraded by opening the chat once", async () => {
+  const thumbnail = snapshot([message({ id: "pic", kind: "image", imageQuality: "thumbnail", attachments: [
+    { kind: "image", path: "C:\\cache\\media\\abc_thumb.jpg", origin: "direct" },
+  ] })]);
+  const upgraded = snapshot([message({ id: "pic", kind: "image", imageQuality: "original", attachments: [
+    { kind: "image", path: "C:\\cache\\media\\abc.png", origin: "direct" },
+  ] })]);
+  let reads = 0;
+  const worker = {
+    async snapshots() {
+      reads += 1;
+      // This method is called directly here, so the FIRST read of the worker is
+      // already the re-read after the chat was opened: it must show the original,
+      // exactly as the client behaves once it has downloaded it.
+      return { chats: [upgraded], failures: [] };
+    },
+  };
+  const opened = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    imageUpgrade: (peer) => { opened.push(peer); return true; },
+    imageUpgradeWaitMs: 0,
+    imageUpgradeCooldownMs: 0,
+    onMessage: async () => true,
+    logger: quietLogger(),
+  });
+  const result = await source.upgradeThumbnailImages([thumbnail]);
+  assert.deepEqual(opened, ["柳毓琳"], "the chat is opened for a preview");
+  assert.equal(result[0].messages[0].imageQuality, "original");
+  assert.equal(result[0].messages[0].attachments[0].path, "C:\\cache\\media\\abc.png");
+  assert.equal(source.stats.imageUpgraded, 1);
+
+  // ...and a second pass inside the cooldown leaves the desktop alone.
+  source.imageUpgradeCooldownMs = 60_000;
+  const again = await source.upgradeThumbnailImages([thumbnail]);
+  assert.equal(opened.length, 1, "the cooldown must stop a second foreground click");
+  assert.equal(again[0].messages[0].imageQuality, "thumbnail");
+});
+
+test("a re-read that did not improve keeps the preview rather than losing it", async () => {
+  const thumbnail = snapshot([message({ id: "pic", kind: "image", imageQuality: "thumbnail", attachments: [
+    { kind: "image", path: "C:\\cache\\media\\abc_thumb.jpg", origin: "direct" },
+  ] })]);
+  const worker = {
+    async snapshots() {
+      // The client was opened but has not finished downloading: same preview.
+      return { chats: [thumbnail], failures: [] };
+    },
+  };
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    imageUpgrade: () => true,
+    imageUpgradeWaitMs: 0,
+    imageUpgradeCooldownMs: 0,
+    onMessage: async () => true,
+    logger: quietLogger(),
+  });
+  const result = await source.upgradeThumbnailImages([thumbnail]);
+  assert.equal(result[0].messages[0].attachments[0].path, "C:\\cache\\media\\abc_thumb.jpg",
+    "a preview is still better than an empty attachment");
+});
+
+test("an original needs no upgrade, and a cooldown stops repeats", async () => {
+  const withOriginal = snapshot([message({ id: "pic", kind: "image", imageQuality: "original", attachments: [
+    { kind: "image", path: "C:\\cache\\media\\abc.png", origin: "direct" },
+  ] })]);
+  const worker = fakeWorker([{ chats: [withOriginal], failures: [] }]);
+  const opened = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    imageUpgrade: (peer) => { opened.push(peer); return true; },
+    imageUpgradeWaitMs: 0,
+    onMessage: async () => true,
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  assert.deepEqual(opened, [], "a full-size picture must not steal the foreground");
+});
+
 test("replayOnStart delivers the most recent incoming rows exactly once", async () => {
   const worker = fakeWorker([
     {

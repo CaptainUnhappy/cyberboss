@@ -50,6 +50,9 @@ class WechatDbInboxSource {
     historyLimit = DEFAULT_HISTORY_LIMIT,
     replayOnStart = false,
     replayLimit = DEFAULT_REPLAY_LIMIT,
+    imageUpgrade = null,
+    imageUpgradeWaitMs = 2_500,
+    imageUpgradeCooldownMs = 30_000,
   } = {}) {
     if (typeof onMessage !== "function") {
       throw new Error("WechatDbInboxSource needs an onMessage callback");
@@ -68,6 +71,12 @@ class WechatDbInboxSource {
     this.historyLimit = historyLimit;
     this.replayOnStart = replayOnStart;
     this.replayLimit = replayLimit;
+    // Injected: opening a conversation is the ONE thing here that takes the
+    // foreground, so a test can assert the cooldown without a live client.
+    this.imageUpgrade = typeof imageUpgrade === "function" ? imageUpgrade : null;
+    this.imageUpgradeWaitMs = imageUpgradeWaitMs;
+    this.imageUpgradeCooldownMs = imageUpgradeCooldownMs;
+    this.imageUpgradeAt = new Map();
     this.state = loadCursorState(config.wechatDbInboxCursorFile);
     this.running = false;
     this.timer = null;
@@ -84,6 +93,10 @@ class WechatDbInboxSource {
       // Detection lag: how long after WeChat stored a row the inbox noticed it.
       lastLagMs: 0,
       maxLagMs: 0,
+      // Pictures that arrived as previews, and how many were upgraded to the
+      // original by opening the conversation once.
+      imageUpgrades: 0,
+      imageUpgraded: 0,
     };
   }
 
@@ -154,6 +167,99 @@ class WechatDbInboxSource {
     }
   }
 
+  /**
+   * Ask the desktop client for the original of a picture it has only previewed.
+   *
+   * Measured 2026-10-03: WeChat writes `<md5>_t.dat` (a 94x210 preview) the moment
+   * a picture arrives and the full `<md5>.dat` only when the conversation is
+   * rendered - the original in that case appeared 22 seconds later, exactly when
+   * the bot opened the chat to send its reply. Reading pixels cannot fetch what
+   * the client has not downloaded, and the CDN route was tried first and does not
+   * work (the message's `cdnthumburl` locator answers HTTP 400 on
+   * novac2c.cdn.weixin.qq.com whatever the parameter shape; see the note).
+   *
+   * So: open that one conversation, wait a moment, read the database again, and
+   * hand over the original if it arrived. Bounded by a per-chat cooldown so a
+   * chat full of previews cannot turn the desktop into a slideshow.
+   */
+  async upgradeThumbnailImages(snapshots) {
+    if (!this.imageUpgrade) {
+      return snapshots;
+    }
+    const stale = snapshots.filter((snapshot, index) => (
+      Array.isArray(snapshot?.messages)
+      && snapshot.messages.some((message) => normalizeText(message?.imageQuality) === "thumbnail")
+      && !this.isUpgradeCoolingDown(index, snapshot)
+    ));
+    if (!stale.length) {
+      return snapshots;
+    }
+    const upgraded = snapshots.slice();
+    for (const snapshot of stale) {
+      const index = snapshots.indexOf(snapshot);
+      const peer = normalizeText(snapshot?.displayName) || normalizeText(snapshot?.chatUsername);
+      const talker = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername);
+      try {
+        const opened = await this.imageUpgrade(peer, talker);
+        if (opened === false) {
+          continue;
+        }
+        this.markUpgradeAttempt(index, snapshot);
+        await sleep(this.imageUpgradeWaitMs);
+        const fresh = await this.worker.snapshots({ chats: [talker], limit: this.historyLimit });
+        const refreshed = Array.isArray(fresh?.chats) ? fresh.chats[0] : null;
+        if (!refreshed) {
+          continue;
+        }
+        const before = new Map((snapshot.messages || []).map((message) => [normalizeText(message?.id), message]));
+        const after = new Map((refreshed.messages || []).map((message) => [normalizeText(message?.id), message]));
+        let improved = 0;
+        for (const [id, message] of before) {
+          const next = after.get(id);
+          if (next && normalizeText(next.imageQuality) === "original"
+            && normalizeText(message.imageQuality) !== "original") {
+            improved += 1;
+          }
+        }
+        upgraded[index] = {
+          ...refreshed,
+          messages: (refreshed.messages || []).map((message) => {
+            const previous = before.get(normalizeText(message?.id));
+            // Keep the preview when the re-read did not improve on it: a
+            // thumbnail is still better than nothing while the client thinks.
+            return previous
+              && normalizeText(previous.imageQuality) === "thumbnail"
+              && normalizeText(message.imageQuality) !== "original"
+              ? previous
+              : message;
+          }),
+        };
+        this.stats.imageUpgrades += 1;
+        if (improved) {
+          this.stats.imageUpgraded += improved;
+        }
+        this.logger.log?.(
+          `[cyberboss] wechat-db image upgrade chat=${peer} improved=${improved} `
+          + `waitedMs=${this.imageUpgradeWaitMs}`
+        );
+      } catch (error) {
+        this.logger.warn?.(`[cyberboss] wechat-db image upgrade failed chat=${peer}: ${error.message}`);
+      }
+    }
+    return upgraded;
+  }
+
+  isUpgradeCoolingDown(index, snapshot) {
+    const key = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername) || String(index);
+    const last = Number(this.imageUpgradeAt.get(key) || 0);
+    return Date.now() - last < this.imageUpgradeCooldownMs;
+  }
+
+  markUpgradeAttempt(index, snapshot) {
+    const key = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername) || String(index);
+    this.imageUpgradeAt.set(key, Date.now());
+  }
+
   /** One poll: read every watched chat, hand new rows to the app. */
   async pollOnce() {
     if (!await this.isReady()) {
@@ -164,8 +270,11 @@ class WechatDbInboxSource {
       chats: this.chats,
       limit: this.historyLimit,
     });
-    const snapshots = Array.isArray(payload?.chats) ? payload.chats : [];
+    let snapshots = Array.isArray(payload?.chats) ? payload.chats : [];
     const failures = Array.isArray(payload?.failures) ? payload.failures : [];
+    // A picture whose original is not on disk yet: WeChat only downloads it when
+    // the conversation is shown, so ask for it once, then read the database again.
+    snapshots = await this.upgradeThumbnailImages(snapshots);
     for (const failure of failures) {
       this.logger.warn?.(`[cyberboss] wechat-db inbox could not read a chat: ${failure}`);
     }
@@ -243,7 +352,8 @@ class WechatDbInboxSource {
       this.logger.log?.(
         `[cyberboss] wechat-db inbox stats polls=${this.stats.polls} delivered=${this.stats.delivered} `
         + `suppressed=${this.stats.suppressed} deferred=${this.stats.deferred} errors=${this.stats.errors} `
-        + `lastPollMs=${this.stats.lastPollMs} lastLagMs=${this.stats.lastLagMs} maxLagMs=${this.stats.maxLagMs}`
+        + `lastPollMs=${this.stats.lastPollMs} lastLagMs=${this.stats.lastLagMs} maxLagMs=${this.stats.maxLagMs} `
+        + `imageUpgrades=${this.stats.imageUpgrades} imageUpgraded=${this.stats.imageUpgraded}`
       );
     }
     return {
@@ -373,6 +483,9 @@ function normalizeSnapshotMessage(value) {
     senderId: normalizeText(value.senderId),
     isGroup: Boolean(value.isGroup),
     quotedContexts: Array.isArray(value.quotedContexts) ? value.quotedContexts : [],
+    // `original` / `thumbnail` / `missing`: whether the picture on disk is the
+    // real one. The source opens the conversation once when it is only a preview.
+    imageQuality: normalizeText(value.imageQuality),
     // Media the reader already put on disk (a decrypted image, say). The app's
     // attachment persistence takes it from here; dropping it would turn every
     // picture back into the "[图片]" the operator complained about.
@@ -428,6 +541,11 @@ function toInt(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+/** Synchronous pause; used only between "open the chat" and "read it again". */
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, Number(ms) || 0));
 }
 
 module.exports = {
