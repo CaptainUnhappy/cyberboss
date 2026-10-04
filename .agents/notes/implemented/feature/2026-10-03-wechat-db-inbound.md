@@ -228,6 +228,41 @@ node --test test/wechat-db-worker.test.js  # 11：帧/关联/超时杀进程/崩
 `.dat` 按 V2 容器手工构造、AES 密钥固定注入）——原图落地后必须升级、来源消失后不许再报
 "original"、等待只付一次。
 
+### 12. 视频：本体取不到（已证实），但封面能取到（2026-10-04）
+
+用户报「视频消息收到了，但文件本体没下来——inbox 里还是只有图，没有视频」。把那条真实消息
+（柳毓琳 localId=77，35 秒 / 8.2MB）查到底：
+
+**本体确实不在机器上，而且不是读取器的错：**
+
+- 行的 XML 只有 CDN 坐标：`cdnvideourl` / `aeskey` / `length=8610009` / `md5` / `newmd5`；
+- 全盘（`msg/attach`、`msg/video`、`msg/file`、以及账号根目录递归）**没有任何 mp4**，
+  也没有任何 8.6MB 量级的文件；
+- 原因：微信只在**播放**收到的视频时才下载它，这条从没被播放过；
+- CDN 直取也不行：`novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=…` 恒 400
+  （与图片同一条死路；换 host 时 `dldir1.qq.com` 甚至回 `file not exist`）。
+
+**封面能取到，而且文件名规则是查出来的、不是猜的：**
+
+- 文件在 `<account>/msg/video/<YYYY-MM>/<32hex>_thumb.jpg`；
+- 三个"看起来像"的键都不对：`newmd5`（那是视频自己的 id）、`cdnthumburl` 里的 UUID
+  （`bcb732d9-…`）、`packed_info_data` 的 md5——把整行所有 32hex/UUID 形状的值逐个拿去磁盘上找，
+  **一个都不匹配**；
+- 真正可靠的绑定是：**同月目录 + mtime 与行的 `create_time` 最接近**（实测差 5 秒，客户端在消息
+  落地时写下封面），并用**行自带的 `cdnthumblength` / `cdnthumbwidth` / `cdnthumbheight`**
+  逐张校验（10,312B / 224×398 三者全中）。两个候选一样近时宁可不给，也不把别人的封面发出去。
+
+于是视频消息现在的形态是：**封面文件 + 一句实话**——
+
+```
+[视频]（这是封面 224x398；35s / 8.2MB 的视频本体没有下载到本地——微信只在播放时才下载收到的
+视频，CDN 也取不到（HTTP 400）；需要原片的话请对方用「文件」方式重发一次）
+```
+
+读取器统计行加了 `videoThumbs`。**仍缺**：文件消息（`localType=49` + app type 6）的落地解析——
+`msg/file/<YYYY-MM>/` 确实存在真文件，但当前数据库里没有一条文件行可以据此验证命名规则，
+所以这一半等一次真实发送再实现，不先猜。
+
 ## Alternatives considered
 
 1. **把 `db_reader` 移植成纯 Node。** Node 24 有 `node:sqlite` 和 zstd，理论上可行，长期也最干净（去掉 Python 依赖）。否决理由：43KB+ 的读取层里全是踩出来的坑（分片路由、占位会话、`real_sender_id` 的 Name2Id 映射、群聊 `wxid:\n正文` 前缀、压缩内容的 hex 形态），重写等于把那些坑再踩一遍，而且要等到全部对齐才能上线；现在是"读侧已经断了"的救火期。用 vendored 文件 + 一个 JSON 协议子进程，当天就能跑通，且把风险限制在一个已验证的组件里。

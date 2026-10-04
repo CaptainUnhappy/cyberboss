@@ -340,7 +340,8 @@ class MediaResolver:
         self._wait_budget_ms = 0
         self._in_snapshot = False
         self.stats = {"resolved": 0, "missing": 0, "keyFailures": 0, "ffmpeg": 0, "thumbnailOnly": 0,
-                      "blankFrames": 0, "noSource": 0, "waitedMs": 0, "lastReason": "", "lastChosen": ""}
+                      "blankFrames": 0, "noSource": 0, "waitedMs": 0, "lastReason": "", "lastChosen": "",
+                      "videoThumbs": 0}
         # Facts about what was chosen for one picture, so `summarize_message` can
         # report them on the MESSAGE. A single `last_quality` field on the resolver
         # was a bug waiting to happen: the moment a snapshot holds two pictures the
@@ -651,6 +652,85 @@ class MediaResolver:
         candidates.sort(key=lambda item: (-item["area"], item["rank"]))
         return candidates[0], notes
 
+    # ── 视频：只有缩略图，除非微信播放过 ────────────────────────────
+
+    def resolve_video(self, content: str, packed_hex: str, create_time: int):
+        """A video row -> (thumbnail path, failure reason, note).
+
+        Measured 2026-10-04 (柳毓琳 localId=77, a real 35-second video):
+
+          * the row's XML gives CDN co-ordinates (`cdnvideourl`, `aeskey`,
+            `length=8610009`) and two ids: `md5` (the video's own) and `newmd5`
+            (a UUID);
+          * the only file on disk is
+            `<account>/msg/video/<YYYY-MM>/<newmd5-without-dashes>_thumb.jpg` -
+            10,312 B and 224x398, exactly what `cdnthumblength`/`cdnthumbwidth`/
+            `cdnthumbheight` promise. That is how the stem was identified.
+          * the 8.6 MB video itself is **nowhere** on the machine, and that is not a
+            bug in this reader: WeChat downloads a received video when it is played,
+            and it was never played. Fetching it from the CDN does not work either -
+            `novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=…` answers
+            HTTP 400 for every parameter shape (same as images; one host even replies
+            `file not exist`).
+
+        So this hands over the THUMBNAIL when one exists and says plainly that the
+        video has not been downloaded - the alternative (a bare `[视频]`) tells the
+        operator nothing.
+        """
+        # Which file is this row's cover? The three obvious keys do NOT work, and that
+        # was measured rather than assumed (2026-10-04, 柳毓琳 localId=77):
+        #   * the file is `<newmd5-without-dashes>_thumb.jpg`? No - `newmd5` is the
+        #     video's own id, and the file's stem is a different value entirely;
+        #   * the UUID inside `cdnthumburl`? No - that is `bcb732d9-…`, the file is
+        #     `52bdfe95…`;
+        #   * the row's `packed_info_data` md5? No.
+        # What IS true: the file sits in `msg/video/<YYYY-MM>/`, its mtime is 5 seconds
+        # before the row's `create_time` (the client writes it as the message lands), and
+        # its size and pixels equal the row's `cdnthumblength` / `cdnthumbwidth` /
+        # `cdnthumbheight`. So the binding is "same month, closest in time, confirmed by
+        # the row's own numbers" - which cannot silently hand over another video's cover.
+        want_size = int((re.search(r'cdnthumblength="(\d+)"', content) or [0, "0"])[1] or 0)
+        want_width = int((re.search(r'cdnthumbwidth="(\d+)"', content) or [0, "0"])[1] or 0)
+        want_height = int((re.search(r'cdnthumbheight="(\d+)"', content) or [0, "0"])[1] or 0)
+        root = self.account_dir / "msg" / "video"
+        if not root.is_dir():
+            return "", "WeChat stored no thumbnail for this video", ""
+        months = []
+        if create_time:
+            months.append(datetime.fromtimestamp(create_time).strftime("%Y-%m"))
+        months.extend(entry.name for entry in root.iterdir() if entry.is_dir() and entry.name not in months)
+        candidates = []
+        for month in months:
+            folder = root / month
+            if not folder.is_dir():
+                continue
+            for path in folder.glob("*_thumb.jpg"):
+                size = path.stat().st_size
+                if want_size and size != want_size:
+                    continue
+                width, height = _image_size(path.read_bytes())
+                if want_width and want_height and (width, height) != (want_width, want_height):
+                    continue
+                distance = abs(path.stat().st_mtime - create_time) if create_time else 0
+                candidates.append((distance, path))
+            if candidates:
+                break
+        if not candidates:
+            return "", "WeChat stored no thumbnail for this video", ""
+        candidates.sort(key=lambda item: item[0])
+        if len(candidates) > 1 and candidates[1][0] == candidates[0][0]:
+            # Two covers equally close: do not guess whose is whose.
+            return "", "two thumbnails matched equally well", ""
+        thumb = candidates[0][1]
+        stem = thumb.name[: -len("_thumb.jpg")]
+        width, height = _image_size(thumb.read_bytes())
+        published = self.cache_dir / f"{stem}_thumb.jpg"
+        if not published.is_file() or published.stat().st_size != thumb.stat().st_size:
+            published.write_bytes(thumb.read_bytes())
+        self.stats["videoThumbs"] += 1
+        self.stats["lastChosen"] = f"{thumb.name} {width}x{height} (video cover)"
+        return str(published), "", f"{width}x{height}"
+
     def _variant_files(self, md5: str, folder: Path, months: list) -> dict:
         """Every `<md5>*_?.dat` on disk right now, keyed by suffix ("" / "_h" / "_t")."""
         found = {}
@@ -870,6 +950,31 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
             # Say WHY, in the message itself: an operator who sees only "[图片]"
             # cannot tell "the peer sent nothing" from "we lost it".
             text = f"{PLACEHOLDER.get(kind, '[图片]')}（本地文件未取到：{reason}）"
+    elif kind == "video" and media is not None:
+        # A video is a real attachment whose body WeChat has not downloaded (it does
+        # that on play). The thumbnail usually IS here, so hand that over and say what
+        # it is - measured 2026-10-04, the row's `length` was 8.6 MB and nothing that
+        # size existed on the machine.
+        thumb, reason, size = media.resolve_video(raw, str(row.get("packed_info_data") or ""), create_time)
+        if thumb:
+            attachments.append({
+                "kind": "image",
+                "path": thumb,
+                "fileName": os.path.basename(thumb),
+                "origin": "direct",
+                "attachmentRef": f"direct-{local_id}-1",
+            })
+            length = (re.search(r'length="(\d+)"', raw) or [None, ""])[1]
+            play = (re.search(r'playlength="(\d+)"', raw) or [None, ""])[1]
+            megabytes = f"{int(length) / 1_048_576:.1f}MB" if str(length).isdigit() else "unknown size"
+            seconds = f"{play}s" if str(play).isdigit() else "unknown length"
+            text = (
+                f"[视频]（这是封面 {size}；{seconds} / {megabytes} 的视频本体没有下载到本地——"
+                "微信只在播放时才下载收到的视频，CDN 也取不到（HTTP 400）；"
+                "需要原片的话请对方用「文件」方式重发一次）"
+            )
+        else:
+            text = f"[视频]（本地文件未取到：{reason}）"
 
     sender = str(row.get("sender_username") or "")
     is_group = talker.endswith("@chatroom")
