@@ -493,6 +493,200 @@ test("a stale preview from the old reader (no size) still counts as a picture", 
   assert.equal(source.stats.imageMissing, 1, "no quality reported and no file read is still a picture we cannot see");
 });
 
+test("a preview is delivered immediately, and the original is handed over later", async () => {
+  // The shape of the real case (2026-10-03): the preview arrived 14 seconds
+  // before the only copy of the original that would ever exist, and the turn has
+  // to get the original WITHOUT a second delivery and WITHOUT the
+  // acknowledgement having waited for it.
+  let reads = 0;
+  const previewMessage = message({
+    id: "pic",
+    kind: "image",
+    imageQuality: "thumbnail",
+    imageSize: "157x210",
+    imageSource: "abc_t.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\abc_thumb.jpg", origin: "direct" }],
+  });
+  const originalMessage = message({
+    id: "pic",
+    kind: "image",
+    imageQuality: "original",
+    imageSize: "1280x1706",
+    imageSource: "abc.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\abc.png", origin: "direct" }],
+  });
+  const worker = {
+    async snapshots() {
+      reads += 1;
+      // Read 1 is the baseline (nothing new yet); reads 2-3 answer the first real
+      // poll (the preview, then its "still a preview" re-read); from then on the
+      // client has downloaded the original.
+      if (reads === 1) {
+        return { chats: [snapshot([])], failures: [] };
+      }
+      return { chats: [snapshot([reads <= 3 ? previewMessage : originalMessage])], failures: [] };
+    },
+  };
+  const delivered = [];
+  const upgraded = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async (msg) => { delivered.push(msg); return true; },
+    imageUpgrade: () => true,
+    imageUpgradeWaitMs: 0,
+    imageUpgradeNoticeMs: 0,
+    imageUpgradeCooldownMs: 0,
+    onImageUpgraded: (msg, info) => upgraded.push({ msg, info }),
+    logger: quietLogger(),
+  });
+
+  // First poll is the baseline (a boot must not answer history), so the flow that
+  // matters starts on the second.
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.equal(delivered.length, 1, "the preview must be delivered on the spot");
+  assert.equal(delivered[0].imageQuality, "thumbnail");
+  assert.equal(delivered[0].imageSize, "157x210");
+
+  // Next poll: the original is on disk, so the app is told - and NOTHING is
+  // delivered a second time.
+  await source.pollOnce();
+  assert.equal(upgraded.length, 1, "the app has to hear about the original");
+  assert.equal(upgraded[0].msg.imageQuality, "original");
+  assert.equal(upgraded[0].msg.imageSize, "1280x1706");
+  assert.equal(upgraded[0].info.peer, "柳毓琳");
+  assert.equal(delivered.length, 1, "an upgrade is a swap, not a second turn");
+  assert.equal(source.stats.imageUpgraded, 1);
+  assert.equal(source.pendingImageUpgrades.size, 0, "a settled picture stops being tracked");
+});
+
+test("a preview that never improves is given up on instead of tracked forever", async () => {
+  const previewMessage = message({
+    id: "stuck",
+    kind: "image",
+    imageQuality: "thumbnail",
+    imageSize: "80x40",
+    imageSource: "def_t.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\def_thumb.jpg", origin: "direct" }],
+  });
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+  ]);
+  const upgraded = [];
+  const warnings = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async () => true,
+    imageUpgrade: () => true,
+    imageUpgradeWaitMs: 0,
+    imageUpgradeNoticeMs: 0,
+    imageUpgradeDeadlineMs: -1,
+    imageUpgradeCooldownMs: 0,
+    onImageUpgraded: (msg) => upgraded.push(msg),
+    logger: { log() {}, warn: (line) => warnings.push(line), error() {}, debug() {} },
+  });
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.equal(upgraded.length, 0, "nothing to hand over while it is still a preview");
+  assert.equal(source.pendingImageUpgrades.size, 0, "past the deadline the entry is dropped");
+  assert.ok(warnings.some((line) => /gave up after/.test(line)),
+    `expected a give-up line, got ${JSON.stringify(warnings)}`);
+});
+
+test("a preview seen at baseline is still upgraded when the original lands later", async () => {
+  // Found on a live bot (2026-10-03): tracking previews only at delivery meant a
+  // preview that arrived before the baseline - or an hour earlier - was never
+  // watched again, so the original landing changed nothing at all.
+  let reads = 0;
+  let originalArrived = false;
+  const previewMessage = message({
+    id: "pic",
+    kind: "image",
+    imageQuality: "thumbnail",
+    imageSize: "157x210",
+    imageSource: "abc_t.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\abc_thumb.jpg", origin: "direct" }],
+  });
+  const originalMessage = message({
+    id: "pic",
+    kind: "image",
+    imageQuality: "original",
+    imageSize: "1280x1706",
+    imageSource: "abc.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\abc.png", origin: "direct" }],
+  });
+  const worker = {
+    async snapshots() {
+      reads += 1;
+      return { chats: [snapshot([originalArrived ? originalMessage : previewMessage])], failures: [] };
+    },
+  };
+  const delivered = [];
+  const upgraded = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async (msg) => { delivered.push(msg); return true; },
+    imageUpgrade: () => true,
+    imageUpgradeWaitMs: 0,
+    imageUpgradeNoticeMs: 0,
+    imageUpgradeCooldownMs: 0,
+    onImageUpgraded: (msg) => upgraded.push(msg),
+    logger: quietLogger(),
+  });
+
+  // Poll 1 is the baseline: the preview is history, so nothing is delivered - but
+  // it goes on the watch list.
+  await source.pollOnce();
+  assert.equal(delivered.length, 0);
+  assert.equal(source.pendingImageUpgrades.size, 1, "a baseline preview must still be watched");
+
+  // The original lands one poll later: the app is told, and what gets delivered
+  // (if anything) carries the ORIGINAL - never the preview it replaced.
+  originalArrived = true;
+  await source.pollOnce();
+  assert.equal(upgraded.length, 1, "the original has to reach the app");
+  assert.equal(upgraded[0].imageQuality, "original");
+  if (delivered.length) {
+    assert.equal(delivered.at(-1).imageQuality, "original",
+      "a delivered copy must never be the preview once the original is on disk");
+  }
+});
+
+test("with no upgrade callback configured, a preview is still delivered and never tracked", async () => {
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    {
+      chats: [snapshot([
+        message({ id: "pic", kind: "image", imageQuality: "thumbnail", imageSize: "80x40", attachments: [
+          { kind: "image", path: "C:\\cache\\media\\def_thumb.jpg", origin: "direct" },
+        ] }),
+      ])],
+      failures: [],
+    },
+  ]);
+  const delivered = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async (msg) => { delivered.push(msg); return true; },
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.equal(delivered.length, 1, "no upgrade machinery must not mean no delivery");
+  assert.equal(source.pendingImageUpgrades.size, 0);
+});
+
 test("replayOnStart delivers the most recent incoming rows exactly once", async () => {
   const worker = fakeWorker([
     {

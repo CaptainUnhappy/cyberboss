@@ -208,6 +208,37 @@ class PendingInboundStore {
     return { added: true, scopeKey, message: cloneMessage(normalizedMessage), draft: cloneScope(scope) };
   }
 
+  /**
+   * Swap one queued shared-content message for a better version of itself.
+   *
+   * Why this exists: a picture can arrive as a preview whose original lands 14
+   * seconds later (measured 2026-10-03), and the turn has not started yet. The
+   * message was delivered early on purpose - that is what sends the
+   * acknowledgement - so the only thing that may change is its content. The
+   * quiet window is NOT touched: an upgrade is not new activity from the peer.
+   *
+   * Returns `{ updated, scopeKey, message }`; `updated: false` means the message
+   * is no longer queued (already promoted, or dropped), and the caller must not
+   * create it again.
+   */
+  replaceSharedContentMessage({ bindingKey, workspaceRoot, chatId, message } = {}) {
+    this.load();
+    const scopeKey = buildSharedScopeKey(bindingKey, workspaceRoot, chatId);
+    const scope = this.state.sharedScopes.find((item) => item.scopeKey === scopeKey);
+    const normalizedMessage = normalizeMessage(message, { scopeKey, nowMs: this.currentTimeMs() });
+    if (!scope || !normalizedMessage) {
+      return { updated: false, scopeKey, message: null };
+    }
+    const index = scope.messages.findIndex((item) => item.pendingId === normalizedMessage.pendingId);
+    if (index < 0) {
+      return { updated: false, scopeKey, message: null };
+    }
+    scope.messages[index] = normalizedMessage;
+    scope.messages.sort(compareMessages);
+    this.save();
+    return { updated: true, scopeKey, message: cloneMessage(normalizedMessage) };
+  }
+
   promoteSharedContent(scopeKey, { message, consumedIds = [] } = {}) {
     this.load();
     const nowMs = this.currentTimeMs();

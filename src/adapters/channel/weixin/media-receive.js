@@ -1,6 +1,10 @@
 const crypto = require("crypto");
-const fs = require("fs/promises");
+const fs = require("fs");
+const fsPromises = require("fs/promises");
 const path = require("path");
+const { fileURLToPath } = require("node:url");
+
+const { getMimeFromFilename } = require("./media-mime");
 
 const DEFAULT_INBOX_DIR = "inbox";
 const MAX_FILE_NAME_LENGTH = 120;
@@ -86,6 +90,17 @@ function normalizeDateFolder(receivedAt) {
 }
 
 async function downloadAttachmentPayload(attachment, cdnBaseUrl) {
+  // A file already on this machine: the database reader decrypts WeChat's own
+  // `.dat` into a picture and hands it over as a local path, so there is nothing
+  // to download. Without this branch such an attachment had "no supported download
+  // reference" and was dropped - measured 2026-10-03 with the real reader, which
+  // had a perfectly good 900x1400 PNG on disk while the turn got nothing.
+  const localPath = resolveLocalAttachmentPath(attachment);
+  if (localPath) {
+    const bytes = await fsPromises.readFile(localPath);
+    return { bytes, contentType: getMimeFromFilename(localPath) };
+  }
+
   const candidates = buildDownloadCandidates(attachment, cdnBaseUrl);
   if (!candidates.length) {
     throw new Error("attachment did not include a supported download reference");
@@ -116,6 +131,36 @@ async function downloadAttachmentPayload(attachment, cdnBaseUrl) {
   }
 
   throw lastError || new Error("attachment download failed");
+}
+
+/**
+ * The local file this attachment points at, or "" when it is a remote one.
+ *
+ * String `fetch` does not take `file://` (it answers "fetch failed"), which is why
+ * a local picture cannot simply be turned into a URL here.
+ */
+function resolveLocalAttachmentPath(attachment) {
+  const candidates = [
+    normalizeText(attachment?.path),
+    normalizeText(attachment?.absolutePath),
+    ...(Array.isArray(attachment?.directUrls) ? attachment.directUrls : []),
+  ].map((value) => normalizeText(value)).filter(Boolean);
+  for (const candidate of candidates) {
+    const local = /^file:\/\//i.test(candidate)
+      ? fileURLToPath(candidate)
+      : (/^[a-z]:[\\/]|^\\\\|^\//i.test(candidate) ? candidate : "");
+    if (!local) {
+      continue;
+    }
+    try {
+      if (fs.existsSync(local) && fs.statSync(local).isFile()) {
+        return local;
+      }
+    } catch {
+      /* unreadable path: fall through to the remote candidates */
+    }
+  }
+  return "";
 }
 
 function buildDownloadCandidates(attachment, cdnBaseUrl) {
@@ -366,7 +411,7 @@ function sanitizeFileName(value) {
 }
 
 async function writeUniqueFile(targetDir, fileName, plaintext) {
-  await fs.mkdir(targetDir, { recursive: true });
+  await fsPromises.mkdir(targetDir, { recursive: true });
   const parsed = path.parse(fileName);
   const baseName = parsed.name || "attachment";
   const extension = parsed.ext || "";
@@ -374,7 +419,7 @@ async function writeUniqueFile(targetDir, fileName, plaintext) {
     const suffix = index === 0 ? "" : `-${index + 1}`;
     const candidate = path.join(targetDir, `${baseName}${suffix}${extension}`);
     try {
-      await fs.writeFile(candidate, plaintext, { flag: "wx" });
+      await fsPromises.writeFile(candidate, plaintext, { flag: "wx" });
       return candidate;
     } catch (error) {
       if (error?.code !== "EEXIST") {

@@ -159,36 +159,51 @@ being called "the" behaviour:
   was no preview-only window to observe at all.
 
 What is certain either way: reading pixels cannot fetch what the client has not
-downloaded. So two things happen, in this order:
+downloaded. So three things happen, in this order:
 
 1. the reader waits a bounded moment for the original
    (`CYBERBOSS_WECHAT_DB_IMAGE_WAIT_MS`, default 8s, one budget per snapshot, and
    only once per picture per disk state - see below);
-2. if the message still carries a preview, the inbox **opens that one
-   conversation through Cua** (a single foreground click, once per chat per 30s
-   cooldown), waits `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE_WAIT_MS` (default 2.5s) and
-   reads the database again. If the original arrived, the turn gets it; if not,
-   the preview is kept, the message text says it is one, and the log says why:
+2. the message is **delivered immediately** with whatever the reader has, preview
+   included. Delivery is what sends the acknowledgement ("处理中"), and that must
+   not wait for a picture;
+3. a picture that was delivered as a preview goes on a watch list. Every poll
+   re-reads it, and when the original lands the app is told
+   (`onImageUpgraded`), which **swaps the attachment into the turn that has not
+   started yet**. No second message, no second answer:
 
    ```
-   [cyberboss] wechat-db image upgrade chat=Azzy improved=1 waitedMs=2500 size=180x102->800x300
-   [cyberboss] wechat-db image upgrade chat=Azzy still a preview after 2500ms: 1 picture(s) size=180x102 source=abc_t.dat; the client has nothing better on disk
+   [cyberboss] wechat-db inbox image chat=Azzy quality=thumbnail size=157x210 source=abc_t.dat
+   [cyberboss] wechat-db image upgrade chat=Azzy improved=1 size=157x210->1280x1706 source=abc.dat
+   [cyberboss] image upgrade swapped into the pending turn chat=Azzy size=1280x1706 file=…/inbox/2026-10-04/abc.png
    ```
 
-   Switch it off with `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE=false`.
+   If the turn has already started, the same code says so instead of inventing a
+   second turn (`image upgrade arrived too late to swap … waitedMs=10062`), and an
+   entry that never improves is dropped after `imageUpgradeDeadlineMs` (90s) with
+   a warning. Switch the whole path off with
+   `CYBERBOSS_WECHAT_DB_IMAGE_UPGRADE=false`.
 
-**Opening the chat is not a re-download button.** Measured 2026-10-03
-(`scripts/wechat-db-image-redownload-probe.js`): after moving a picture's
-`<md5>.dat` away and opening the conversation through Cua, the file did **not**
-come back within 2 minutes. The upgrade path can therefore rescue a picture the
-client is still fetching, but it cannot bring back one the client no longer has.
+**The original has to be caught as it lands.** Opening the conversation is not a
+re-download button: measured 2026-10-03, after moving a picture's `<md5>.dat` away
+and opening the chat through Cua, the file did **not** come back within 2 minutes
+(`scripts/wechat-db-image-redownload-probe.js`). So the upgrade can rescue a
+picture the client is still fetching - which is the common case (a preview was
+measured arriving **14 seconds** before its original) - and nothing can rescue one
+the client no longer has.
 
 Fetching the original straight from WeChat's CDN does **not** work: the locator in
 the message body (`cdnthumburl`, the same on all three sizes here) answers
 `HTTP 400` on `novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=…` for
 every parameter shape, host and user agent tried, direct and through the proxy
 (2026-10-03). The official iLink channel's `/download?encrypted_query_param=` path
-in `src/adapters/channel/weixin/media-receive.js` is a different contract.
+in `src/adapters/channel/weixin/media-receive.js` is a different contract - and
+that adapter now also accepts a **local file** (`path` / `absolutePath` / `file://`),
+because the database reader decrypts the picture itself and hands over a path
+rather than a URL. Before that branch existed, every picture from this channel was
+dropped with `attachment did not include a supported download reference`, which is
+how the bot could log `quality=original size=900x1400` and still show the model
+nothing.
 
 Suffix handling is the part that bites. `_t` is the **thumbnail** (measured
 180x102 for a 720x240 original, and 171x180 for a picture whose original is

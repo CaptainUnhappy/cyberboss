@@ -574,6 +574,11 @@ class CyberbossApp {
         ? (peer) => this.openChatForImageUpgrade(peer)
         : null,
       imageUpgradeWaitMs: this.config.wechatDbImageUpgradeWaitMs,
+      // A picture handed over as a preview: the inbox keeps watching for the
+      // original and tells us here if it lands while the turn has not started.
+      // Delivery itself does not wait for it - that wait would delay the
+      // acknowledgement.
+      onImageUpgraded: (message, info) => this.handleWechatDbImageUpgraded(message, info),
       onMessage: (message, snapshot) => this.handleWeFlowInboxMessage(message, snapshot),
     });
     await this.wechatDbInboxSource.start();
@@ -612,6 +617,100 @@ class CyberbossApp {
     }
     console.log(`[cyberboss] wechat-db image upgrade opened chat=${label}`);
     return true;
+  }
+
+  /**
+   * A picture that was handed over as a preview now has a better copy.
+   *
+   * The inbox delivers a preview the moment it sees it, because delivery is what
+   * sends the acknowledgement ("处理中") - and the operator's rule is that the
+   * acknowledgement may not wait while the formal reply may. What it does
+   * afterwards is tell us here, so the turn that has NOT started yet can run with
+   * the original instead of the 157x210 preview.
+   *
+   * Two hard rules:
+   *
+   *   * it must never produce a second turn (that is a second answer to one
+   *     message) - so the only thing this touches is the message already queued;
+   *   * it must be quiet when the turn has already started - there is nothing to
+   *     swap, and the preview plus its text note is what the model saw.
+   */
+  async handleWechatDbImageUpgraded(message, info = {}) {
+    const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
+    if (!attachments.length) {
+      return { updated: false, reason: "no attachment to swap" };
+    }
+    // Find the queued copy of THIS message. Looking it up by pending id instead of
+    // by chat id is deliberate: the draft may be keyed by a chat id this layer
+    // would have to guess, and a wrong guess would either miss the swap or touch
+    // another conversation.
+    const pendingId = normalizeText(message?.pendingId) || normalizeText(message?.messageId)
+      || normalizeText(message?.id);
+    let scopeKey = "";
+    let draft = null;
+    for (const [key, candidate] of this.pendingSharedContentInboundByScope?.entries?.() || []) {
+      if ((candidate?.messages || []).some((item) => resolvePendingInboundId(item) === pendingId)) {
+        scopeKey = key;
+        draft = candidate;
+        break;
+      }
+    }
+    if (!draft) {
+      // The quiet window is over and the turn is running (or the draft was
+      // dropped): nothing to swap into, and starting something now would be a
+      // second answer to one message.
+      console.log(
+        `[cyberboss] image upgrade arrived too late to swap chat=${normalizeText(info?.peer) || "(unknown)"} `
+        + `size=${normalizeText(info?.size) || "unknown"} waitedMs=${Number(info?.waitedMs) || 0}`
+      );
+      return { updated: false, reason: "turn already started" };
+    }
+    const persisted = await persistIncomingWeixinAttachments({
+      attachments,
+      stateDir: this.config.stateDir,
+      cdnBaseUrl: this.config.weixinCdnBaseUrl,
+      messageId: pendingId,
+      receivedAt: normalizeText(message?.receivedAt),
+    });
+    if (!persisted.saved.length) {
+      console.warn(
+        `[cyberboss] image upgrade could not persist the original chat=${normalizeText(info?.peer)} `
+        + `reason=${persisted.failed.map((item) => item.reason).join("; ") || "unknown"}`
+      );
+      return { updated: false, reason: "persist failed" };
+    }
+    const queued = (draft.messages || []).find((item) => resolvePendingInboundId(item) === pendingId);
+    const replacement = {
+      ...queued,
+      attachments: persisted.saved,
+      attachmentFailures: [],
+      // The note the reader wrote ("微信只下载了缩略图 …") stops being true the
+      // moment the original is in hand.
+      text: stripThumbnailNotice(queued.text),
+      originalText: stripThumbnailNotice(queued.originalText),
+    };
+    const stored = typeof this.pendingInboundStore?.replaceSharedContentMessage === "function"
+      ? this.pendingInboundStore.replaceSharedContentMessage({
+        bindingKey: draft.bindingKey,
+        workspaceRoot: draft.workspaceRoot,
+        chatId: draft.chatId,
+        message: replacement,
+      })
+      : null;
+    if (stored && stored.updated === false) {
+      return { updated: false, reason: "store no longer holds the message" };
+    }
+    this.pendingSharedContentInboundByScope.set(scopeKey, {
+      ...draft,
+      messages: (draft.messages || []).map((item) => (
+        resolvePendingInboundId(item) === pendingId ? replacement : item
+      )),
+    });
+    console.log(
+      `[cyberboss] image upgrade swapped into the pending turn chat=${normalizeText(info?.peer) || "(unknown)"} `
+      + `size=${normalizeText(info?.size) || "unknown"} file=${persisted.saved[0]?.path || ""}`
+    );
+    return { updated: true };
   }
 
   async closeWechatDbInbox() {
@@ -5376,6 +5475,25 @@ function shouldAcknowledgeInbound(prepared) {
 
 function resolvePendingInboundId(message) {
   return normalizeText(message?.pendingId) || normalizeText(message?.messageId);
+}
+
+/**
+ * Drop the "this is only a preview" note the reader adds to a picture.
+ *
+ * The reader writes `[图片]（微信只下载了缩略图 157x210，原图尚未到达）` when the
+ * original is not on disk yet, and the note is honest until the original arrives -
+ * after which keeping it would tell the model something false about the picture it
+ * is looking at.
+ */
+function stripThumbnailNotice(text) {
+  const value = typeof text === "string" ? text : "";
+  if (!value || !/缩略图|尚未到达|本地文件未取到/u.test(value)) {
+    return value;
+  }
+  return value
+    .replace(/（(?:微信只下载了)?缩略图[^）]*）/gu, "")
+    .replace(/（本地文件未取到[^）]*）/gu, "")
+    .trim();
 }
 
 function buildSharedContentBatchMessageId(prompt, messages) {

@@ -53,6 +53,9 @@ class WechatDbInboxSource {
     imageUpgrade = null,
     imageUpgradeWaitMs = 2_500,
     imageUpgradeCooldownMs = 30_000,
+    imageUpgradeNoticeMs = 2_500,
+    imageUpgradeDeadlineMs = 90_000,
+    onImageUpgraded = null,
   } = {}) {
     if (typeof onMessage !== "function") {
       throw new Error("WechatDbInboxSource needs an onMessage callback");
@@ -76,6 +79,18 @@ class WechatDbInboxSource {
     this.imageUpgrade = typeof imageUpgrade === "function" ? imageUpgrade : null;
     this.imageUpgradeWaitMs = imageUpgradeWaitMs;
     this.imageUpgradeCooldownMs = imageUpgradeCooldownMs;
+    // How long a poll waits for the original of a picture it has ALREADY handed
+    // over: this is the wait that no longer delays the acknowledgement, so it can
+    // be longer than the one before delivery.
+    this.imageUpgradeNoticeMs = imageUpgradeNoticeMs;
+    // How long a preview stays worth chasing before the entry is dropped. Past
+    // this the turn has long started and nothing can be swapped into it.
+    this.imageUpgradeDeadlineMs = imageUpgradeDeadlineMs;
+    // Called when a picture that was delivered as a preview turns out to have a
+    // better copy. The app uses it to swap the attachment in a turn it has not
+    // started yet; it must never start a second turn.
+    this.onImageUpgraded = typeof onImageUpgraded === "function" ? onImageUpgraded : null;
+    this.pendingImageUpgrades = new Map();
     this.imageUpgradeAt = new Map();
     this.state = loadCursorState(config.wechatDbInboxCursorFile);
     this.running = false;
@@ -177,21 +192,20 @@ class WechatDbInboxSource {
   }
 
   /**
-   * Ask the desktop client for the original of a picture it has only previewed.
+   * Open the conversation once when a picture is only a preview, then read the
+   * database again and keep whichever answer is better.
    *
-   * Measured 2026-10-03: WeChat writes `<md5>_t.dat` (a 94x210 preview) the moment
-   * a picture arrives and the full `<md5>.dat` only when the conversation is
-   * rendered - the original in that case appeared 22 seconds later, exactly when
-   * the bot opened the chat to send its reply. Reading pixels cannot fetch what
-   * the client has not downloaded, and the CDN route was tried first and does not
-   * work (the message's `cdnthumburl` locator answers HTTP 400 on
-   * novac2c.cdn.weixin.qq.com whatever the parameter shape; see the note).
+   * Measured 2026-10-03: WeChat writes `<md5>_t.dat` (a 157x210 preview) the
+   * moment a picture arrives and the full `<md5>.dat` **14 seconds later**. The
+   * original in that case is the only copy that will ever exist - opening the
+   * conversation afterwards does NOT bring it back (measured: 2.5 minutes, no
+   * re-download), so it has to be caught as it lands.
    *
-   * So: open that one conversation, wait a moment, read the database again, and
-   * hand over the original if it arrived. Bounded by a per-chat cooldown so a
-   * chat full of previews cannot turn the desktop into a slideshow.
+   * The wait is bounded by the caller, because the caller is what decides whether
+   * the acknowledgement ("处理中") waits with it. It must not: the operator's rule
+   * is "the formal reply may be late, the acknowledgement may not".
    */
-  async upgradeThumbnailImages(snapshots) {
+  async upgradeThumbnailImages(snapshots, { maxWaitMs = 0, sessionMs = 0 } = {}) {
     if (!this.imageUpgrade) {
       return snapshots;
     }
@@ -204,81 +218,246 @@ class WechatDbInboxSource {
       return snapshots;
     }
     const upgraded = snapshots.slice();
+    const deadline = Date.now() + Math.max(0, maxWaitMs);
     for (const snapshot of stale) {
       const index = snapshots.indexOf(snapshot);
       const peer = normalizeText(snapshot?.displayName) || normalizeText(snapshot?.chatUsername);
       const talker = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername);
+      let current = snapshot;
       try {
+        // ONE foreground click per picture per cooldown. The waiting that follows
+        // is re-reading, not re-opening: the conversation is already on screen, so
+        // the client is downloading what it is going to download.
         const opened = await this.imageUpgrade(peer, talker);
-        if (opened === false) {
-          continue;
-        }
-        this.markUpgradeAttempt(index, snapshot);
-        await sleep(this.imageUpgradeWaitMs);
-        const fresh = await this.worker.snapshots({ chats: [talker], limit: this.historyLimit });
-        const refreshed = Array.isArray(fresh?.chats) ? fresh.chats[0] : null;
-        if (!refreshed) {
-          continue;
-        }
-        const before = new Map((snapshot.messages || []).map((message) => [normalizeText(message?.id), message]));
-        const after = new Map((refreshed.messages || []).map((message) => [normalizeText(message?.id), message]));
-        let improved = 0;
-        const better = [];
-        for (const [id, message] of before) {
-          const next = after.get(id);
-          if (next && normalizeText(next.imageQuality) === "original"
-            && normalizeText(message.imageQuality) !== "original") {
-            improved += 1;
-            better.push(`${message.imageSize || "?"}->${next.imageSize || "?"}`);
-          }
-        }
-        upgraded[index] = {
-          ...refreshed,
-          messages: (refreshed.messages || []).map((message) => {
-            const previous = before.get(normalizeText(message?.id));
-            // Keep the preview when the re-read did not improve on it: a
-            // thumbnail is still better than nothing while the client thinks.
-            return previous
-              && normalizeText(previous.imageQuality) === "thumbnail"
-              && normalizeText(message.imageQuality) !== "original"
-              ? previous
-              : message;
-          }),
-        };
-        this.stats.imageUpgrades += 1;
-        if (improved) {
-          this.stats.imageUpgraded += improved;
-        }
-        this.logger.log?.(
-          `[cyberboss] wechat-db image upgrade chat=${peer} improved=${improved} `
-          + `waitedMs=${this.imageUpgradeWaitMs}`
-          + (better.length ? ` size=${better.join(",")}` : "")
-        );
-        if (!improved) {
-          // Report the state the turn will actually run with. Silence here is how
-          // a preview reaches the model while every counter says "upgraded".
-          const stuck = (upgraded[index].messages || []).filter(
-            (message) => normalizeText(message?.imageQuality) === "thumbnail"
-          );
-          if (stuck.length) {
-            const first = stuck[0];
-            this.logger.warn?.(
-              `[cyberboss] wechat-db image upgrade chat=${peer} still a preview after `
-              + `${this.imageUpgradeWaitMs}ms: ${stuck.length} picture(s) `
-              + `size=${normalizeText(first.imageSize) || "unknown"} `
-              + `source=${normalizeText(first.imageSource) || "unknown"}; the client has nothing better on disk`
-            );
+        if (opened !== false) {
+          this.markUpgradeAttempt(index, snapshot);
+          for (;;) {
+            // The gap has to exceed the reader's own wait budget
+            // (`CYBERBOSS_WECHAT_DB_IMAGE_WAIT_MS`, 8s by default) so each pass
+            // re-resolves from disk instead of returning the reader's own answer.
+            await sleep(Math.max(this.imageUpgradeWaitMs, sessionMs));
+            const fresh = await this.worker.snapshots({ chats: [talker], limit: this.historyLimit });
+            const refreshed = Array.isArray(fresh?.chats) ? fresh.chats[0] : null;
+            if (!refreshed) {
+              break;
+            }
+            current = this.mergeUpgrade(current, refreshed);
+            if (!stillPreview(current) || Date.now() >= deadline) {
+              break;
+            }
           }
         }
       } catch (error) {
         this.logger.warn?.(`[cyberboss] wechat-db image upgrade failed chat=${peer}: ${error.message}`);
       }
+      upgraded[index] = current;
+      this.reportUpgrade(peer, snapshot, current);
     }
     return upgraded;
   }
 
-  isUpgradeCoolingDown(index, snapshot) {
-    const key = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername) || String(index);
+  /**
+   * Fold a re-read into the snapshot it came from.
+   *
+   * A picture this side declares a preview is replaced by the re-read whenever the
+   * re-read did better (`original`/`fallback`) - and only then: keeping the preview
+   * is better than losing the attachment while the client thinks. Any message the
+   * re-read added (a text that arrived during the wait) is kept as well, because
+   * dropping it would mean answering a later poll about an earlier state.
+   */
+  mergeUpgrade(before, refreshed) {
+    const previous = new Map((before.messages || []).map((message) => [normalizeText(message?.id), message]));
+    const improved = new Map();
+    for (const message of refreshed.messages || []) {
+      const id = normalizeText(message?.id);
+      const old = previous.get(id);
+      if (old && normalizeText(old.imageQuality) === "thumbnail"
+        && normalizeText(message.imageQuality) === "thumbnail") {
+        improved.set(id, old);
+      } else {
+        improved.set(id, message);
+      }
+    }
+    for (const [id, message] of previous) {
+      if (!improved.has(id)) {
+        improved.set(id, message);
+      }
+    }
+    const order = (refreshed.messages || []).map((message) => normalizeText(message?.id));
+    for (const id of previous.keys()) {
+      if (!order.includes(id)) {
+        order.push(id);
+      }
+    }
+    return {
+      ...refreshed,
+      messages: order.map((id) => improved.get(id)).filter(Boolean),
+      upgradeBefore: before,
+    };
+  }
+
+  /** What an upgrade attempt did, said out loud either way. */
+  reportUpgrade(peer, before, after) {
+    const ids = new Set([...(before.messages || []), ...(after.messages || [])]
+      .filter((message) => normalizeText(message?.imageQuality) === "thumbnail"
+        || normalizeText(message?.imageQuality) === "original")
+      .map((message) => normalizeText(message?.id)));
+    let improved = 0;
+    const better = [];
+    const afterById = new Map((after.messages || []).map((message) => [normalizeText(message?.id), message]));
+    for (const id of ids) {
+      const old = (before.messages || []).find((message) => normalizeText(message?.id) === id);
+      const next = afterById.get(id);
+      if (old && next && normalizeText(next.imageQuality) === "original"
+        && normalizeText(old.imageQuality) !== "original") {
+        improved += 1;
+        better.push(`${old.imageSize || "?"}->${next.imageSize || "?"}`);
+      }
+    }
+    this.stats.imageUpgrades += 1;
+    if (improved) {
+      this.stats.imageUpgraded += improved;
+    }
+    this.logger.log?.(
+      `[cyberboss] wechat-db image upgrade chat=${peer} improved=${improved} `
+      + `waitedMs=${this.imageUpgradeWaitMs}`
+      + (better.length ? ` size=${better.join(",")}` : "")
+    );
+    if (improved || !stillPreview(after)) {
+      return;
+    }
+    // Report the state the turn will run with. Silence here is how a preview
+    // reaches the model while every counter says "upgraded".
+    const stuck = (after.messages || []).filter(
+      (message) => normalizeText(message?.imageQuality) === "thumbnail"
+    );
+    if (!stuck.length) {
+      return;
+    }
+    const first = stuck[0];
+    this.logger.warn?.(
+      `[cyberboss] wechat-db image upgrade chat=${peer} still a preview after `
+      + `${this.imageUpgradeWaitMs}ms: ${stuck.length} picture(s) `
+      + `size=${normalizeText(first.imageSize) || "unknown"} `
+      + `source=${normalizeText(first.imageSource) || "unknown"}; the client has nothing better on disk`
+    );
+  }
+
+  /**
+   * Note that this message was delivered while its picture was only a preview.
+   *
+   * Returns the tracking record when the caller should treat the message as
+   * "delivered early, original expected" - which is exactly when the app has to
+   * be told later that the picture got better.
+   */
+  rememberPendingImageUpgrade(item) {
+    const message = item.message;
+    if (!this.onImageUpgraded || normalizeText(message?.imageQuality) !== "thumbnail") {
+      return null;
+    }
+    const existing = this.pendingImageUpgrades.get(normalizeText(message.id));
+    if (existing) {
+      // Keep the FIRST sighting: `atMs` is the start of the wait budget and
+      // `deliveredAtMs` is what stops the row from being delivered twice, so a
+      // later poll must not reset either of them.
+      return existing;
+    }
+    const key = normalizeText(item.talker) || normalizeText(item.peer);
+    const entry = {
+      id: message.id,
+      talker: key,
+      peer: normalizeText(item.peer),
+      atMs: Date.now(),
+      deliveredAtMs: 0,
+      first: `${normalizeText(message.imageSize) || "unknown"} ${normalizeText(message.imageSource) || "unknown"}`,
+      quality: normalizeText(message.imageQuality),
+    };
+    this.pendingImageUpgrades.set(message.id, entry);
+    return entry;
+  }
+
+  pendingImageUpgradeFor(messageId) {
+    return this.pendingImageUpgrades.get(normalizeText(messageId)) || null;
+  }
+
+  isAwaitingImageUpgrade(message) {
+    return Boolean(this.pendingImageUpgradeFor(message?.id));
+  }
+
+  clearPendingImageUpgrade(message) {
+    this.pendingImageUpgrades.delete(normalizeText(message?.id));
+  }
+
+  /**
+   * Tell the app that a picture it already handed over has a better copy now.
+   *
+   * The app swaps the attachment inside the turn it has NOT started yet; if that
+   * turn already ran, the callback is a no-op on its side. What must never happen
+   * here is a second turn: the operator asked for the original picture, not for a
+   * second answer.
+   */
+  notifyImageUpgraded(message, entry, snapshots) {
+    const quality = normalizeText(message.imageQuality);
+    if (quality !== "original" && quality !== "fallback") {
+      return false;
+    }
+    const size = normalizeText(message.imageSize) || "unknown";
+    this.stats.imageUpgrades += 1;
+    this.stats.imageUpgraded += 1;
+    this.pendingImageUpgrades.delete(entry.id);
+    this.logger.log?.(
+      `[cyberboss] wechat-db image upgrade chat=${entry.peer} improved=1 `
+      + `size=${entry.first}->${size} source=${normalizeText(message.imageSource) || "unknown"}`
+    );
+    try {
+      this.onImageUpgraded(message, {
+        talker: entry.talker,
+        peer: entry.peer,
+        waitedMs: Date.now() - entry.atMs,
+        quality,
+        size,
+        snapshots,
+      });
+    } catch (error) {
+      this.logger.warn?.(`[cyberboss] wechat-db image upgrade handover failed: ${error.message}`);
+    }
+    return true;
+  }
+
+  /**
+   * Give every picture that was delivered as a preview a chance to be upgraded,
+   * once per poll, without opening any conversation again (the per-chat cooldown
+   * already prevents a second click).
+   */
+  async notifyPendingImageUpgrades(snapshots) {
+    if (!this.onImageUpgraded || !this.pendingImageUpgrades.size) {
+      return 0;
+    }
+    let improved = 0;
+    for (const entry of [...this.pendingImageUpgrades.values()]) {
+      const message = findByEnvelopeId(snapshots, entry.id);
+      if (!message) {
+        continue;
+      }
+      if (this.notifyImageUpgraded(message, entry, snapshots)) {
+        improved += 1;
+        continue;
+      }
+      if (Date.now() - entry.atMs > this.imageUpgradeDeadlineMs) {
+        // The window is over: whatever the turn is going to run with, it is not
+        // going to change, and holding the entry forever would only hide that.
+        this.pendingImageUpgrades.delete(entry.id);
+        this.logger.warn?.(
+          `[cyberboss] wechat-db image upgrade chat=${entry.peer} gave up after `
+          + `${Date.now() - entry.atMs}ms: still ${normalizeText(message.imageSize) || "unknown"} `
+          + `from ${normalizeText(message.imageSource) || "unknown"}`
+        );
+      }
+    }
+    return improved;
+  }
+
+  isUpgradeCoolingDown(index, snapshot) {    const key = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername) || String(index);
     const last = Number(this.imageUpgradeAt.get(key) || 0);
     return Date.now() - last < this.imageUpgradeCooldownMs;
   }
@@ -300,8 +479,11 @@ class WechatDbInboxSource {
     });
     let snapshots = Array.isArray(payload?.chats) ? payload.chats : [];
     const failures = Array.isArray(payload?.failures) ? payload.failures : [];
-    // A picture whose original is not on disk yet: WeChat only downloads it when
-    // the conversation is shown, so ask for it once, then read the database again.
+    // A picture whose original is not on disk yet: ask the client for it once. This
+    // call DOES wait the short `imageUpgradeWaitMs` - long enough to catch a client
+    // that was already downloading - but it deliberately does not wait the big
+    // picture budget. That wait belongs after delivery, because delivery is what
+    // triggers the acknowledgement ("处理中").
     snapshots = await this.upgradeThumbnailImages(snapshots);
     for (const failure of failures) {
       this.logger.warn?.(`[cyberboss] wechat-db inbox could not read a chat: ${failure}`);
@@ -313,62 +495,132 @@ class WechatDbInboxSource {
     const replayIds = firstSnapshot && this.replayOnStart
       ? new Set(collectIncoming(snapshots).slice(-this.replayLimit).map((item) => item.message.id))
       : new Set();
+    const batch = collectBatch(snapshots, (peer, text) => this.isOwnEcho(peer, text));
     let processed = 0;
 
-    for (const snapshot of snapshots) {
-      const peer = normalizeText(snapshot?.displayName) || normalizeText(snapshot?.chatUsername);
-      const talker = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername);
-      const chatSnapshot = {
-        chat: normalizeText(snapshot?.chat),
-        // The CUA writer opens a conversation by its displayed name, so that is
-        // what the reply route has to carry.
-        chatUsername: peer,
-        chatTalker: talker,
-      };
-      const seen = new Set(this.state.seenIds);
-      for (const raw of Array.isArray(snapshot?.messages) ? snapshot.messages : []) {
-        const message = normalizeSnapshotMessage(raw);
-        if (!message || seen.has(message.id)) {
-          continue;
-        }
-        const ownEcho = message.direction === "outgoing" && this.isOwnEcho(peer, message.text);
-        if (ownEcho) {
-          this.stats.suppressed += 1;
-        }
-        const shouldDispatch = !ownEcho
-          && (!firstSnapshot || replayIds.has(message.id));
-        if (shouldDispatch) {
-          // How long the bot took to NOTICE: from the moment WeChat stored the row
-          // to the moment this poll handed it over. This is the first half of the
-          // operator's "处理中 is late" complaint, and without it the only number
-          // available was the ack's total latency, which cannot say whether the
-          // time went into noticing or into sending.
-          const lagMs = message.timestamp ? Date.now() - message.timestamp * 1000 : 0;
-          if (lagMs > 0) {
-            this.stats.lastLagMs = lagMs;
-            this.stats.maxLagMs = Math.max(this.stats.maxLagMs || 0, lagMs);
-          }
-          const accepted = await this.onMessage(buildEnvelope(message, { peer, talker }), chatSnapshot, { lagMs });
-          if (accepted === false) {
-            // Not accepted means "ask me again later" (no reply route yet, the
-            // ledger has not caught up). Leave it unseen so the next poll
-            // retries instead of dropping a real message on the floor.
-            this.stats.deferred += 1;
-            await this.saveState();
-            return { status: "deferred", processed };
-          }
-          processed += 1;
-          this.stats.delivered += 1;
-          this.noteImage(message, peer);
-          this.logger.log?.(
-            `[cyberboss] wechat-db inbox delivered talker=${talker} localId=${message.localId} `
-            + `direction=${message.direction} lagMs=${lagMs} pollMs=${this.pollIntervalMs}`
-          );
-        }
-        this.rememberSeen(message.id);
-        seen.add(message.id);
+    // EVERY picture that is still a preview goes on the watch list - not just the
+    // ones delivered on this poll. Tracking them only at delivery was a real bug
+    // (caught 2026-10-03 by forcing the state on a live bot): a preview that
+    // arrived before the baseline, or that was delivered an hour ago, was never
+    // watched again, so the original landing later changed nothing at all.
+    for (const item of batch) {
+      if (!item.echo && normalizeText(item.message?.imageQuality) === "thumbnail") {
+        this.rememberPendingImageUpgrade(item);
       }
     }
+
+    // The acknowledgement rides on delivery, so a preview is handed over the
+    // moment it is seen. Measured 2026-10-03: WeChat stored a 157x210 preview 14s
+    // before the only copy of the original that would ever exist, and the earlier
+    // design waited here for the original, which pushed the acknowledgement out by
+    // the whole image budget. The operator's rule is the other way round: the
+    // formal reply may be late, the acknowledgement may not.
+    for (const item of batch) {
+      if (item.echo || !isDeliverable(item.message, { firstSnapshot, replayIds })) {
+        continue;
+      }
+      const pending = this.pendingImageUpgradeFor(item.message.id);
+      if (!pending || pending.deliveredAtMs) {
+        continue;
+      }
+      const lagMs = item.message.timestamp ? Date.now() - item.message.timestamp * 1000 : 0;
+      const accepted = await this.onMessage(
+        buildEnvelope(item.message, item),
+        item.chatSnapshot,
+        { lagMs },
+      );
+      if (accepted === false) {
+        this.stats.deferred += 1;
+        await this.saveState();
+        return { status: "deferred", processed };
+      }
+      processed += 1;
+      this.stats.delivered += 1;
+      pending.deliveredAtMs = Date.now();
+      // Seen right here: the loop below must not hand the same row over again just
+      // because the picture improved (an upgrade is a swap inside the pending
+      // turn, not a second turn).
+      this.rememberSeen(item.message.id);
+      this.noteImage(item.message, item.peer);
+      this.logger.log?.(
+        `[cyberboss] wechat-db inbox delivered talker=${item.talker} localId=${item.message.localId} `
+        + `direction=${item.message.direction} lagMs=${lagMs} early=preview`
+      );
+    }
+
+    // Now spend the picture budget: one conversation open (the per-chat cooldown
+    // allows it only once), then re-read until the original lands or the budget is
+    // gone. This happens AFTER the delivery above, which is what keeps the
+    // acknowledgement fast.
+    if (this.pendingImageUpgrades.size) {
+      await sleep(Math.max(this.imageUpgradeWaitMs, this.imageUpgradeNoticeMs));
+      const fresh = await this.worker.snapshots({ chats: this.chats, limit: this.historyLimit });
+      if (Array.isArray(fresh?.chats) && fresh.chats.length) {
+        snapshots = await this.upgradeThumbnailImages(fresh.chats);
+        await this.notifyPendingImageUpgrades(snapshots);
+      }
+    }
+
+    // How long the bot took to NOTICE: from the moment WeChat stored the row to
+    // the moment this poll handed it over. This is the first half of the
+    // operator's "处理中 is late" complaint, and without it the only number
+    // available was the ack's total latency, which cannot say whether the time
+    // went into noticing or into sending.
+    const seen = new Set(this.state.seenIds);
+    for (const item of batch) {
+      const message = item.message;
+      const peer = item.peer;
+      const talker = item.talker;
+      if (seen.has(message.id)) {
+        continue;
+      }
+      const ownEcho = item.echo;
+      if (ownEcho) {
+        this.stats.suppressed += 1;
+      }
+      const shouldDispatch = !ownEcho && isDeliverable(message, { firstSnapshot, replayIds });
+      if (shouldDispatch) {
+        if (this.isAwaitingImageUpgrade(message)) {
+          // Delivered once already (with its acknowledgement) and still waiting for
+          // the picture: hand it over again only when we have something better, or
+          // when its window is over. Delivering the preview early keeps the
+          // acknowledgement fast; delivering it a second time unchanged would only
+          // make noise.
+          const first = this.pendingImageUpgradeFor(message.id);
+          if (!first || first.deliveredAtMs) {
+            this.rememberSeen(message.id);
+            seen.add(message.id);
+            continue;
+          }
+          first.deliveredAtMs = Date.now();
+        }
+        const lagMs = message.timestamp ? Date.now() - message.timestamp * 1000 : 0;
+        if (lagMs > 0) {
+          this.stats.lastLagMs = lagMs;
+          this.stats.maxLagMs = Math.max(this.stats.maxLagMs || 0, lagMs);
+        }
+        const accepted = await this.onMessage(buildEnvelope(message, { peer, talker }), item.chatSnapshot, { lagMs });
+        if (accepted === false) {
+          // Not accepted means "ask me again later" (no reply route yet, the
+          // ledger has not caught up). Leave it unseen so the next poll retries
+          // instead of dropping a real message on the floor.
+          this.stats.deferred += 1;
+          await this.saveState();
+          return { status: "deferred", processed };
+        }
+        processed += 1;
+        this.stats.delivered += 1;
+        this.noteImage(message, peer);
+        this.clearPendingImageUpgrade(message);
+        this.logger.log?.(
+          `[cyberboss] wechat-db inbox delivered talker=${talker} localId=${message.localId} `
+          + `direction=${message.direction} lagMs=${lagMs} pollMs=${this.pollIntervalMs}`
+        );
+      }
+      this.rememberSeen(message.id);
+      seen.add(message.id);
+    }
+    await this.notifyPendingImageUpgrades(snapshots);
     if (!this.state.initialized) {
       this.state.initialized = true;
     }
@@ -518,8 +770,79 @@ function buildEnvelope(message, { peer, talker }) {
   };
 }
 
-function collectIncoming(snapshots) {
-  const items = [];
+/**
+ * Is any picture in this snapshot still "a preview and nothing better"?
+ *
+ * The question that decides whether another look is worth taking. `missing` is NOT
+ * a preview here: a picture whose file cannot be read at all will not improve by
+ * waiting, and waiting on it would hold a text message hostage.
+ */
+function stillPreview(snapshot) {
+  return (snapshot?.messages || []).some(
+    (message) => normalizeText(message?.imageQuality) === "thumbnail"
+  );
+}
+
+/**
+ * Every row this poll saw, in order, with the routing facts each one needs.
+ *
+ * A flat list rather than a per-snapshot loop: the delivery order is what decides
+ * whether the acknowledgement goes out before the picture's wait, so it is worth
+ * being able to read in one place.
+ */
+function collectBatch(snapshots, isOwnEcho) {
+  const batch = [];
+  for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+    const peer = normalizeText(snapshot?.displayName) || normalizeText(snapshot?.chatUsername);
+    const talker = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername);
+    const chatSnapshot = {
+      chat: normalizeText(snapshot?.chat),
+      // The CUA writer opens a conversation by its displayed name, so that is
+      // what the reply route has to carry.
+      chatUsername: peer,
+      chatTalker: talker,
+    };
+    for (const raw of Array.isArray(snapshot?.messages) ? snapshot.messages : []) {
+      const message = normalizeSnapshotMessage(raw);
+      if (!message) {
+        continue;
+      }
+      batch.push({
+        message,
+        snapshot,
+        chatSnapshot,
+        peer,
+        talker,
+        echo: message.direction === "outgoing" && isOwnEcho(peer, message.text),
+      });
+    }
+  }
+  return batch;
+}
+
+/** Should this row be handed to the app (as opposed to suppressed or baselined)? */
+function isDeliverable(message, { firstSnapshot, replayIds }) {
+  return !firstSnapshot || replayIds.has(message.id);
+}
+
+/** The same message, as the freshest read of the database describes it. */
+function findByEnvelopeId(snapshots, id) {
+  const wanted = normalizeText(id);
+  if (!wanted) {
+    return null;
+  }
+  for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+    for (const raw of Array.isArray(snapshot?.messages) ? snapshot.messages : []) {
+      const message = normalizeSnapshotMessage(raw);
+      if (message && message.id === wanted) {
+        return message;
+      }
+    }
+  }
+  return null;
+}
+
+function collectIncoming(snapshots) {  const items = [];
   for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
     for (const raw of Array.isArray(snapshot?.messages) ? snapshot.messages : []) {
       const message = normalizeSnapshotMessage(raw);

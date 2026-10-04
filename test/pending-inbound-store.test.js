@@ -1978,6 +1978,64 @@ test("a retrying startup revoke gates only the primary WeFlow scope until it is 
   assert.equal(appLike.pendingInboundByScope.size, 0);
 });
 
+test("a better picture replaces the queued message without restarting its quiet window", () => {
+  // The late-original-image path (2026-10-03): the preview was delivered early so
+  // the acknowledgement did not wait, and the original lands 14 seconds later,
+  // while the turn has not started yet. The swap must not read as new activity -
+  // otherwise the turn is pushed out again for something the peer did not do.
+  const { filePath } = createStore();
+  const store = new PendingInboundStore({ filePath });
+  const queued = fixtureMessage({
+    messageId: "weflow:shared-image",
+    pendingId: "weflow:shared-image",
+    chatId: "weflow:wxid_peer",
+    originalText: "[图片]（微信只下载了缩略图 157x210，原图尚未到达）",
+    text: "[图片]（微信只下载了缩略图 157x210，原图尚未到达）",
+    contentKind: "image",
+    sharedContent: true,
+    attachments: [{ kind: "image", absolutePath: "D:/inbox/preview.jpg", origin: "direct" }],
+  });
+  const enqueued = store.enqueueSharedContent({
+    bindingKey: "binding-1",
+    workspaceRoot: "D:/workspace",
+    chatId: queued.chatId,
+    message: queued,
+    lastContentAtMs: Date.parse(queued.receivedAt),
+  });
+  const quietBefore = enqueued.draft.lastContentAtMs;
+
+  const result = store.replaceSharedContentMessage({
+    bindingKey: "binding-1",
+    workspaceRoot: "D:/workspace",
+    chatId: queued.chatId,
+    message: {
+      ...queued,
+      text: "",
+      originalText: "",
+      attachments: [{ kind: "image", absolutePath: "D:/inbox/original.png", origin: "direct" }],
+    },
+  });
+  assert.equal(result.updated, true);
+  const scope = store.snapshotSharedMap().get("binding-1::D:/workspace::weflow:wxid_peer");
+  assert.equal(scope.messages.length, 1, "a swap must not add a second message");
+  assert.equal(scope.messages[0].attachments[0].absolutePath, "D:/inbox/original.png");
+  assert.equal(scope.messages[0].text, "");
+  assert.equal(scope.lastContentAtMs, quietBefore, "an upgrade is not new activity from the peer");
+
+  // ...and a message that is no longer queued is never recreated by a swap.
+  const missing = store.replaceSharedContentMessage({
+    bindingKey: "binding-1",
+    workspaceRoot: "D:/workspace",
+    chatId: queued.chatId,
+    message: { ...queued, pendingId: "weflow:not-queued", messageId: "weflow:not-queued" },
+  });
+  assert.equal(missing.updated, false);
+  assert.equal(
+    store.snapshotSharedMap().get("binding-1::D:/workspace::weflow:wxid_peer").messages.length,
+    1,
+  );
+});
+
 test("startup revoke reconciliation is bounded while the durable gate remains armed", async () => {
   let scheduled = 0;
   const source = {
