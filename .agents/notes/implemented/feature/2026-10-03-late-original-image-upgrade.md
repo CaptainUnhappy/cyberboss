@@ -81,16 +81,20 @@ Node 对它的回答是 "fetch failed"，所以这一步必须自己读文件。
    而它现在是"同一 pendingId 直接忽略"（`pending-inbound-store.enqueueSharedContent`），
    改它等于让"重复投递"变成正常路径——代价比收益大。
 
-## 上线后抓到的第二个缺陷：同一张预览被交付两次
+## 上线后改掉的两处（2026-10-04）
 
-生产日志（2026-10-04）里 `localId=66 … early=preview` 在**同一次轮询**里出现了两次。
-原因是纯粹的顺序问题：主循环用的 `seen` 集合是在**提前交付之前**从 `state.seenIds` 拷出来的，
-而提前交付那一步才把行标成已见——于是主循环看到的是"没见过"，把同一行又交给应用一次
-（一行 = 两个轮次）。
+**一、同一行看起来被交付了两次——其实不是。** 日志里 `localId=66 … early=preview` 出现两行，
+时间相差 93.8 秒，而这份日志里只有一个 `inbox enabled`。真相：那两次来自**两个不同的守护进程**
+（第二次启动时它的日志覆盖了同名文件，只留下自己的尾部）。诊断被记在这里，因为差点照着
+一个不存在的 bug 改代码。仍然顺手把 `seen` 集合的构造挪到提前交付**之后**（顺序更明确，
+单测 `a preview is handed over exactly once per poll, even while it is watched` 锁住
+"一行一轮只交付一次"），但要说清楚：生产里的双行不是它造成的。
 
-修法：`seen` 在提前交付**之后**再构造（并留注释说明为什么顺序不能动）。
-回归测试 `a preview is handed over exactly once per poll, even while it is watched`
-（断言 `processed === 1` 且只交付一次）。修完重启生产：每个 localId 只出现一行。
+**二、每次轮询都等满 2.5 秒（真实缺陷）。** 待升级清单里有条目就无条件等 2.5 秒 + 重读，
+于是稳态 `slow poll costMs=2730-2946`、整个轮询周期 2.7-2.9 秒（三个会话都受它拖累）。
+这跟上一轮"每轮都等 8 秒"是同一类错误：**没有变化的东西不该再等**。
+修法 `shouldWaitForImages()`：只有"源文件的指纹（imageSize|imageSource）变了"或"这个条目还从没等过"
+才付这笔等待；没有轮到等的轮询照常重读一次（便宜）并继续判断。
 
 ## Consequences
 
@@ -115,3 +119,12 @@ Node 对它的回答是 "fetch failed"，所以这一步必须自己读文件。
   不新增消息、不重置窗口。
 - 真机：`tmp/probe-local-attachment-persist.js` 用真实 900×1400 PNG 验证持久化（修复前 `saved: 0`，
   修复后 `saved: 1 -> …\inbox\2026-10-04\e2e-900x1400.png (51743B, image/png)`）。
+- 真机（生产，强制预览状态）：11:32:23 把 `<md5>.dat` 挪走 → `inbox image chat=Azzy
+  quality=thumbnail size=157x210`；11:32:42 原图落地 → `image upgrade chat=Azzy improved=1
+  size=157x210->1280x1706`，10.0 秒内抓到；该消息的轮次 12 小时前已跑完，于是正确地打出
+  `image upgrade arrived too late to swap … waitedMs=10062`（边界那一半也因此有了真机证据）。
+- 真机（稳态成本）：`slow poll` 从每轮一次（2730-2946ms）降到只剩冷启动那一次，
+  稳态 `lastPollMs=132-139ms`（三个会话）。
+- **仍未验证**：`image upgrade swapped into the pending turn …` 这一行需要一张**刚到达**的图
+  （旧消息的轮次早开始了），只能由对端设备发一张才会出现。实现侧它由
+  `wechat-db-image-upgrade-swap` 的四个单测覆盖（含"轮次已开始则不动作"）。

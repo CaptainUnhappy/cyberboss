@@ -457,6 +457,39 @@ class WechatDbInboxSource {
     return improved;
   }
 
+  /**
+   * Is it worth blocking this poll to wait for an original?
+   *
+   * Yes for a picture whose source files changed since the last look - that is a
+   * client mid-download - and for one that has never been waited on. No for a
+   * picture that has already been waited on and has not moved: the answer cannot
+   * change, and the wait is charged to every chat this poll serves.
+   */
+  shouldWaitForImages(batch) {
+    const fingerprints = new Map();
+    for (const item of batch) {
+      const message = item.message;
+      if (normalizeText(message?.imageQuality) !== "thumbnail") {
+        continue;
+      }
+      fingerprints.set(message.id, `${normalizeText(message.imageSize)}|${normalizeText(message.imageSource)}`);
+    }
+    let wait = false;
+    for (const [id, fingerprint] of fingerprints) {
+      const entry = this.pendingImageUpgrades.get(id);
+      if (!entry) {
+        continue;
+      }
+      entry.waits = Number(entry.waits || 0);
+      if (!entry.waits || entry.fingerprint !== fingerprint) {
+        wait = true;
+      }
+      entry.waits += 1;
+      entry.fingerprint = fingerprint;
+    }
+    return wait;
+  }
+
   isUpgradeCoolingDown(index, snapshot) {    const key = normalizeText(snapshot?.talker) || normalizeText(snapshot?.chatUsername) || String(index);
     const last = Number(this.imageUpgradeAt.get(key) || 0);
     return Date.now() - last < this.imageUpgradeCooldownMs;
@@ -552,7 +585,13 @@ class WechatDbInboxSource {
     // allows it only once), then re-read until the original lands or the budget is
     // gone. This happens AFTER the delivery above, which is what keeps the
     // acknowledgement fast.
-    if (this.pendingImageUpgrades.size) {
+    //
+    // "Until it lands" is not "every poll": a picture whose source files have not
+    // changed cannot answer differently, and waiting 2.5s for it on every poll
+    // pushed the whole loop to 2.7-2.9s per cycle (measured 2026-10-04 in
+    // production, `slow poll costMs=2852` on repeat). The first look at a preview
+    // pays the wait; every later look at an unchanged one skips it.
+    if (this.pendingImageUpgrades.size && this.shouldWaitForImages(batch)) {
       await sleep(Math.max(this.imageUpgradeWaitMs, this.imageUpgradeNoticeMs));
       const fresh = await this.worker.snapshots({ chats: this.chats, limit: this.historyLimit });
       if (Array.isArray(fresh?.chats) && fresh.chats.length) {
