@@ -704,6 +704,48 @@ test("a preview is handed over exactly once per poll, even while it is watched",
   assert.deepEqual(delivered, ["pic-once"], "a watched preview is not delivered again");
 });
 
+test("a row handed over early is never delivered again, watcher or not", async () => {
+  // Measured in production 2026-10-04: a picture whose watcher entry had already
+  // been dropped came back on EVERY poll - 14 deliveries of the same two rows in
+  // one boot, each with a 21-hour lag - and the turns they created are why a real
+  // message got no answer.
+  const previewMessage = message({
+    id: "pic-forever",
+    kind: "image",
+    imageQuality: "thumbnail",
+    imageSize: "171x180",
+    imageSource: "abc_t.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\abc_thumb.jpg", origin: "direct" }],
+  });
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+  ]);
+  const delivered = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async (msg) => { delivered.push(msg.id); return true; },
+    // No upgrade path at all: there is no watcher entry to mark anything, and the
+    // row still must not come back.
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  await source.pollOnce();
+  // ...now let the watcher entry be dropped, which is what used to resurrect it
+  // every 90 seconds: the next poll re-created the entry and handed the preview
+  // over again.
+  source.pendingImageUpgrades.clear();
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.deepEqual(delivered, ["pic-forever"], "one handover, ever");
+  assert.equal(source.stats.delivered, 1);
+});
+
 test("an unchanged preview is announced once, not on every poll", async () => {
   // Measured 2026-10-04: the watcher announced the same unchanged preview every
   // poll, the app persisted a fresh copy each time, and one day folder collected

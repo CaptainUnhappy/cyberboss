@@ -91,6 +91,9 @@ class WechatDbInboxSource {
     // started yet; it must never start a second turn.
     this.onImageUpgraded = typeof onImageUpgraded === "function" ? onImageUpgraded : null;
     this.pendingImageUpgrades = new Map();
+    // Rows already handed over early (envelope id -> nothing). Survives the watcher
+    // entry on purpose: see `rememberImageHandedOver`.
+    this.imageHandedOver = new Set();
     this.imageUpgradeAt = new Map();
     this.state = loadCursorState(config.wechatDbInboxCursorFile);
     this.running = false;
@@ -385,6 +388,26 @@ class WechatDbInboxSource {
     return this.pendingImageUpgrades.get(normalizeText(messageId)) || null;
   }
 
+  /**
+   * "This row has been handed over already" - independent of the watcher entry.
+   *
+   * Kept as a bounded, insertion-ordered set: a long-running bot sees hundreds of
+   * thousands of rows, and this only has to remember long enough that no row in the
+   * reader's history window can come back.
+   */
+  rememberImageHandedOver(messageId) {
+    const id = normalizeText(messageId);
+    if (!id) {
+      return;
+    }
+    this.imageHandedOver.delete(id);
+    this.imageHandedOver.add(id);
+    while (this.imageHandedOver.size > MAX_SEEN_IDS) {
+      const oldest = this.imageHandedOver.values().next().value;
+      this.imageHandedOver.delete(oldest);
+    }
+  }
+
   isAwaitingImageUpgrade(message) {
     return Boolean(this.pendingImageUpgradeFor(message?.id));
   }
@@ -600,7 +623,11 @@ class WechatDbInboxSource {
         continue;
       }
       const pending = this.pendingImageUpgradeFor(item.message.id);
-      if (!pending || pending.deliveredAtMs) {
+      // "Handed over already" is remembered PER MESSAGE, not on the watcher entry:
+      // the entry is dropped when the upgrade window closes, and a re-created entry
+      // used to hand the same preview over again - measured 2026-10-04, a preview
+      // came back every 90 seconds with a 21-hour lag, forever.
+      if (!pending || this.imageHandedOver.has(item.message.id)) {
         continue;
       }
       const lagMs = item.message.timestamp ? Date.now() - item.message.timestamp * 1000 : 0;
@@ -616,11 +643,11 @@ class WechatDbInboxSource {
       }
       processed += 1;
       this.stats.delivered += 1;
-      pending.deliveredAtMs = Date.now();
-      // Seen right here: the loop below must not hand the same row over again just
-      // because the picture improved (an upgrade is a swap inside the pending
-      // turn, not a second turn).
+      // Marked seen in the same breath as the handover, so the main loop below
+      // (which snapshots `state.seenIds` after this one finishes) skips it.
       this.rememberSeen(item.message.id);
+      this.rememberImageHandedOver(item.message.id);
+      pending.deliveredAtMs = Date.now();
       this.noteImage(item.message, item.peer);
       this.logger.log?.(
         `[cyberboss] wechat-db inbox delivered talker=${item.talker} localId=${item.message.localId} `
