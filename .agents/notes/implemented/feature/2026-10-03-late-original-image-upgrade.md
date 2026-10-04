@@ -132,6 +132,27 @@ inbox 侧一轮只交接一次，所以那第二份来自应用侧的持久化�
 `CYBERBOSS_SHARED_PORT=8767`，而该端口当前没有监听），这是与图片无关的另一条线索，
 需要下一次真实消息来定位。
 
+**五、用户那条"没回复"的图，其实是被规则静默掉了。** 用户报"azzy 消息还是没回复"。查 DSH 会话记录
+（`~/.dsh/sessions/--D-Projects-cyberboss-user-cyberboss--/004fcf30-…`，用 `scripts/dsh-transcript.py`）：
+
+- 那一轮的输入带了 `Current-turn attachment/reference boundary`（"优先解释或分析本轮附件"）；
+- 助手的推理原文：*"Now a full-size screenshot (1220x2712) arrived, no text. It's a JD product page
+  screenshot for the nubia NaviX Ultra AI phone… **No text message. Lone image, no task → per rules
+  silent.**"*；
+- 也就是说：**图到了、被看懂了，然后按规则故意不回**。前两张图它其实回了（同一份记录里为
+  157×210 的缩略图拟过回复）。
+
+规则在 `~/.cyberboss/weixin-instructions.md`：第 2 节把"单独发送的图片"列进"仅收件"，
+判断示例里直接写"单发一张图：静默"。用户选择改成"单发图片就正常分析回复"，因此：
+
+- 第 2 节的收件清单里移除图片/视频，并加一句"用户本人单独发来的图片/视频一律当任务处理
+  （转发来的聊天记录里的图片仍按收件规则）"；
+- 判断示例改为"单发一张图：直接看图回一句——看到什么说什么，不静默、不反问"。
+
+这个文件是**运营本地状态**（`config.weixinInstructionsFile` 指向 state 目录，不在仓库里），
+`shared-instructions.js` 按 `mtime` 缓存，所以改完下一轮就生效、不需要重启。
+仓库里的 `templates/weixin-instructions.md` 是另一份（本项目里两者本就不一致），没有跟着改。
+
 ## Consequences
 
 - 「处理中」不再为图片等待买单：交付在看见预览的那一刻发生，和文字消息同一条路径。
