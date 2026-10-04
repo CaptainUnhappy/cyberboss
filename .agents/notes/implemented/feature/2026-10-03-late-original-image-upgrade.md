@@ -153,6 +153,51 @@ inbox 侧一轮只交接一次，所以那第二份来自应用侧的持久化�
 `shared-instructions.js` 按 `mtime` 缓存，所以改完下一轮就生效、不需要重启。
 仓库里的 `templates/weixin-instructions.md` 是另一份（本项目里两者本就不一致），没有跟着改。
 
+## 补上「原图为什么从来没落盘」的那个上游开关（2026-10-04 晚）
+
+上面整篇讲的是**原图落盘之后**怎么抓、怎么换。用户 2026-10-04 报的是更前面的一段——
+「图片/视频/文件取不到」。查下来：原图常常**根本没被写进磁盘**，而那个开关不在本仓库里，在 WeFlow：
+
+- `%APPDATA%\weflow\WeFlow-config.json` 的 `autoDownloadWhitelist` + `autoDownloadHighRes`。
+  WeFlow 的「自动下载」（设置 → 自动下载，仅 win32-x64）会往**微信进程里装内存 Hook**
+  （日志：`[ImageDownloadService] attempting to hook PID … / hook successful`），按白名单
+  **强制微信把原图落盘**。非空白名单 = 只对这些会话生效；留空 = 全部会话；关掉 = 只留预览。
+  UI 自己的警告是「此功能通过内存 Hook 修改微信行为，具有一定的风险。请尽量仅在白名单模式下针对必要会话开启。」
+- 读侧 `scripts/wechat-db-inbox-read.py` **只读磁盘**（`<md5>.dat` 原图 / `<md5>_h.dat` / `<md5>_t.dat` 预览；
+  全文 0 处 `http`/`5031`/`weflow` 引用）。上游不落盘时，读侧等到超时也只能拿 `_t` 预览——
+  这就是 `tmp/shared-prod.log` 里每 90 秒一轮的
+  `image upgrade chat=… gave up after 90…ms: still 171x180 from <md5>_t.dat`。
+
+本机两个具体缺口：
+
+1. **WeFlow 根本没在跑**：最后一次运行是 10-02 23:37（`%APPDATA%\weflow\logs\wcdb.log` 的 mtime），
+   5031 无监听 ⇒ 没有 Hook，没有任何会话会落原图。
+2. **白名单少了机器人真正在读的会话**：入站白名单是
+   `CYBERBOSS_WECHAT_DB_INBOX_CHATS=wxid_ubo0cy5xh4px22,filehelper,wxid_s3178hwvzsl922`
+   （柳毓琳 / 文件传输助手 / Azzy），而 WeFlow 三个列表里**没有一个含 `filehelper`**，推送列表还缺 Azzy。
+
+修法（改的是本仓库之外的配置 + 运行时，因此没有代码 diff）：
+
+- `autoDownloadWhitelist` 增补 `filehelper`（媒体实际缺的那一个会话）；
+- `messagePushFilterList` 增补 `wxid_s3178hwvzsl922`、`filehelper`；
+- `notificationFilterList` 增补 `filehelper`；
+- 启动 WeFlow 6.2.0（5031 那条），确认 Hook 装进了 `weixin.exe`；
+- **故意不加** `wxid_ty69l7hjiqt012`（Ally）：那是本机微信**当前登录的账号自己**
+  （`CYBERBOSS_WECHAT_DB_WXID`），给自己配白名单没有意义——这一点值得写下来，因为白名单
+  是按 talker 书写的，很容易顺手把机器自己的号也塞进去。
+
+原文件已备份为同目录 `WeFlow-config.json.bak-20261004-194421`（4380B）；改后 4453B，
+`Compare-Object` 显示**只有这三个数组**新增了条目。
+
+**考虑过但没用的两条**：**把白名单留空**（= 全部会话，一行改动就能让所有会话都落原图）——
+它把内存 Hook 的作用面从 3 个会话扩到全部，而 UI 明确建议"仅在白名单模式下针对必要会话开启"；
+**只改 `autoDownloadWhitelist`**——改动最小，但推送/通知两个列表会继续与"机器人真正在读的三个会话"不一致，
+下次排查还得重新对一遍账。
+
+**边界（必须写清楚）**：这个 Hook 是在**收到消息的那一刻**决定要不要落原图，所以它**不会**回头补下载
+已经停在预览的历史图片——这与本篇 Problem 里「打开会话取不回原图」那条实测是一致的、互相印证。
+要确认端到端，需要一张**新到**的图（见 Verification 的未验证项）。
+
 ## Consequences
 
 - 「处理中」不再为图片等待买单：交付在看见预览的那一刻发生，和文字消息同一条路径。
@@ -185,3 +230,16 @@ inbox 侧一轮只交接一次，所以那第二份来自应用侧的持久化�
 - **仍未验证**：`image upgrade swapped into the pending turn …` 这一行需要一张**刚到达**的图
   （旧消息的轮次早开始了），只能由对端设备发一张才会出现。实现侧它由
   `wechat-db-image-upgrade-swap` 的四个单测覆盖（含"轮次已开始则不动作"）。
+- 真机（2026-10-04 19:45，自动下载白名单补齐后启动 WeFlow 6.2.0）：
+  `[HttpService] HTTP API server started on http://127.0.0.1:5031`、`/api/v1/health` → `200 {"status":"ok"}`、
+  `netstat` 显示 `127.0.0.1:5031 LISTENING pid=35696`、
+  `[ImageDownloadService] attempting to hook PID: 28704` + `[ImageDownloadService] hook successful`
+  （Hook 确实进了 `weixin.exe`，不是只起来了 HTTP 服务）。
+- 配置：改前/后 4380B → 4453B，`Compare-Object` 只多出三个数组的新增项；改后 `ConvertFrom-Json` 通过，
+  WeFlow 启动并接管该文件后内容仍含 `filehelper`（mtime 19:45:28，未被回写覆盖）。
+- **仍未验证（本节的落点）**：白名单会话里**一张新到的图**是否真的以 `<md5>.dat` 原图落盘、
+  进而让读侧报 `quality=original`。Hook 只在收消息时生效，历史预览不会被追补，所以这一条
+  只能等对端（或用文件传输助手）真发一张图，再用读侧日志核对。
+- 反证（同一次真机，Hook 装上之后）：那两张**历史**预览在 19:45 装上 Hook 后仍继续
+  `image upgrade chat=柳毓琳/Azzy gave up after ~90s: still 171x180 / 180x102`（19:47:56 仍在打），
+  也就是说"打开会话 + 强制下载 Hook"都补不回已经停在预览的老图 —— 本节那条边界从"推断"变成"实测"。

@@ -263,6 +263,59 @@ node --test test/wechat-db-worker.test.js  # 11：帧/关联/超时杀进程/崩
 `msg/file/<YYYY-MM>/` 确实存在真文件，但当前数据库里没有一条文件行可以据此验证命名规则，
 所以这一半等一次真实发送再实现，不先猜。
 
+### 13. 文件消息：同名文件就在 `msg/file/<YYYY-MM>/`（2026-10-04，真机验证）
+
+用户说"要么重发一遍，要么直接当文件发过来"。为了让"当文件发"这条真的能落地，先造一条真实样本：
+用 Cua 的 `sendMedia` 往文件传输助手发了一个 57B 的 txt（自聊，不会打扰任何人），然后读回那一行——
+
+```
+localId=388  local_type=25769803825  create_time=1791114916
+app.type   '6'
+title      'file-attach-probe-1791114893857.txt'   ← 就是磁盘上的文件名
+md5        '69f2104a9e0eb601ce4cea8d404d73b2'
+totallen   '57'
+attachid   '@cdn_305f0201…'
+```
+
+磁盘上确实是 `<account>/msg/file/2026-10/file-attach-probe-1791114893857.txt`。于是 `resolve_file()`：
+
+- 用 `<title>` 在 `msg/file/<创建月份>/` 里找同名文件（**没有哈希、没有 `.dat` 容器**，与图片完全不同）；
+- 用 `<totallen>` 校验大小——同名但大小不符时**拒绝**，而不是把别人的文件交出去；
+- `<title>` 做路径分隔符剥离：标题来自对端客户端，绝不能指到媒体目录之外。
+
+验证：读侧对这条行现在给出 `kind=file` 的附件（内容就是那 57 字节），
+单测 `a file message resolves to the file WeChat stored under its own name` 覆盖
+正常/大小不符/路径穿越/文件缺失四种情况。读取器统计行加了 `files` / `fileMissing`。
+
+### 14. WeFlow 读侧在这台机器上不可用：`-101` 是它自己的环境检测（2026-10-04）
+
+用户要求"改回 WeFlow 取文件"。查完的事实：
+
+- 另一个会话做的白名单修复是有效的：`%APPDATA%\weflow\WeFlow-config.json` 的
+  `autoDownloadWhitelist` 已含三个目标，`autoDownloadHighRes=true`；WeFlow 进程在跑，
+  5031 在听；
+- **但它的原生层拒绝初始化**（`%APPDATA%\weflow\logs\wcdb.log` 反复出现）：
+
+  ```
+  [bootstrap] koffi.load ok
+  [bootstrap] native runtime policy mismatch value=-101
+  ```
+
+  机制：它加载闭源 `wcdb_api.dll` 后调用 `wcdb_runtime_policy_version()`，**期望
+  `1464206081`**，这台机器返回 `-101`，于是所有 `/api/v1/*` 都是
+  `500 {"error":"错误码: -101"}`。
+- `-101` 的原文（从 asar 的错误表解出，GBK 双重编码）：
+  **"当前电脑环境异常，请关闭杀毒软件和安全防护后重试；仍然失败请更换电脑"**。
+  同表还有 `-104 检测到调试或分析环境，组件已拒绝运行`。这台机器
+  `HypervisorPresent=True`（虚拟机）+ Defender 开启，且当前会话**非管理员**，
+  加 Defender 排除项需要 UAC 提权。
+- 顺带修掉两个配置错位（已在主仓库 `.env`）：`CYBERBOSS_WEFLOW_BASE_URL` 原指 5051
+  （实际 5031）已改对；**token 不能用 config 里那个**——实测 config 的
+  `httpApiToken` 打 5031 返回 401，`.env` 原有的那个才能过鉴权，已从备份恢复。
+
+结论：WeFlow 的原生读取层在这台虚拟机上不可用，且**不是可以配置绕过的开关**（闭源 DLL 的策略）。
+要继续用 WeFlow，需要在真机（非虚拟机）上装官方版本；否则读侧只能是数据库读取器。
+
 ## Alternatives considered
 
 1. **把 `db_reader` 移植成纯 Node。** Node 24 有 `node:sqlite` 和 zstd，理论上可行，长期也最干净（去掉 Python 依赖）。否决理由：43KB+ 的读取层里全是踩出来的坑（分片路由、占位会话、`real_sender_id` 的 Name2Id 映射、群聊 `wxid:\n正文` 前缀、压缩内容的 hex 形态），重写等于把那些坑再踩一遍，而且要等到全部对齐才能上线；现在是"读侧已经断了"的救火期。用 vendored 文件 + 一个 JSON 协议子进程，当天就能跑通，且把风险限制在一个已验证的组件里。

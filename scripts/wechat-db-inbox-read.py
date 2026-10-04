@@ -341,7 +341,7 @@ class MediaResolver:
         self._in_snapshot = False
         self.stats = {"resolved": 0, "missing": 0, "keyFailures": 0, "ffmpeg": 0, "thumbnailOnly": 0,
                       "blankFrames": 0, "noSource": 0, "waitedMs": 0, "lastReason": "", "lastChosen": "",
-                      "videoThumbs": 0}
+                      "videoThumbs": 0, "files": 0, "fileMissing": 0}
         # Facts about what was chosen for one picture, so `summarize_message` can
         # report them on the MESSAGE. A single `last_quality` field on the resolver
         # was a bug waiting to happen: the moment a snapshot holds two pictures the
@@ -731,6 +731,54 @@ class MediaResolver:
         self.stats["lastChosen"] = f"{thumb.name} {width}x{height} (video cover)"
         return str(published), "", f"{width}x{height}"
 
+    # ── 文件消息：同名文件就在 msg/file/<YYYY-MM>/ ──────────────────
+
+    def resolve_file(self, content: str, create_time: int):
+        """An appmsg file row -> (path, failure reason).
+
+        Measured 2026-10-04 by sending a real file (`file-attach-probe-<stamp>.txt`,
+        57 B) into the self-chat and reading the row back:
+
+          * the row's `<title>` IS the file's name on disk, and the file sits at
+            `<account>/msg/file/<YYYY-MM>/<title>` - no hashing, no `.dat` container;
+          * the row also carries `<md5>` and `<totallen>`, which make it possible to
+            refuse a same-named file that is obviously not this one.
+
+        Only the one file is opened, and the name is checked for path separators: a
+        row's title comes from the peer's client, so it must never be able to point
+        outside the media folder.
+        """
+        title = (re.search(r"<title>(.*?)</title>", content, re.S) or [None, ""])[1]
+        title = title.strip().replace("\\", "/").split("/")[-1]
+        if not title or title in {".", ".."}:
+            return "", "the file row carries no usable name"
+        want_length = int((re.search(r"<totallen>(\d+)</totallen>", content) or [0, "0"])[1] or 0)
+        root = self.account_dir / "msg" / "file"
+        if not root.is_dir():
+            self.stats["fileMissing"] += 1
+            return "", "no msg/file folder in this account"
+        months = []
+        if create_time:
+            months.append(datetime.fromtimestamp(create_time).strftime("%Y-%m"))
+        months.extend(entry.name for entry in root.iterdir() if entry.is_dir() and entry.name not in months)
+        for month in months:
+            candidate = root / month / title
+            if not candidate.is_file():
+                continue
+            size = candidate.stat().st_size
+            if want_length and size != want_length:
+                # Same name, wrong size: not the file this row describes.
+                self.stats["fileMissing"] += 1
+                return "", f"a file named {title} exists but is {size}B, the row says {want_length}B"
+            published = self.cache_dir / title
+            if not published.is_file() or published.stat().st_size != size:
+                published.write_bytes(candidate.read_bytes())
+            self.stats["files"] += 1
+            self.stats["lastChosen"] = f"{title} {size}B (file)"
+            return str(published), ""
+        self.stats["fileMissing"] += 1
+        return "", f"{title} is not on disk yet (WeChat downloads it on demand)"
+
     def _variant_files(self, md5: str, folder: Path, months: list) -> dict:
         """Every `<md5>*_?.dat` on disk right now, keyed by suffix ("" / "_h" / "_t")."""
         found = {}
@@ -975,6 +1023,22 @@ def summarize_message(row: dict, my_wxid: str, talker: str, media: "MediaResolve
             )
         else:
             text = f"[视频]（本地文件未取到：{reason}）"
+    elif kind == "file" and media is not None:
+        # A file keeps its own name under `msg/file/<YYYY-MM>/` (measured). Hand it
+        # over as an attachment so the model can read it, and only fall back to a
+        # placeholder with a reason when it is genuinely not on disk yet.
+        path, reason = media.resolve_file(raw, create_time)
+        if path:
+            attachments.append({
+                "kind": "file",
+                "path": path,
+                "fileName": os.path.basename(path),
+                "origin": "direct",
+                "attachmentRef": f"direct-{local_id}-1",
+            })
+            text = title or os.path.basename(path)
+        else:
+            text = f"{PLACEHOLDER.get(kind, '[文件]')}（本地文件未取到：{reason}）"
 
     sender = str(row.get("sender_username") or "")
     is_group = talker.endswith("@chatroom")

@@ -198,6 +198,55 @@ test("a cached answer is not reused once its source is gone", { skip: !PYTHON },
   assert.equal(second.runs[0].size, "80x40");
 });
 
+test("a file message resolves to the file WeChat stored under its own name", { skip: !PYTHON }, () => {
+  // Rule measured 2026-10-04 by sending a real file (57 B .txt) and reading the row
+  // back: `<title>` is the name on disk, under `msg/file/<YYYY-MM>/`, and `<totallen>`
+  // is the size. It also has to refuse a same-named file that is the wrong size.
+  const box = sandbox();
+  const month = "2026-10";
+  const fileDir = path.join(box.account, "msg", "file", month);
+  fs.mkdirSync(fileDir, { recursive: true });
+  const title = "file-attach-probe.txt";
+  const payload = Buffer.from("cyberboss file attachment probe\n", "utf8");
+  fs.writeFileSync(path.join(fileDir, title), payload);
+
+  const script = `
+import importlib.util, json, sys
+from pathlib import Path
+root, account, cache, title, length, create_time = sys.argv[1:7]
+spec = importlib.util.spec_from_file_location("ir", str(Path(root) / "scripts" / "wechat-db-inbox-read.py"))
+ir = importlib.util.module_from_spec(spec); spec.loader.exec_module(ir)
+media = ir.MediaResolver(Path(account), Path(cache), aes_key="", xor_key=-1, ffmpeg="")
+content = f"<msg><appmsg><type>6</type><title>{title}</title><totallen>{length}</totallen></appmsg></msg>"
+out = {}
+out["ok"] = media.resolve_file(content, int(create_time))
+out["wrongSize"] = media.resolve_file(content.replace(f"<totallen>{length}</totallen>", "<totallen>999</totallen>"), int(create_time))
+out["traversal"] = media.resolve_file(
+    "<msg><appmsg><type>6</type><title>../../../secret.txt</title><totallen>1</totallen></appmsg></msg>", int(create_time))
+out["missing"] = media.resolve_file(
+    "<msg><appmsg><type>6</type><title>not-here.txt</title><totallen>5</totallen></appmsg></msg>", int(create_time))
+print(json.dumps({"out": out, "stats": media.stats}))
+`;
+  const result = spawnSync(PYTHON, [
+    "-c", script, ROOT, box.account, box.cache, title, String(payload.length), "1791114916",
+  ], { encoding: "utf8", cwd: ROOT });
+  if (result.status !== 0) {
+    throw new Error(`reader run failed: ${result.stderr || result.stdout}`);
+  }
+  const parsed = JSON.parse(result.stdout.trim().split("\n").pop());
+  const [resolvedPath, reason] = parsed.out.ok;
+  assert.equal(reason, "");
+  assert.ok(resolvedPath.endsWith(title), `resolved to ${resolvedPath}`);
+  assert.equal(fs.readFileSync(resolvedPath, "utf8"), payload.toString("utf8"),
+    "the bytes handed over must be the file itself");
+
+  assert.match(parsed.out.wrongSize[1], /the row says 999B/,
+    "a same-named file of the wrong size is not this row's file");
+  assert.match(parsed.out.traversal[1], /not on disk yet|no usable name/,
+    "a row's title must never point outside the media folder");
+  assert.match(parsed.out.missing[1], /not on disk yet/);
+});
+
 test("the wait for an original is spent once per picture, not on every poll", { skip: !PYTHON }, () => {
   const box = sandbox();
   const md5 = "c".repeat(32);
