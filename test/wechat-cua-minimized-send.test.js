@@ -30,22 +30,28 @@ function element(role, label, value = "", token = 1) {
 }
 
 /**
- * A conversation snapshot: one row (so the verdict can find the preview) and the
- * composer, whose LABEL is the peer's name - that is how the writer knows which
- * conversation is open.
+ * A conversation snapshot: one row per conversation (so the verdict can find the
+ * preview and `ensureConversation` can find another chat's row) and the composer,
+ * whose LABEL is the peer's name - that is how the writer knows which chat is open.
  */
-function snapshot({ boxValue = "", rowLabel = `${CHAT}\n${TEXT}\n12:00` } = {}) {
-  return {
-    elements: [
-      element("ListItem", rowLabel, "", 10),
-      element("Edit", CHAT, boxValue, 11),
-    ],
-  };
+function snapshot({
+  boxValue = "",
+  rowLabel = `${CHAT}\n${TEXT}\n12:00`,
+  label = CHAT,
+  otherRow = "",
+} = {}) {
+  const elements = [element("ListItem", rowLabel, "", 10)];
+  if (otherRow) {
+    elements.push(element("ListItem", otherRow, "", 12));
+  }
+  elements.push(element("Edit", label, boxValue, 11));
+  return { elements };
 }
 
 /**
- * A session whose Return is refused with `window_minimized` until `restoreMinimized`
- * succeeds - the production situation, with no desktop involved.
+ * A session whose foreground clicks and Returns are refused with `window_minimized`
+ * until `restoreMinimized` succeeds - the production situation, with no desktop
+ * involved. `openLabel` is which conversation the window currently shows.
  */
 function fakeSession({ refuseReturns = 1 } = {}) {
   const calls = [];
@@ -53,6 +59,8 @@ function fakeSession({ refuseReturns = 1 } = {}) {
   let refusalsLeft = refuseReturns;
   let boxValue = "";
   let rowLabel = `${CHAT}\n${TEXT}\n12:00`;
+  let openLabel = CHAT;
+  let otherRow = "柳毓琳\nhi\n11:00";
   const session = {
     label: "test",
     calls,
@@ -60,11 +68,28 @@ function fakeSession({ refuseReturns = 1 } = {}) {
     raw() { return {}; },
     setComposer(value) { boxValue = value; },
     setRow(label) { rowLabel = label; },
+    setOpenLabel(label) { openLabel = label; },
+    isMinimized() { return minimized; },
     snapshot() {
-      return snapshot({ boxValue, rowLabel });
+      return snapshot({
+        boxValue,
+        rowLabel: openLabel === CHAT ? rowLabel : `${CHAT}\n${TEXT}\n12:00`,
+        label: openLabel,
+        otherRow,
+      });
     },
     call(tool, args = {}) {
       calls.push({ tool, args });
+      if (tool === "click") {
+        if (minimized) {
+          return {
+            __failed: true,
+            payload: { refusal: { code: "window_minimized", message: "window is minimized" } },
+          };
+        }
+        openLabel = CHAT;
+        return { effect: "confirmed" };
+      }
       if (tool === "type_text" && args.text === "\n") {
         if (minimized && refusalsLeft > 0) {
           refusalsLeft -= 1;
@@ -90,10 +115,7 @@ function fakeSession({ refuseReturns = 1 } = {}) {
         return { effect: "confirmed" };
       }
       if (tool === "get_window_state") {
-        return snapshot({ boxValue });
-      }
-      if (tool === "click") {
-        return { effect: "confirmed" };
+        return session.snapshot();
       }
       return { effect: "confirmed" };
     },
@@ -153,4 +175,18 @@ test("text that is NOT a saved draft is still never typed over", () => {
   assert.match(result.verify, /already holds unsent text/);
   assert.ok(!result.steps.some((entry) => entry.step === "send-stranded-draft"),
     "unknown text must not be sent");
+});
+
+test("opening ANOTHER conversation also recovers a minimized window", () => {
+  // Measured 2026-10-04: the operator deliberately keeps WeChat minimized, and every
+  // caller that had not grown its own restore step failed here - the ack bench died
+  // with `could not open …` before it could type a single message.
+  const session = fakeSession();
+  session.setComposer("");
+  session.setOpenLabel("柳毓琳");
+  const { ensureConversation } = require("../src/integrations/wechat-cua/client");
+
+  const opened = ensureConversation(session, TARGET, CHAT, { settleMs: 0 });
+  assert.equal(session.restoreCount, 1, "the window has to be restored once");
+  assert.equal(opened.label, CHAT, "…and then the conversation really opens");
 });

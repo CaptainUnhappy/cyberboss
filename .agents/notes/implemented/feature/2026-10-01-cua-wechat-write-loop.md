@@ -201,6 +201,16 @@ session '<label>' to start it again, or use a new session label.
 
 回归测试 `test/wechat-cua-minimized-send.test.js`：草稿会被送出；非草稿仍然拒绝。
 
+3. **开另一个会话也要能自愈。** `ensureConversation` 同样缺恢复：只要微信在任务栏，
+   任何"切到别的会话"的调用都会失败——2026-10-04 的 ack 基准就死在这里
+   （`could not open …`，一个字都没打出去）。现在它在点击被 `window_minimized` 拒绝时，
+   先无感恢复、重新快照、再点一次。
+
+真机实测（用户明确选择"微信保持最小化"，2026-10-04 下午）：一条自检消息的整轮走完，
+写侧日志出现 `cua send: WeChat was minimized and had to be brought forward to type (chat=Azzy)`，
+应用侧 `inbound acknowledged … latencyMs=660 sendMs=3394`——**最小化时写侧约 3.4 秒**
+（不最小化时 1.9-2.4 秒），多出来的就是那一次恢复。
+
 顺带把 `strandedDraftFor` 改成读**调用方已有的快照**（多一次 `get_window_state` 既费一次驱动调用、
 又会让我们马上要用的输入框 token 失效），这也修掉了我第一版把它写成额外快照导致
 `test/wechat-cua-client.test.js` 里 "unexpected call: get_window_state" 的崩溃。

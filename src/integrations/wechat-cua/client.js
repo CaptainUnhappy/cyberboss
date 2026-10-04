@@ -434,7 +434,7 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800, allow
     return { switched: false, route: "already-open", cost: "none", label: before.label, box: before.box, snapshot: before.snapshot };
   }
 
-  const row = elements(before.snapshot).find((el) => isRow(el) && wanted.test(labelOf(el)));
+  let row = elements(before.snapshot).find((el) => isRow(el) && wanted.test(labelOf(el)));
   if (!row) {
     throw new Error(`no conversation row matching ${JSON.stringify(chatLabel)} in the chat list`);
   }
@@ -444,6 +444,27 @@ function ensureConversation(session, target, chatLabel, { settleMs = 1800, allow
   let attempt = session.call("click", { ...toTarget(target), element_token: row.element_token });
   if (isStaleToken(attempt)) {
     attempt = reclickRow(session, target, wanted) || attempt;
+  }
+
+  // A minimized window refuses every foreground click, so NOTHING that needs another
+  // conversation can run while WeChat sits in the taskbar. Measured 2026-10-04: the
+  // operator deliberately keeps it minimized, and every caller that had not grown its
+  // own restore step failed here - the ack bench died with `could not open …`, and a
+  // reply was stranded in the composer as a draft. The restore is the quiet one
+  // (SW_SHOWNOACTIVATE), so paying it on this path costs no foreground.
+  if (outcome(attempt).failed && isWindowMinimized(attempt)) {
+    const restored = session.restoreMinimized(target.pid);
+    if (restored?.ok) {
+      sleep(400);
+      const fresh = elements(session.snapshot(target)).find((el) => isRow(el) && wanted.test(labelOf(el)));
+      if (fresh) {
+        row = fresh;
+      }
+      attempt = session.call("click", { ...toTarget(target), element_token: row.element_token });
+      if (isStaleToken(attempt)) {
+        attempt = reclickRow(session, target, wanted) || attempt;
+      }
+    }
   }
   sleep(settleMs);
   let now = currentConversation(session, target);
