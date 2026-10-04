@@ -31,6 +31,9 @@ const TARGET = { pid: 4242, window_id: 999 };
 function fakeDriver(script) {
   const calls = [];
   const session = new CuaSession("test");
+  // These scripts assert the ladder step by step, so the window state is declared
+  // rather than probed (the probe is its own driver call).
+  session.windowMinimized = () => false;
   session.call = (tool, args) => {
     calls.push({ tool, args });
     const next = script.shift();

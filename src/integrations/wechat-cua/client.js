@@ -269,6 +269,23 @@ class CuaSession {
   restoreMinimized(pid) {
     return defaultRestoreMinimized(pid);
   }
+
+  /**
+   * Is this window minimized right now?
+   *
+   * Worth asking BEFORE writing, not only after a refusal: measured 2026-10-04, a
+   * minimized window makes the driver's foreground clicks report
+   * `effect: unverifiable` instead of refusing, so a conversation switch silently did
+   * nothing and the reply was typed into whichever chat happened to be open. A
+   * refusal is a diagnosable event; a silently ignored click is not.
+   */
+  windowMinimized(pid) {
+    try {
+      return findWeChatWindow(this).minimized === true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 /** `SW_SHOWNOACTIVATE` = 4: show the window at its previous size, do not activate it. */
@@ -628,6 +645,30 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   // how the MCP transport, the fixed settles and the send route were all found).
   const startedAtMs = Date.now();
   const pushStep = (entry) => { steps.push({ ...entry, ms: Date.now() - startedAtMs }); };
+
+  // A minimized window is restored BEFORE anything else. Reacting to refusals was not
+  // enough: measured 2026-10-04 on this desktop, a minimized WeChat answers a
+  // foreground click with `effect: unverifiable` rather than a refusal, so the switch
+  // to the wanted conversation silently did nothing and the reply was typed into
+  // whatever chat happened to be open (`the message box already holds unsent text`).
+  // The restore is the quiet one (SW_SHOWNOACTIVATE): no foreground change.
+  //
+  // Only for a session that can answer the question: a caller that injected its own
+  // transport either implements `windowMinimized` or is left alone.
+  const minimized = typeof session.windowMinimized === "function"
+    && session.windowMinimized(target.pid) === true;
+  if (minimized) {
+    const restored = session.restoreMinimized(target.pid);
+    pushStep({
+      step: "unminimize-before-send",
+      outcome: { failed: !restored?.ok, reason: restored?.ok ? "no-activate-restore" : "restore-failed", detail: restored?.error || "" },
+    });
+    if (restored?.ok) {
+      minimizedCache.set(String(target.pid), { at: Date.now(), value: false });
+      sleep(400);
+    }
+  }
+
   const opened = ensureConversation(session, target, chatLabel, { settleMs, allowForegroundSwitch });
   steps.push({ step: "open", ...opened });
 
@@ -649,10 +690,30 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
     // only option that is both honest (the text is ours, verbatim) and useful.
     const stranded = strandedDraftFor(conv.snapshot, chatLabel);
     if (stranded) {
-      const pushed = deliverDraft(session, target, conv, { pushStep });
-      pushStep({ step: "send-stranded-draft", text: stranded.slice(0, 60), outcome: outcome(pushed.res), sent: pushed.sent });
-      if (pushed.sent) {
-        conv = pushed.conv;
+      if (draftLooksLikeOurs(stranded, conv.box?.value)) {
+        const pushed = deliverDraft(session, target, conv, { pushStep });
+        pushStep({
+          step: "send-stranded-draft",
+          text: stranded.text.slice(0, 60),
+          deliverable: true,
+          outcome: outcome(pushed.res),
+          sent: pushed.sent,
+        });
+        if (pushed.sent) {
+          conv = pushed.conv;
+        }
+      } else {
+        // Residue from a reply that belonged to another conversation. Pushing it would
+        // put a stray message in front of a human, so it is dropped - and recorded,
+        // because "the writer typed into the wrong chat" is something the operator
+        // needs to be able to see.
+        const residue = String(conv.box?.value ?? "");
+        if (residue) {
+          const dropped = session.call("set_value", { ...toTarget(target), element_token: conv.box.element_token, value: "" });
+          pushStep({ step: "drop-stray-draft", text: residue.slice(0, 60), deliverable: false, outcome: outcome(dropped) });
+          sleep(300);
+          conv = currentConversation(session, target);
+        }
       }
     }
   }
@@ -728,6 +789,21 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   const landed = String(conv.box?.value ?? "") === text;
   pushStep({ step: "type", landed, outcome: outcome(typed), ...(firstAttempt ? { firstAttempt } : {}) });
   if (!landed) {
+    // The composer holds something that is not our text. After a minimized-window
+    // restore that is the common shape: the driver's writes land partially or not at
+    // all (measured 2026-10-04: `type_text` took 12.5s after a restore, and the box
+    // ended up with `处理中处理中…` from repeated attempts). Nothing may be appended to
+    // that pile - say so, so the caller defers and retries with a clean box.
+    const residue = String(conv.box?.value ?? "");
+    if (residue && residue !== text) {
+      return {
+        ok: false,
+        verify: `the composer holds ${JSON.stringify(residue.slice(0, 60))} instead of our text; `
+          + "refusing to send a mixed message",
+        steps,
+        certainNotSent: true,
+      };
+    }
     // Nothing was typed, so nothing can have been sent: say so, because the caller's
     // deferral logic keys on this flag and otherwise drops the reply as "uncertain".
     return { ok: false, verify: "text never reached the message box", steps, certainNotSent: true };
@@ -900,7 +976,15 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
  *
  * The conversation list labels such a row `[草稿]` and repeats the text, which is
  * how a draft is told apart from someone mid-typing (a live composer has no row
- * marker). Returns the draft text (from the row, which is what WeChat saved) or "".
+ * marker). Returns `{ text, fromPreview }` or null.
+ *
+ * `fromPreview` is the part that decides what to DO with it. A draft whose text is
+ * the chat's LAST message is our own unsent reply (we typed it, never delivered it,
+ * and WeChat kept it) - pushing it is right. A draft whose text is anything else is
+ * residue from a reply that belonged to a DIFFERENT conversation (measured
+ * 2026-10-04: `[图片]` was stranded in Azzy's box by a send meant for someone else) -
+ * sending that would put a stray message in front of a human, so it must be dropped
+ * instead.
  *
  * It reads the snapshot the caller already has: another `get_window_state` would
  * cost a driver call AND invalidate the composer token we are about to use.
@@ -912,11 +996,78 @@ function strandedDraftFor(snapshotForRows, chatLabel) {
     .map(labelOf)
     .find((label) => wanted.test(label) && /\[草稿\]/.test(label));
   if (!row) {
-    return "";
+    return null;
   }
-  const lines = String(row).split("\n").map((line) => line.trim()).filter(Boolean);
-  const index = lines.findIndex((line) => /\[草稿\]/.test(line));
-  return lines.slice(index + 1).join("\n").replace(/\[草稿\]/g, "").trim();
+  const raw = String(row).split("\n").map((line) => line.trim()).filter(Boolean);
+  const index = raw.findIndex((line) => /\[草稿\]/.test(line));
+  if (index < 0) {
+    return null;
+  }
+  // The row is `peer / [preview] / [草稿] / text / time`, and which of the middle lines
+  // exist depends on the chat: a conversation whose last message was never delivered
+  // has NO preview line - measured 2026-10-04 the real row was
+  // `文件传输助手 / [草稿] / [矩阵4 …] / 15:27`, i.e. `[草稿]` came second. So each
+  // line is classified rather than counted: everything before the marker that is not
+  // the peer is the preview, everything after it that is not a time is the draft.
+  // The time is a line of its own and must never be taken for part of the draft.
+  const isTime = (line) => /^(\d{1,2}:\d{2}|\d{1,2}\/\d{1,2}|昨天|星期[一二三四五六日]|周[一二三四五六日]|.{0,6}\d{1,2}月\d{1,2}日.*)$/u.test(line);
+  const before = raw.slice(1, index).filter((line) => !isTime(line));
+  const after = raw.slice(index + 1).filter((line) => !isTime(line));
+  const preview = before.join("\n").trim();
+  const draft = after.join("\n").replace(/\[草稿\]/g, "").trim();
+  return { text: draft, preview };
+}
+
+/**
+ * Is this draft OUR unsent reply, or residue from a reply meant for another chat?
+ *
+ * Two independent signals, either of which is enough:
+ *
+ *   * the composer holds the same text the chat list saved as the draft - i.e. this
+ *     conversation is the one it was written for;
+ *   * the draft text equals the chat's last delivered message - what the old writer
+ *     left behind was a copy of the row's own preview (measured 2026-10-04:
+ *     柳毓琳's row read `[草稿] 处理中`, and `处理中` was that row's preview).
+ *
+ * `[图片]` appended to the row's `[图片]` preview might satisfy the second signal by
+ * accident, but pushing a picture placeholder is harmless next to leaving a real reply
+ * stranded for hours. Residue that matches NEITHER (a reply written for another chat)
+ * is dropped instead of sent.
+ */
+function draftLooksLikeOurs(draft, boxValue) {
+  if (!draft || !draft.text) {
+    return false;
+  }
+  // A picture or voice draft is a placeholder, not text: the composer holds U+FFFC (or
+  // literally `[图片]`) and the row repeats it. There is no way to tell whose it is, and
+  // a stray picture in front of a human is worse than a broken one, so it is never
+  // pushed - it gets dropped. (`[图片]` was exactly the state found in Azzy's chat on
+  // 2026-10-04.)
+  if (isPlaceholderText(draft.text)) {
+    return false;
+  }
+  const value = String(boxValue ?? "").replace(/[\r\n]+$/, "").trim();
+  if (value && !isPlaceholderText(value) && value === draft.text) {
+    return true;
+  }
+  const preview = String(draft.preview ?? "").trim();
+  if (preview) {
+    return preview === draft.text;
+  }
+  // No preview line at all means the chat's last message was never delivered - which is
+  // exactly what an unsent reply looks like (`[草稿]` right after the peer's name). The
+  // composer holding something for THIS conversation is then proof enough: WeChat wrote
+  // that draft here, and the alternative is refusing forever.
+  return Boolean(value);
+}
+
+/** Is this text a media placeholder rather than something a person typed? */
+function isPlaceholderText(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return false;
+  }
+  return /^(?:\[[^\]]{1,8}\]|\uFFFC+)$/u.test(text);
 }
 
 /**
@@ -954,6 +1105,30 @@ function deliverDraft(session, target, conv, { pushStep = () => {} } = {}) {
   sleep(350);
   const after = currentConversation(session, target);
   return { sent: String(after.box?.value ?? "") !== text, res, conv: after };
+}
+
+/**
+ * Is the WeChat window minimized right now? (Answer cached for a moment.)
+ *
+ * Asking costs one driver call, so it is memoised: `sendMessage` asks before it does
+ * anything, and the value cannot change under our feet mid-send without Windows
+ * telling the user about it first.
+ */
+const minimizedCache = new Map();
+function windowIsMinimized(session, pid) {
+  const key = String(pid || "");
+  const cached = minimizedCache.get(key);
+  if (cached && Date.now() - cached.at < 400) {
+    return cached.value;
+  }
+  let value = false;
+  try {
+    value = findWeChatWindow(session).minimized === true;
+  } catch {
+    value = false;
+  }
+  minimizedCache.set(key, { at: Date.now(), value });
+  return value;
 }
 
 /** What the window says about a send: the row that proves it, and the composer. */

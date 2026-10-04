@@ -70,6 +70,7 @@ function fakeSession({ refuseReturns = 1 } = {}) {
     setRow(label) { rowLabel = label; },
     setOpenLabel(label) { openLabel = label; },
     isMinimized() { return minimized; },
+    windowMinimized() { return minimized; },
     snapshot() {
       return snapshot({
         boxValue,
@@ -129,13 +130,16 @@ function fakeSession({ refuseReturns = 1 } = {}) {
   return session;
 }
 
-test("a Return refused because the window is minimized is retried after a quiet restore", () => {
+test("a minimized window is restored before the send, and the reply still goes out", () => {
+  // The restore is now PROACTIVE, because a minimized window answers a foreground
+  // click with `effect: unverifiable` rather than a refusal - reacting to refusals
+  // alone let a conversation switch silently do nothing.
   const session = fakeSession({ refuseReturns: 1 });
   const result = sendMessage(TARGET, CHAT, TEXT, { session, settleMs: 0 });
 
   assert.equal(session.restoreCount, 1, "the window has to be restored exactly once");
-  assert.ok(result.steps.some((step) => step.step === "unminimize-send"),
-    `expected an unminimize-send step, got ${JSON.stringify(result.steps.map((s) => s.step))}`);
+  assert.ok(result.steps.some((step) => step.step === "unminimize-before-send"),
+    `expected unminimize-before-send, got ${JSON.stringify(result.steps.map((s) => s.step))}`);
   assert.equal(result.certainNotSent, false, "the reply went out, so it must not be reported as unsent");
 });
 
@@ -150,21 +154,48 @@ test("a restore that cannot happen still refuses to claim the message was sent",
   assert.equal(result.ok, false);
   assert.equal(result.certainNotSent, true,
     "the text is still in the composer, and the caller needs that proof to retry instead of dropping the reply");
-  assert.ok(result.steps.some((step) => step.step === "unminimize-send" && step.outcome.failed === true));
+  assert.ok(result.steps.some((step) => step.step === "unminimize-before-send" && step.outcome.failed === true));
 });
 
-test("a stranded draft of ours is delivered instead of refusing to type over it", () => {
+test("a stranded draft that is our unsent reply is delivered", () => {
   // Measured 2026-10-04: this exact state - a reply stranded in Azzy's composer and
   // shown as `[草稿]` in the conversation list - kept the channel mute for hours,
   // because the old guard treated it as "someone may be typing" and refused forever.
+  // The row shape is WeChat's: peer / preview / [草稿] / text / time.
   const session = fakeSession();
   session.setComposer("这条是全尺寸 800×300 原图，不是缩略图");
-  session.setRow("Azzy\n[草稿]\n这条是全尺寸 800×300 原图，不是缩略图\n11:53");
+  session.setRow("Azzy\n这条是全尺寸 800×300 原图，不是缩略图\n[草稿]\n这条是全尺寸 800×300 原图，不是缩略图\n11:53");
   const result = sendMessage(TARGET, CHAT, TEXT, { session, settleMs: 0 });
 
   const step = result.steps.find((entry) => entry.step === "send-stranded-draft");
   assert.ok(step, `expected send-stranded-draft, got ${JSON.stringify(result.steps.map((s) => s.step))}`);
   assert.equal(step.sent, true, "the draft has to leave the composer");
+});
+
+test("a draft that only repeats a placeholder preview is dropped, not sent", () => {
+  // 2026-10-04: this was the real state in Azzy's chat - a stranded `[图片]` whose row
+  // preview was also `[图片]`. Ambiguous, so it must be dropped rather than pushed.
+  const session = fakeSession();
+  session.setComposer("[图片]");
+  session.setRow("Azzy\n[图片]\n[草稿]\n[图片]\n13:25");
+  const result = sendMessage(TARGET, CHAT, TEXT, { session, settleMs: 0 });
+  assert.ok(!result.steps.some((entry) => entry.step === "send-stranded-draft" && entry.sent),
+    "a placeholder must never be sent as a message");
+});
+
+test("a draft that belongs to ANOTHER conversation is dropped, never sent", () => {
+  // Measured 2026-10-04: `[图片]` was stranded in Azzy's composer by a send meant for
+  // someone else (the window was minimized, so the switch silently did nothing).
+  // Pushing it would have put a stray message in front of a human.
+  const session = fakeSession();
+  session.setComposer("[图片]");
+  session.setRow("Azzy\n[草稿]\n[图片]\n13:25");
+  const result = sendMessage(TARGET, CHAT, TEXT, { session, settleMs: 0 });
+
+  const dropped = result.steps.find((entry) => entry.step === "drop-stray-draft");
+  assert.ok(dropped, `expected drop-stray-draft, got ${JSON.stringify(result.steps.map((s) => s.step))}`);
+  assert.ok(!result.steps.some((entry) => entry.step === "send-stranded-draft" && entry.sent),
+    "residue must never be sent as a message");
 });
 
 test("text that is NOT a saved draft is still never typed over", () => {
