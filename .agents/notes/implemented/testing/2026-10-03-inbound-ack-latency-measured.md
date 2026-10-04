@@ -188,6 +188,30 @@ wxid_s3178hwvzsl922 -> Azzy         poll#1    31ms / poll#2 32ms / poll#3 15ms
 [入站改读数据库](../feature/2026-10-03-wechat-db-inbound.md) §11；回归由
 `test/wechat-db-media-resolver.test.js`（3 项，合成 attach 目录、不需要密钥）守住。
 
+## 最小化配置下的完整一轮（2026-10-04，用户明确选择"微信保持最小化"）
+
+`node scripts/cua-minimized-cycle-bench.js 文件传输助手 120`：往文件传输助手打一条带时间戳的消息，
+用**本机时钟**量三段（应用自报的 `latencyMs` 从微信时间戳起算，而它超前本机 1.9-4.1 秒，所以是负数）。
+
+```
+wechat pid=28704 pid-minimized=true
++  5492ms  typed (ok=true, 4232ms)          ← 最小化下打字这一步本身花了 4.2s（含一次无感恢复）
++ 10378ms  ack   inbound acknowledged … latencyMs=-1079 sendMs=2870
+输入完成 → inbox 看见        4889ms
+输入完成 → 「处理中」发出      4886ms          ← ack 写入 2.87s，含一次恢复
+输入完成 → 正式回复落地      23045ms          ← 15s 静默窗口 + 一轮模型
+回复预览: "文件传输助手\n确认 1791093257306\n13:54"
+```
+
+结论：
+
+- **最小化不再是"写侧整体失效"**：整轮走通，日志里出现
+  `cua send: WeChat was minimized and had to be brought forward to type`，恢复是无感的
+  （SW_SHOWNOACTIVATE），代价是写侧从 1.9-2.4s 变成约 2.9-3.4s。
+- **「处理中」不是被等待拖慢的**：从输入完成到它发出只要约 4.9s，其中约 2.9s 是写侧本身。
+- 图片路径同样走通（最小化状态，`--seconds=45`）：发送完成 +5ms 附件落地、+5.5s 生产日志出现
+  `inbox image chat=文件传输助手 quality=original size=900x1400`、8.5s 时读取器已给出原图。
+
 ## Alternatives considered
 
 1. **只凭 `latencyMs` 一个数字判断快慢。** 否决：它用消息行的 `create_time` 作起点，而那个时间戳比本机时钟超前 1.9-3.7s，会把 3.9s 的真实等待报成 281ms。必须同时有本机时钟的端到端数字。
