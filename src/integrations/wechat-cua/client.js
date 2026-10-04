@@ -712,12 +712,41 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   let pressRetryFrom = null;
   let skippedRepress = false;
   const pressRefusal = outcome(sent.res);
-  if (pressRefusal.failed && (isStaleToken(sent.res) || isWindowMinimized(sent.res))) {
+  // A minimized window refuses the delivery for the same reason it refuses the
+  // typing - and the cure is the same one the typing step already uses: restore it
+  // with SW_SHOWNOACTIVATE (no foreground change) and deliver again. Missing here,
+  // this was not a near-miss: measured 2026-10-04, a reply was typed into Azzy's
+  // composer, the Return was refused because the window sat in the taskbar, and the
+  // text stayed there as a WeChat DRAFT. The operator saw no answer for hours, and
+  // every later send to that chat refused to type over the leftover, so the channel
+  // went mute for that person.
+  if (pressRefusal.failed && isWindowMinimized(sent.res)) {
+    pressRetryFrom = pressRefusal;
+    const restored = session.restoreMinimized(target.pid);
+    pushStep({
+      step: "unminimize-send",
+      outcome: { failed: !restored.ok, reason: restored.ok ? "no-activate-restore" : "restore-failed", detail: restored.error || "" },
+    });
+    if (restored.ok) {
+      sleep(250);
+      conv = currentConversation(session, target);
+      if (conv.box && String(conv.box.value ?? "") === text) {
+        sent = deliverReturn(conv.snapshot);
+      } else {
+        // The text left the composer while the window was coming back: it either went
+        // out after all (a re-press would duplicate it) or it vanished. The verdict
+        // below decides; this only stops the blind re-press.
+        skippedRepress = true;
+      }
+    }
+  }
+  if (!skippedRepress && outcome(sent.res).failed
+    && (isStaleToken(sent.res) || isWindowMinimized(sent.res))) {
     // The delivery was refused, so the message did not go out. Whether to try again
     // depends on the box, not on optimism: text still there = nothing was sent, empty
     // box = it went out and only our view is stale, so sending again would duplicate
     // it. Verification below decides, not this branch.
-    pressRetryFrom = pressRefusal;
+    pressRetryFrom = pressRetryFrom || pressRefusal;
     conv = currentConversation(session, target);
     if (conv.box && String(conv.box.value ?? "") === text) {
       sent = deliverReturn(conv.snapshot);
