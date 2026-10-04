@@ -661,6 +661,49 @@ test("a preview seen at baseline is still upgraded when the original lands later
   }
 });
 
+test("a preview is handed over exactly once per poll, even while it is watched", async () => {
+  // Measured in production 2026-10-04: `localId=66 … early=preview` was delivered
+  // TWICE in a single poll. The cause was an ordering one - the main loop's seen
+  // set was snapshotted before the early handover marked the row seen - and the
+  // symptom is two turns for one picture.
+  const previewMessage = message({
+    id: "pic-once",
+    kind: "image",
+    imageQuality: "thumbnail",
+    imageSize: "171x180",
+    imageSource: "abc_t.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\abc_thumb.jpg", origin: "direct" }],
+  });
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+  ]);
+  const delivered = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async (msg) => { delivered.push(msg.id); return true; },
+    imageUpgrade: () => true,
+    imageUpgradeWaitMs: 0,
+    imageUpgradeNoticeMs: 0,
+    imageUpgradeCooldownMs: 0,
+    onImageUpgraded: () => {},
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  const result = await source.pollOnce();
+  assert.deepEqual(delivered, ["pic-once"], "one picture, one handover");
+  assert.equal(result.processed, 1, "and the poll must count it once");
+  assert.equal(source.stats.delivered, 1);
+  assert.equal(source.stats.imageThumbnail, 1);
+  // The row is watched (not re-delivered) on the polls that follow.
+  await source.pollOnce();
+  assert.deepEqual(delivered, ["pic-once"], "a watched preview is not delivered again");
+});
+
 test("with no upgrade callback configured, a preview is still delivered and never tracked", async () => {
   const worker = fakeWorker([
     { chats: [snapshot([])], failures: [] },

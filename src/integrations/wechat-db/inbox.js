@@ -566,6 +566,11 @@ class WechatDbInboxSource {
     // operator's "处理中 is late" complaint, and without it the only number
     // available was the ack's total latency, which cannot say whether the time
     // went into noticing or into sending.
+    //
+    // Built AFTER the early handovers above on purpose: the loop marks those rows
+    // seen, and a set snapshotted before that would deliver every preview twice
+    // (measured 2026-10-04 in production - `localId=66 … early=preview` appeared
+    // twice in one poll).
     const seen = new Set(this.state.seenIds);
     for (const item of batch) {
       const message = item.message;

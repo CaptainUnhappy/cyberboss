@@ -81,6 +81,17 @@ Node 对它的回答是 "fetch failed"，所以这一步必须自己读文件。
    而它现在是"同一 pendingId 直接忽略"（`pending-inbound-store.enqueueSharedContent`），
    改它等于让"重复投递"变成正常路径——代价比收益大。
 
+## 上线后抓到的第二个缺陷：同一张预览被交付两次
+
+生产日志（2026-10-04）里 `localId=66 … early=preview` 在**同一次轮询**里出现了两次。
+原因是纯粹的顺序问题：主循环用的 `seen` 集合是在**提前交付之前**从 `state.seenIds` 拷出来的，
+而提前交付那一步才把行标成已见——于是主循环看到的是"没见过"，把同一行又交给应用一次
+（一行 = 两个轮次）。
+
+修法：`seen` 在提前交付**之后**再构造（并留注释说明为什么顺序不能动）。
+回归测试 `a preview is handed over exactly once per poll, even while it is watched`
+（断言 `processed === 1` 且只交付一次）。修完重启生产：每个 localId 只出现一行。
+
 ## Consequences
 
 - 「处理中」不再为图片等待买单：交付在看见预览的那一刻发生，和文字消息同一条路径。
@@ -95,8 +106,9 @@ Node 对它的回答是 "fetch failed"，所以这一步必须自己读文件。
 
 ## Verification
 
-- 单测：`test/wechat-db-inbox.test.js`（20 项，新增 3 项）——预览立即交付、原图落地后回调恰好一次
-  且不再交付、过期清单项会被放弃、没有回调时行为不变。
+- 单测：`test/wechat-db-inbox.test.js`（22 项，新增 5 项）——预览立即交付、原图落地后回调恰好一次
+  且不再交付、基线期看到的预览也会继续盯、过期清单项会被放弃、同一行一轮只交付一次、
+  没有回调时行为不变。
 - 单测：`test/wechat-db-image-upgrade-swap.test.js`（4 项）——本地文件可持久化、缺失文件明确失败、
   迟到原图替换草稿且**不改静默窗口**、轮次已开始时不产生任何副作用。
 - 单测：`test/pending-inbound-store.test.js`——`replaceSharedContentMessage` 替换同一条消息、
