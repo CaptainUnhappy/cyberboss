@@ -704,6 +704,45 @@ test("a preview is handed over exactly once per poll, even while it is watched",
   assert.deepEqual(delivered, ["pic-once"], "a watched preview is not delivered again");
 });
 
+test("an unchanged preview is announced once, not on every poll", async () => {
+  // Measured 2026-10-04: the watcher announced the same unchanged preview every
+  // poll, the app persisted a fresh copy each time, and one day folder collected
+  // 100 counter-suffixed duplicates (460KB) for two pictures.
+  const previewMessage = message({
+    id: "pic-same",
+    kind: "image",
+    imageQuality: "thumbnail",
+    imageSize: "171x180",
+    imageSource: "same_t.dat",
+    attachments: [{ kind: "image", path: "C:\\cache\\media\\same_thumb.jpg", origin: "direct" }],
+  });
+  const worker = fakeWorker([
+    { chats: [snapshot([])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+    { chats: [snapshot([previewMessage])], failures: [] },
+  ]);
+  const announced = [];
+  const source = new WechatDbInboxSource({
+    config: { wechatDbInboxCursorFile: tempCursor() },
+    worker,
+    chats: ["wxid_ubo0cy5xh4px22"],
+    onMessage: async () => true,
+    imageUpgrade: () => true,
+    imageUpgradeWaitMs: 0,
+    imageUpgradeNoticeMs: 0,
+    imageUpgradeCooldownMs: 0,
+    onImageUpgraded: (msg) => announced.push(msg.imageSize),
+    logger: quietLogger(),
+  });
+  await source.pollOnce();
+  await source.pollOnce();
+  await source.pollOnce();
+  await source.pollOnce();
+  assert.deepEqual(announced, [], "nothing may be handed over while the picture is unchanged");
+});
+
 test("with no upgrade callback configured, a preview is still delivered and never tracked", async () => {
   const worker = fakeWorker([
     { chats: [snapshot([])], failures: [] },

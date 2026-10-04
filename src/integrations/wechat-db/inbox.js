@@ -371,6 +371,11 @@ class WechatDbInboxSource {
       deliveredAtMs: 0,
       first: `${normalizeText(message.imageSize) || "unknown"} ${normalizeText(message.imageSource) || "unknown"}`,
       quality: normalizeText(message.imageQuality),
+      // The app persists the picture when it is delivered, so this exact state
+      // has already been announced. Without this the same unchanged preview was
+      // handed over once more inside the same poll - two copies of one picture in
+      // `<state>/inbox/<date>/` instead of one.
+      announcedFingerprint: `${normalizeText(message.imageSize)}|${normalizeText(message.imageSource)}`,
     };
     this.pendingImageUpgrades.set(message.id, entry);
     return entry;
@@ -428,6 +433,12 @@ class WechatDbInboxSource {
    * Give every picture that was delivered as a preview a chance to be upgraded,
    * once per poll, without opening any conversation again (the per-chat cooldown
    * already prevents a second click).
+   *
+   * A picture that is STILL a preview is only handed over when its fingerprint
+   * changed. Without that rule the same unchanged preview was announced on every
+   * poll, and the app persisted a fresh copy each time - measured 2026-10-04, 46
+   * identical files in `<state>/inbox/<date>/` for two pictures, a file flood
+   * caused by a "nothing changed" message.
    */
   async notifyPendingImageUpgrades(snapshots) {
     if (!this.onImageUpgraded || !this.pendingImageUpgrades.size) {
@@ -443,6 +454,14 @@ class WechatDbInboxSource {
         improved += 1;
         continue;
       }
+      const fingerprint = `${normalizeText(message.imageSize)}|${normalizeText(message.imageSource)}`;
+      const announced = entry.announcedFingerprint === fingerprint;
+      entry.announcedFingerprint = fingerprint;
+      if (!announced) {
+        // Better pixels are not always a better quality word: a `fallback` frame
+        // that replaced a preview is worth handing over too.
+        this.handOverBetterPicture(message, entry, snapshots);
+      }
       if (Date.now() - entry.atMs > this.imageUpgradeDeadlineMs) {
         // The window is over: whatever the turn is going to run with, it is not
         // going to change, and holding the entry forever would only hide that.
@@ -455,6 +474,34 @@ class WechatDbInboxSource {
       }
     }
     return improved;
+  }
+
+  /** A preview that became a `fallback` (a readable non-original) is still better. */
+  handOverBetterPicture(message, entry, snapshots) {
+    const quality = normalizeText(message.imageQuality);
+    if (quality !== "fallback") {
+      return false;
+    }
+    const size = normalizeText(message.imageSize) || "unknown";
+    this.stats.imageUpgraded += 1;
+    this.pendingImageUpgrades.delete(entry.id);
+    this.logger.log?.(
+      `[cyberboss] wechat-db image upgrade chat=${entry.peer} improved=1 `
+      + `size=${entry.first}->${size} source=${normalizeText(message.imageSource) || "unknown"}`
+    );
+    try {
+      this.onImageUpgraded(message, {
+        talker: entry.talker,
+        peer: entry.peer,
+        waitedMs: Date.now() - entry.atMs,
+        quality,
+        size,
+        snapshots,
+      });
+    } catch (error) {
+      this.logger.warn?.(`[cyberboss] wechat-db image upgrade handover failed: ${error.message}`);
+    }
+    return true;
   }
 
   /**
