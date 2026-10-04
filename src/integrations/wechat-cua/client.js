@@ -48,6 +48,8 @@
 // rather than leave the bot permanently mute.
 
 const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
 const { createMcpTransport } = require("./mcp-transport");
 
 const DRIVER = process.env.CUA_DRIVER
@@ -534,16 +536,60 @@ function boxNow(session, target) {
  */
 const leftovers = new Map();
 
+/**
+ * Where our own unsent text is remembered BETWEEN RUNS.
+ *
+ * Process-local memory was the difference between "one bad press" and "this person
+ * never hears from the bot again": measured 2026-10-04, a reply was left in Azzy's
+ * composer, the daemon was restarted several times, and after each restart the
+ * leftover was unknown text - so every send to that chat refused (`refusing to type
+ * over it`) and the channel stayed mute for hours, with one warn line as the only
+ * trace. Persisting OUR OWN text keeps it recognisable across restarts.
+ */
+const LEFTOVER_FILE = process.env.CYBERBOSS_CUA_LEFTOVER_FILE
+  || (process.env.CYBERBOSS_STATE_DIR ? path.join(process.env.CYBERBOSS_STATE_DIR, "cua-unsent-text.json") : "");
+
+function loadLeftovers() {
+  if (!LEFTOVER_FILE) {
+    return new Map();
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(LEFTOVER_FILE, "utf8"));
+    return new Map(Object.entries(parsed && typeof parsed === "object" ? parsed : {}));
+  } catch {
+    return new Map();
+  }
+}
+
+function saveLeftovers() {
+  if (!LEFTOVER_FILE) {
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(LEFTOVER_FILE), { recursive: true });
+    const serializable = Object.fromEntries([...leftovers].filter(([, text]) => text));
+    fs.writeFileSync(LEFTOVER_FILE, `${JSON.stringify(serializable, null, 2)}\n`, "utf8");
+  } catch {
+    /* a leftover that cannot be persisted still works for this run */
+  }
+}
+
+for (const [chat, text] of loadLeftovers()) {
+  leftovers.set(chat, text);
+}
+
 function leftoverFor(chatLabel) {
   return leftovers.get(chatLabel) || "";
 }
 
 function rememberLeftover(chatLabel, text) {
   leftovers.set(chatLabel, text);
+  saveLeftovers();
 }
 
 function forgetLeftover(chatLabel) {
   leftovers.delete(chatLabel);
+  saveLeftovers();
 }
 
 /**
@@ -573,15 +619,33 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
 
   const draft = String(conv.box.value ?? "");
   if (draft && draft !== leftoverFor(chatLabel)) {
-    return {
-      ok: false,
-      verify: `the message box already holds unsent text (${JSON.stringify(draft.slice(0, 60))}); refusing to type over it`,
-      steps,
-    };
+    // Not from this process, so it is unknown text - the operator may be typing, and
+    // it must not be destroyed. The one exception is a WeChat DRAFT that the
+    // conversation list shows as ours: measured 2026-10-04, a reply of ours was
+    // stranded in Azzy's composer by a minimized-window refusal, and "never touch
+    // unknown text" turned that into hours of silence - every later send to that chat
+    // refused (`refusing to type over it`) and nobody was told. Sending it is the
+    // only option that is both honest (the text is ours, verbatim) and useful.
+    const stranded = strandedDraftFor(conv.snapshot, chatLabel);
+    if (stranded) {
+      const pushed = deliverDraft(session, target, conv, { pushStep });
+      pushStep({ step: "send-stranded-draft", text: stranded.slice(0, 60), outcome: outcome(pushed.res), sent: pushed.sent });
+      if (pushed.sent) {
+        conv = pushed.conv;
+      }
+    }
   }
-  if (draft) {
+  if (String(conv.box?.value ?? "")) {
+    const stillThere = String(conv.box.value);
+    if (stillThere !== leftoverFor(chatLabel)) {
+      return {
+        ok: false,
+        verify: `the message box already holds unsent text (${JSON.stringify(stillThere.slice(0, 60))}); refusing to type over it`,
+        steps,
+      };
+    }
     const cleared = session.call("set_value", { ...toTarget(target), element_token: conv.box.element_token, value: "" });
-    steps.push({ step: "clear-leftover", text: draft.slice(0, 60), outcome: outcome(cleared) });
+    steps.push({ step: "clear-leftover", text: stillThere.slice(0, 60), outcome: outcome(cleared) });
     sleep(300);
     conv = currentConversation(session, target);
     if (!conv.box) throw new Error("the message box disappeared while clearing our own unsent text");
@@ -810,9 +874,69 @@ function sendMessage(target, chatLabel, text, { session = new CuaSession(), sett
   };
 }
 
+/**
+ * Is there a WeChat draft of OURS sitting in `chatLabel`'s composer?
+ *
+ * The conversation list labels such a row `[草稿]` and repeats the text, which is
+ * how a draft is told apart from someone mid-typing (a live composer has no row
+ * marker). Returns the draft text (from the row, which is what WeChat saved) or "".
+ *
+ * It reads the snapshot the caller already has: another `get_window_state` would
+ * cost a driver call AND invalidate the composer token we are about to use.
+ */
+function strandedDraftFor(snapshotForRows, chatLabel) {
+  const wanted = new RegExp(`^\\s*${String(chatLabel).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`);
+  const row = elements(snapshotForRows)
+    .filter(isRow)
+    .map(labelOf)
+    .find((label) => wanted.test(label) && /\[草稿\]/.test(label));
+  if (!row) {
+    return "";
+  }
+  const lines = String(row).split("\n").map((line) => line.trim()).filter(Boolean);
+  const index = lines.findIndex((line) => /\[草稿\]/.test(line));
+  return lines.slice(index + 1).join("\n").replace(/\[草稿\]/g, "").trim();
+}
+
+/**
+ * Deliver whatever is in the composer, then report what the box says afterwards.
+ *
+ * Used for a stranded draft: the Return is the same route the ladder uses, and the
+ * box is the judge. A minimized window is restored the quiet way and the Return is
+ * tried once more - that refusal is exactly how the draft got stranded in the first
+ * place, so repeating it without the restore would only reproduce the incident.
+ */
+function deliverDraft(session, target, conv, { pushStep = () => {} } = {}) {
+  const text = String(conv.box?.value ?? "");
+  if (!text) {
+    return { sent: false, res: null, conv };
+  }
+  let res = session.call("type_text", {
+    ...toTarget(target), element_token: conv.box.element_token, text: "\n", delivery_mode: "foreground",
+  });
+  if (outcome(res).failed && isWindowMinimized(res)) {
+    const restored = session.restoreMinimized(target.pid);
+    pushStep({
+      step: "unminimize-draft",
+      outcome: { failed: !restored.ok, reason: restored.ok ? "no-activate-restore" : "restore-failed", detail: restored.error || "" },
+    });
+    if (restored.ok) {
+      sleep(250);
+      const fresh = currentConversation(session, target);
+      if (String(fresh.box?.value ?? "") === text) {
+        res = session.call("type_text", {
+          ...toTarget(target), element_token: fresh.box.element_token, text: "\n", delivery_mode: "foreground",
+        });
+      }
+    }
+  }
+  sleep(350);
+  const after = currentConversation(session, target);
+  return { sent: String(after.box?.value ?? "") !== text, res, conv: after };
+}
+
 /** What the window says about a send: the row that proves it, and the composer. */
-function sendVerdict(snap, text) {
-  const rows = elements(snap).filter(isRow).map(labelOf);
+function sendVerdict(snap, text) {  const rows = elements(snap).filter(isRow).map(labelOf);
   const probe = text.slice(0, Math.min(16, text.length));
   const seen = rows.find((label) => label.includes(probe));
   const boxValue = String(elements(snap).find(isEdit)?.value ?? "");

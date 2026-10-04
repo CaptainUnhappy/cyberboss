@@ -52,13 +52,16 @@ function fakeSession({ refuseReturns = 1 } = {}) {
   let minimized = true;
   let refusalsLeft = refuseReturns;
   let boxValue = "";
+  let rowLabel = `${CHAT}\n${TEXT}\n12:00`;
   const session = {
     label: "test",
     calls,
     restoreCount: 0,
     raw() { return {}; },
+    setComposer(value) { boxValue = value; },
+    setRow(label) { rowLabel = label; },
     snapshot() {
-      return snapshot({ boxValue });
+      return snapshot({ boxValue, rowLabel });
     },
     call(tool, args = {}) {
       calls.push({ tool, args });
@@ -126,4 +129,28 @@ test("a restore that cannot happen still refuses to claim the message was sent",
   assert.equal(result.certainNotSent, true,
     "the text is still in the composer, and the caller needs that proof to retry instead of dropping the reply");
   assert.ok(result.steps.some((step) => step.step === "unminimize-send" && step.outcome.failed === true));
+});
+
+test("a stranded draft of ours is delivered instead of refusing to type over it", () => {
+  // Measured 2026-10-04: this exact state - a reply stranded in Azzy's composer and
+  // shown as `[草稿]` in the conversation list - kept the channel mute for hours,
+  // because the old guard treated it as "someone may be typing" and refused forever.
+  const session = fakeSession();
+  session.setComposer("这条是全尺寸 800×300 原图，不是缩略图");
+  session.setRow("Azzy\n[草稿]\n这条是全尺寸 800×300 原图，不是缩略图\n11:53");
+  const result = sendMessage(TARGET, CHAT, TEXT, { session, settleMs: 0 });
+
+  const step = result.steps.find((entry) => entry.step === "send-stranded-draft");
+  assert.ok(step, `expected send-stranded-draft, got ${JSON.stringify(result.steps.map((s) => s.step))}`);
+  assert.equal(step.sent, true, "the draft has to leave the composer");
+});
+
+test("text that is NOT a saved draft is still never typed over", () => {
+  const session = fakeSession();
+  session.setComposer("operator typing something");
+  const result = sendMessage(TARGET, CHAT, TEXT, { session, settleMs: 0 });
+  assert.equal(result.ok, false);
+  assert.match(result.verify, /already holds unsent text/);
+  assert.ok(!result.steps.some((entry) => entry.step === "send-stranded-draft"),
+    "unknown text must not be sent");
 });
